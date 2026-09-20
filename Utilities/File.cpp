@@ -15,7 +15,7 @@
 
 using namespace std::literals::string_literals;
 
-#ifdef ANDROID
+#if defined(ANDROID) || defined(ARMSX3_IOS)
 std::string g_android_executable_dir;
 std::string g_android_config_dir;
 std::string g_android_cache_dir;
@@ -161,7 +161,9 @@ static fs::error to_error(DWORD e)
 #include <copyfile.h>
 #include <mach-o/dyld.h>
 #include <limits.h>
+#if !defined(ARMSX3_IOS)
 #include <sys/disk.h>
+#endif
 #include <sys/param.h>
 #include <sys/mount.h>
 #elif defined(__linux__) || defined(__sun)
@@ -252,7 +254,7 @@ static u64 get_raw_device_size(int fd)
 	{
 		return size;
 	}
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) && !defined(ARMSX3_IOS)
 	u64 block_count = 0;
 	u32 block_size = 0;
 
@@ -1248,7 +1250,10 @@ bool fs::is_symlink(const std::string& path)
 
 bool fs::is_optical_raw_device(const std::string& path)
 {
-#ifdef _WIN32
+#if defined(ARMSX3_IOS)
+	(void)path;
+	return false;
+#elif defined(_WIN32)
 	if (path.starts_with("\\\\.\\"))
 	{
 		return true;
@@ -1283,6 +1288,11 @@ bool fs::is_optical_raw_device(const std::string& path)
 
 bool fs::get_optical_raw_device(const std::string& path, std::string* raw_device)
 {
+#if defined(ARMSX3_IOS)
+	(void)path;
+	(void)raw_device;
+	return false;
+#else
 	if (fs::is_optical_raw_device(path))
 	{
 		if (raw_device)
@@ -1440,6 +1450,7 @@ bool fs::get_optical_raw_device(const std::string& path, std::string* raw_device
 #else
 	// Not supported on this platform
 	return false;
+#endif
 #endif
 }
 
@@ -2456,7 +2467,7 @@ bool fs::file::strict_read_check(u64 offset, u64 _size, u64 type_size) const
 
 std::string fs::get_executable_path()
 {
-#ifdef ANDROID
+	#if defined(ANDROID) || defined(ARMSX3_IOS)
 	return g_android_executable_dir + "/dummy-rpcs3.apk";
 #else
 	// Use magic static
@@ -2509,7 +2520,7 @@ std::string fs::get_executable_path()
 
 std::string fs::get_executable_dir()
 {
-#ifdef ANDROID
+	#if defined(ANDROID) || defined(ARMSX3_IOS)
 	return g_android_executable_dir;
 #else
 	// Use magic static
@@ -2530,7 +2541,7 @@ std::string fs::get_executable_dir()
 
 const std::string& fs::get_config_dir([[maybe_unused]] bool get_config_subdirectory)
 {
-#ifdef ANDROID
+	#if defined(ANDROID) || defined(ARMSX3_IOS)
 	return g_android_config_dir;
 #else
 	// Use magic static
@@ -2627,7 +2638,7 @@ const std::string& fs::get_config_dir([[maybe_unused]] bool get_config_subdirect
 
 const std::string& fs::get_cache_dir()
 {
-#ifdef ANDROID
+	#if defined(ANDROID) || defined(ARMSX3_IOS)
 	return g_android_cache_dir;
 #else
 	static const std::string s_dir = []

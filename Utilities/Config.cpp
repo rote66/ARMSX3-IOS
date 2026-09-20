@@ -254,6 +254,10 @@ bool try_to_float(f64* out, std::string_view value, f64 min, f64 max, std::strin
 
 bool try_to_string(std::string* out, f64 value, std::string_view name)
 {
+#if defined(ARMSX3_IOS)
+	if (out) *out = std::to_string(value);
+	return true;
+#else
 	std::array<char, 32> str{};
 
 	if (auto [ptr, ec] = std::to_chars(str.data(), str.data() + str.size(), value, std::chars_format::fixed); ec == std::errc())
@@ -266,6 +270,7 @@ bool try_to_string(std::string* out, f64 value, std::string_view name)
 		if (out) cfg_log.error("cfg::try_to_string('%s'): could not convert value '%f' to string. error='%s'", name, value, std::make_error_code(ec).message());
 		return false;
 	}
+#endif
 }
 
 bool cfg::try_to_enum_value(u64* out, decltype(&fmt_class_string<int>::format) func, std::string_view value, std::string_view name)

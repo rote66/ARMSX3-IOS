@@ -507,9 +507,15 @@ namespace utils
 #if defined(ARCH_X64) && !defined(_MSC_VER)
 		__asm__ volatile("lock orl $0, 0(%0)" :: "r" (ptr));
 #elif defined(ARCH_ARM64)
-		u32 value = 0;
-		u32* u32_ptr = static_cast<u32*>(ptr);
-		__asm__ volatile("ldset %w0, %w0, %1" : "+r"(value), "=Q"(*u32_ptr) : "r"(value));
+		u32 value;
+		u32 status;
+		__asm__ volatile(
+			"1: ldxr %w0, [%2]\n"
+			"stxr %w1, %w0, [%2]\n"
+			"cbnz %w1, 1b\n"
+			: "=&r"(value), "=&r"(status)
+			: "r"(ptr)
+			: "memory");
 #else
 		*static_cast<atomic_t<u32> *>(ptr) += 0;
 #endif

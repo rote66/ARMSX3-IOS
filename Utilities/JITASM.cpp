@@ -15,7 +15,12 @@
 #endif
 
 #if defined(__APPLE__)
+#include <TargetConditionals.h>
 #include <mutex>
+#endif
+
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+extern "C" void armsx3_ios_diagnostic_log(const char* message);
 #endif
 
 LOG_CHANNEL(jit_log, "JIT");
@@ -117,33 +122,186 @@ void jit_announce(uptr func, usz size, std::string_view name)
 	}
 }
 
-static u8* get_jit_memory()
+struct jit_memory_arena
 {
-	// Reserve 2G memory (magic static)
-	static void* const s_memory2 = []() -> void*
-	{
-		void* ptr = utils::memory_reserve(0x80000000, true);
-#ifdef CAN_OVERCOMMIT
-		utils::memory_commit(ptr, 0x80000000);
-		utils::memory_protect(ptr, 0x40000000, utils::protection::wx);
+	u8* base{};
+	usz segment_size{};
+	bool map_jit{};
+};
+
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+static atomic_t<bool> s_ios_jit_execution_ready{false};
+extern "C" bool armsx3_ios_jit_authorized();
 #endif
-		return ptr;
+
+static const jit_memory_arena& get_jit_memory_arena()
+{
+	// Reserve the JIT arena (magic static). Desktop keeps the original 2 GiB
+	// layout. iOS cannot reliably create a 2 GiB MAP_JIT mapping, so keep code
+	// and data contiguous but try progressively smaller layouts. The iOS global
+	// asmjit runtime below shares this arena as well: on iOS 15/Dopamine a first
+	// MAP_JIT mapping succeeds while a second MAP_JIT mapping can fail even at
+	// only 16 MiB.
+	static const jit_memory_arena s_arena = []() -> jit_memory_arena
+	{
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+		struct candidate
+		{
+			usz segment_size;
+			const char* success;
+			const char* failure;
+		};
+
+		// Total arena sizes from 512 MiB down to the already proven 16 MiB
+		// MAP_JIT size. Code and data each receive one half.
+		constexpr candidate candidates[] =
+		{
+			{0x10000000, "jit arena=512m", "jit arena=512m failed"},
+			{0x08000000, "jit arena=256m", "jit arena=256m failed"},
+			{0x04000000, "jit arena=128m", "jit arena=128m failed"},
+			{0x02000000, "jit arena=64m",  "jit arena=64m failed"},
+			{0x01000000, "jit arena=32m",  "jit arena=32m failed"},
+			{0x00800000, "jit arena=16m",  "jit arena=16m failed"},
+		};
+
+		for (const auto& entry : candidates)
+		{
+			if (void* ptr = utils::memory_reserve(entry.segment_size * 2, true))
+			{
+				armsx3_ios_diagnostic_log(entry.success);
+				return {static_cast<u8*>(ptr), entry.segment_size, true};
+			}
+
+			armsx3_ios_diagnostic_log(entry.failure);
+		}
+
+		// TrollStore-safe entitlements on iOS 15 may intentionally reject MAP_JIT
+		// at process launch. Global RPCS3 initializers still need storage for the
+		// generated trampolines, but they do not execute them before main(). Keep a
+		// normal RW bootstrap arena and promote its used code range after UIKit has
+		// started. This avoids making dynamic-codesigning a launch-time requirement.
+		for (const auto& entry : candidates)
+		{
+			if (void* ptr = utils::memory_reserve(entry.segment_size * 2, false))
+			{
+				if (entry.segment_size == 0x10000000)
+					armsx3_ios_diagnostic_log("jit bootstrap rw arena=512m");
+				else if (entry.segment_size == 0x08000000)
+					armsx3_ios_diagnostic_log("jit bootstrap rw arena=256m");
+				else if (entry.segment_size == 0x04000000)
+					armsx3_ios_diagnostic_log("jit bootstrap rw arena=128m");
+				else if (entry.segment_size == 0x02000000)
+					armsx3_ios_diagnostic_log("jit bootstrap rw arena=64m");
+				else if (entry.segment_size == 0x01000000)
+					armsx3_ios_diagnostic_log("jit bootstrap rw arena=32m");
+				else
+					armsx3_ios_diagnostic_log("jit bootstrap rw arena=16m");
+				return {static_cast<u8*>(ptr), entry.segment_size, false};
+			}
+		}
+
+		armsx3_ios_diagnostic_log("jit arena allocation failed");
+		return {};
+#else
+		constexpr usz segment_size = 0x40000000;
+		void* ptr = utils::memory_reserve(segment_size * 2, true);
+#ifdef CAN_OVERCOMMIT
+		utils::memory_commit(ptr, segment_size * 2);
+		utils::memory_protect(ptr, segment_size, utils::protection::wx);
+#endif
+		return {static_cast<u8*>(ptr), segment_size, true};
+#endif
 	}();
 
-	return static_cast<u8*>(s_memory2);
+	return s_arena;
 }
 
-// Allocation counters (1G code, 1G data subranges)
+static u8* get_jit_memory(bool exec)
+{
+	const auto& arena = get_jit_memory_arena();
+	ensure(arena.base && arena.segment_size);
+	return arena.base + (exec ? 0 : arena.segment_size);
+}
+
+static usz get_jit_segment_size()
+{
+	return ensure(get_jit_memory_arena().segment_size);
+}
+
+// Allocation counters for the code/data subranges.
 static atomic_t<u64> s_code_pos{0}, s_data_pos{0};
+
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+static std::mutex s_ios_legacy_jit_write_mutex;
+static thread_local u32 s_ios_legacy_jit_write_depth = 0;
+
+extern "C" bool armsx3_ios_legacy_jit_write_protect(int enabled) noexcept
+{
+	const auto& arena = get_jit_memory_arena();
+	if (arena.map_jit)
+	{
+		return false;
+	}
+
+	// Before JIT authorization the bootstrap arena intentionally stays RW.
+	// Treat the toggle as handled so APRR/SPRR is not applied to non-MAP_JIT
+	// memory. Once execution is enabled, use the same Legacy W^X model as
+	// ARMSX2: RW while generating code, RX while executing it.
+	if (!s_ios_jit_execution_ready.load())
+	{
+		return true;
+	}
+
+	const usz used = utils::align<usz>(s_code_pos.load() & 0xffff'ffff,
+		static_cast<usz>(utils::get_page_size()));
+	if (!used)
+	{
+		return true;
+	}
+
+	if (!enabled)
+	{
+		if (s_ios_legacy_jit_write_depth++ == 0)
+		{
+			s_ios_legacy_jit_write_mutex.lock();
+			if (!utils::try_memory_commit(arena.base, used, utils::protection::rw))
+			{
+				s_ios_legacy_jit_write_depth = 0;
+				s_ios_legacy_jit_write_mutex.unlock();
+				armsx3_ios_diagnostic_log("jit legacy protect RW failed");
+			}
+		}
+		return true;
+	}
+
+	if (!s_ios_legacy_jit_write_depth)
+	{
+		return true;
+	}
+
+	if (--s_ios_legacy_jit_write_depth == 0)
+	{
+		asmjit::VirtMem::flushInstructionCache(arena.base, used);
+		if (!utils::try_memory_commit(arena.base, used, utils::protection::rx))
+		{
+			armsx3_ios_diagnostic_log("jit legacy protect RX failed");
+		}
+		s_ios_legacy_jit_write_mutex.unlock();
+	}
+
+	return true;
+}
+#endif
 
 // Snapshot of code generated before main()
 static std::vector<u8> s_code_init, s_data_init;
 
-template <atomic_t<u64>& Ctr, uint Off, utils::protection Prot>
+template <atomic_t<u64>& Ctr, bool Exec, utils::protection Prot>
 static u8* add_jit_memory(usz size, usz align)
 {
-	// Select subrange
-	u8* pointer = get_jit_memory() + Off;
+	// Select code/data subrange from the contiguous arena.
+	u8* pointer = get_jit_memory(Exec);
+	const usz segment_size = get_jit_segment_size();
 
 	if (!size && !align) [[unlikely]]
 	{
@@ -165,10 +323,10 @@ static u8* add_jit_memory(usz size, usz align)
 		const u64 _pos = utils::align(ctr & 0xffff'ffff, align);
 		const u64 _new = utils::align(_pos + size, align);
 
-		if (_new > 0x40000000) [[unlikely]]
+		if (_new > segment_size) [[unlikely]]
 		{
 			// Sorry, we failed, and further attempts should fail too.
-			ctr |= 0x40000000;
+			ctr |= segment_size;
 			return -1;
 		}
 
@@ -188,15 +346,40 @@ static u8* add_jit_memory(usz size, usz align)
 
 	if (pos == umax) [[unlikely]]
 	{
-		jit_log.error("Out of memory (size=0x%x, align=0x%x, off=0x%x)", size, align, Off);
+		jit_log.error("Out of JIT %s memory (size=0x%x, align=0x%x, capacity=0x%x)", Exec ? "code" : "data", size, align, segment_size);
 		return nullptr;
 	}
 
 	if (olda != newa) [[unlikely]]
 	{
 #ifndef CAN_OVERCOMMIT
+		// Apple arm64 reserves this arena as RW from the initial mmap because 16 KiB
+		// pages cannot safely start as PROT_NONE here. The data half therefore needs
+		// no permission transition at all. On iOS 15, redundantly mprotecting a large
+		// MAP_JIT subrange RW -> RW can fail in pmap_enter with a resource shortage
+		// during pre-main SPU dispatcher initialization. Executable allocations still
+		// need the RW -> WX transition below.
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+		if constexpr (Prot != utils::protection::rw)
+		{
+			const auto& arena = get_jit_memory_arena();
+			// MAP_JIT mappings need their executable pages committed immediately.
+			// The ordinary bootstrap mapping must remain RW until prepare_execution()
+			// is called after app launch. Once promoted, later code growth is made
+			// executable page-by-page.
+			if (arena.map_jit)
+			{
+				if (!utils::try_memory_commit(pointer + olda, newa - olda, Prot))
+				{
+					jit_log.error("Failed to make iOS JIT code executable (size=0x%x)", newa - olda);
+					return nullptr;
+				}
+			}
+		}
+#else
 		// Commit more memory.
 		utils::memory_commit(pointer + olda, newa - olda, Prot);
+#endif
 #endif
 		// Acknowledge committed memory
 		Ctr.atomic_op([&](u64& ctr)
@@ -208,8 +391,8 @@ static u8* add_jit_memory(usz size, usz align)
 		});
 	}
 
-	ensure(pointer + pos >= get_jit_memory() + Off);
-	ensure(pointer + pos < get_jit_memory() + Off + 0x40000000);
+	ensure(pointer + pos >= get_jit_memory(Exec));
+	ensure(pointer + pos < get_jit_memory(Exec) + segment_size);
 
 	return pointer + pos;
 }
@@ -282,11 +465,11 @@ u8* jit_runtime::alloc(usz size, usz align, bool exec) noexcept
 
 	if (exec)
 	{
-		return add_jit_memory<s_code_pos, 0x0, utils::protection::wx>(size, align);
+		return add_jit_memory<s_code_pos, true, utils::protection::wx>(size, align);
 	}
 	else
 	{
-		return add_jit_memory<s_data_pos, 0x40000000, utils::protection::rw>(size, align);
+		return add_jit_memory<s_data_pos, false, utils::protection::rw>(size, align);
 	}
 }
 
@@ -294,12 +477,58 @@ u8* jit_runtime::peek(bool exec) noexcept
 {
 	if (exec)
 	{
-		return add_jit_memory<s_code_pos, 0x0, utils::protection::wx>(0, 1);
+		return add_jit_memory<s_code_pos, true, utils::protection::wx>(0, 1);
 	}
 	else
 	{
-		return add_jit_memory<s_data_pos, 0x40000000, utils::protection::rw>(0, 1);
+		return add_jit_memory<s_data_pos, false, utils::protection::rw>(0, 1);
 	}
+}
+
+bool jit_runtime::prepare_execution() noexcept
+{
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+	if (!armsx3_ios_jit_authorized())
+	{
+		armsx3_ios_diagnostic_log("jit execution prepare: CS_DEBUGGED=0");
+		return false;
+	}
+
+	const auto& arena = get_jit_memory_arena();
+	if (!arena.base || !arena.segment_size)
+	{
+		armsx3_ios_diagnostic_log("jit execution prepare: no arena");
+		return false;
+	}
+
+	if (arena.map_jit)
+	{
+		s_ios_jit_execution_ready.store(true);
+		armsx3_ios_diagnostic_log("jit execution prepare: map_jit ready");
+		return true;
+	}
+
+	const usz used = utils::align<usz>(s_code_pos.load() & 0xffff'ffff,
+		static_cast<usz>(utils::get_page_size()));
+	if (!used)
+	{
+		armsx3_ios_diagnostic_log("jit execution prepare: no code");
+		return false;
+	}
+
+	asmjit::VirtMem::flushInstructionCache(arena.base, used);
+	if (!utils::try_memory_commit(arena.base, used, utils::protection::rx))
+	{
+		armsx3_ios_diagnostic_log("jit execution prepare: legacy RX failed");
+		return false;
+	}
+
+	s_ios_jit_execution_ready.store(true);
+	armsx3_ios_diagnostic_log("jit execution prepare: legacy RX ready");
+	return true;
+#else
+	return true;
+#endif
 }
 
 void jit_runtime::initialize()
@@ -321,12 +550,25 @@ void jit_runtime::finalize() noexcept
 #ifdef __APPLE__
 	pthread_jit_write_protect_np(false);
 #endif
+	const usz segment_size = get_jit_segment_size();
+	u8* const arena_base = get_jit_memory(true);
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+	const bool was_execution_ready = s_ios_jit_execution_ready.exchange(false);
+	const bool map_jit = get_jit_memory_arena().map_jit;
+#endif
+
 	// Reset JIT memory
 #ifdef CAN_OVERCOMMIT
-	utils::memory_reset(get_jit_memory(), 0x80000000, true);
-	utils::memory_protect(get_jit_memory(), 0x40000000, utils::protection::wx);
+	utils::memory_reset(arena_base, segment_size * 2, true);
+	utils::memory_protect(arena_base, segment_size, utils::protection::wx);
 #else
-	utils::memory_decommit(get_jit_memory(), 0x80000000, true);
+	// The iOS MAP_JIT arena starts RW and data allocations intentionally do not
+	// issue a redundant mprotect(RW). Preserve that invariant across resets.
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+	utils::memory_reset(arena_base, segment_size * 2, utils::protection::rw, map_jit);
+#else
+	utils::memory_decommit(arena_base, segment_size * 2, true);
+#endif
 #endif
 
 	s_code_pos = 0;
@@ -336,6 +578,13 @@ void jit_runtime::finalize() noexcept
 	u8* const code_ptr = alloc(s_code_init.size(), 1, true);
 	std::memcpy(code_ptr, s_code_init.data(), s_code_init.size());
 	std::memcpy(alloc(s_data_init.size(), 1, false), s_data_init.data(), s_data_init.size());
+
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+	if (was_execution_ready && !prepare_execution())
+	{
+		armsx3_ios_diagnostic_log("jit execution restore failed");
+	}
+#endif
 
 #ifdef __APPLE__
 	pthread_jit_write_protect_np(true);
@@ -352,13 +601,21 @@ void jit_runtime::finalize() noexcept
 
 jit_runtime_base& asmjit::get_global_runtime()
 {
+#if !(defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE)
 	// 16 MiB for internal needs
 	static constexpr u64 size = 1024 * 1024 * 16;
+#endif
 
 	struct custom_runtime final : jit_runtime_base
 	{
 		custom_runtime() noexcept
 		{
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+			// iOS 15 may reject a second MAP_JIT mapping. Global trampolines and
+			// the main LLVM/asmjit runtime therefore share jit_runtime's single
+			// contiguous MAP_JIT arena.
+			armsx3_ios_diagnostic_log("global jit runtime=shared arena");
+#else
 			ensure(m_pos.raw() = static_cast<uchar*>(utils::memory_reserve(size, true)));
 
 			// Initialize "end" pointer
@@ -366,10 +623,14 @@ jit_runtime_base& asmjit::get_global_runtime()
 
 			// Make memory writable + executable
 			utils::memory_commit(m_pos, size, utils::protection::wx);
+#endif
 		}
 
 		uchar* _alloc(usz size, usz align) noexcept override
 		{
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+			return jit_runtime::alloc(size, align, true);
+#else
 			return m_pos.atomic_op([&](uchar*& pos) -> uchar*
 			{
 				const auto r = reinterpret_cast<uchar*>(utils::align(uptr(pos), align));
@@ -382,12 +643,15 @@ jit_runtime_base& asmjit::get_global_runtime()
 
 				return nullptr;
 			});
+#endif
 		}
 
 	private:
+#if !(defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE)
 		atomic_t<uchar*> m_pos{};
 
 		uchar* m_max{};
+#endif
 	};
 
 	// Magic static

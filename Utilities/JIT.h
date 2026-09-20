@@ -100,6 +100,12 @@ struct jit_runtime final : jit_runtime_base
 	// Should be called at least once after global initialization
 	static void initialize();
 
+	// iOS can bootstrap global trampolines in ordinary RW memory when MAP_JIT
+	// is unavailable at process launch. Promote the generated code to an
+	// executable mapping once the app is running and JIT permissions can be
+	// exercised. Other platforms simply return true.
+	static bool prepare_execution() noexcept;
+
 	// Deallocate all memory
 	static void finalize() noexcept;
 };

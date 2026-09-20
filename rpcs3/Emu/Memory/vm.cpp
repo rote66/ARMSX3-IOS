@@ -19,6 +19,14 @@
 
 #include <thread>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+extern "C" void armsx3_ios_diagnostic_log(const char* message);
+#endif
+
 LOG_CHANNEL(vm_log, "VM");
 
 void ppu_remove_hle_instructions(u32 addr, u32 size);
@@ -49,10 +57,25 @@ namespace vm
 	u8* const g_exec_addr = memory_reserve_4GiB(g_sudo_addr, 0x300000000);
 
 	// Hooks for memory R/W interception (default: zero offset to some function with only ret instructions)
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+	// The 32 GiB desktop hook aperture is not referenced outside vm.cpp and is
+	// prohibitively large on iOS 15. Keep it disabled there instead of failing
+	// during global initialization before main().
+	u8* const g_hook_addr = []() -> u8*
+	{
+		armsx3_ios_diagnostic_log("vm hook region skipped");
+		return nullptr;
+	}();
+#else
 	u8* const g_hook_addr = memory_reserve_4GiB(g_exec_addr, 0x800000000);
+#endif
 
 	// Stats for debugging
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+	u8* const g_stat_addr = memory_reserve_4GiB(g_exec_addr);
+#else
 	u8* const g_stat_addr = memory_reserve_4GiB(g_hook_addr);
+#endif
 
 	// For SPU
 	u8* const g_free_addr = g_stat_addr + 0x1'0000'0000;
@@ -2411,7 +2434,9 @@ namespace vm
 
 	inline namespace ps3_
 	{
+#if !(defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE)
 		static utils::shm s_hook{0x800000000, ""};
+#endif
 
 		void init()
 		{
@@ -2425,7 +2450,7 @@ namespace vm
 			g_base_addr, g_base_addr + 0xffff'ffff,
 			g_sudo_addr, g_sudo_addr + 0xffff'ffff,
 			g_exec_addr, g_exec_addr + 0x200000000 - 1,
-			g_hook_addr, g_hook_addr + 0x800000000 - 1,
+			g_hook_addr, g_hook_addr ? g_hook_addr + 0x800000000 - 1 : nullptr,
 			g_stat_addr, g_stat_addr + 0xffff'ffff,
 			g_reservations, g_reservations + sizeof(g_reservations) - 1);
 
@@ -2450,7 +2475,11 @@ namespace vm
 #ifdef _WIN32
 			utils::memory_release(g_hook_addr, 0x800000000);
 #endif
+#if !(defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE)
 			ensure(s_hook.map(g_hook_addr, utils::protection::rw, true));
+#else
+			armsx3_ios_diagnostic_log("vm init without hook mapping");
+#endif
 		}
 	}
 
@@ -2477,7 +2506,7 @@ namespace vm
 #ifdef _WIN32
 		s_hook.unmap(g_hook_addr);
 		ensure(utils::memory_reserve(0x800000000, g_hook_addr));
-#else
+#elif !(defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE)
 		utils::memory_decommit(g_hook_addr, 0x800000000);
 #endif
 

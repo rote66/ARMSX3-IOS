@@ -267,7 +267,14 @@ struct MemoryManager1 : llvm::RTDyldMemoryManager
 			return;
 		}
 
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+		// Keep the unified TrollStore/Dopamine build independent of MAP_JIT.
+		// Code pages are promoted to RWX on demand by allocate() using the
+		// allow-unsigned-executable-memory entitlement.
+		auto ptr = reinterpret_cast<u8*>(utils::memory_reserve(c_max_size * 3, false));
+#else
 		auto ptr = reinterpret_cast<u8*>(utils::memory_reserve(c_max_size * 3, true));
+#endif
 		m_code_mems = ptr;
 		// ptr += c_max_size;
 		// m_data_ro_mems = ptr;
@@ -301,7 +308,11 @@ struct MemoryManager1 : llvm::RTDyldMemoryManager
 		// utils::memory_decommit(m_code_mems, how_much(code_ptr));
 		// utils::memory_decommit(m_data_ro_mems, how_much(data_ro_ptr));
 		// utils::memory_decommit(m_data_rw_mems, how_much(data_rw_ptr));
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+		utils::memory_decommit(m_code_mems, c_max_size * 3, false);
+#else
 		utils::memory_decommit(m_code_mems, c_max_size * 3, true);
+#endif
 	}
 
 	llvm::JITSymbol findSymbol(const std::string& name) override

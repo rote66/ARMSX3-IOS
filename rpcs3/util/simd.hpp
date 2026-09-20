@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <math.h>
 
 #if defined(__clang__)
@@ -1881,7 +1882,19 @@ inline v128 gv_muladdfs(const v128& a, const v128& b, const v128& c)
 inline v128 gv_rmuladds_hds16(const v128& a, const v128& b, const v128& c)
 {
 #if defined(ARCH_ARM64)
+	#ifdef __ARM_FEATURE_QRDMX
 	return vqrdmlahq_s16(c, a, b);
+	#else
+	// SQRDMLAH was added in ARMv8.1. Compose it from ARMv8.0 operations, correcting
+	// the one case where SQRDMULH saturates before the add instead of after it.
+	const auto min_s16 = vdupq_n_s16(std::numeric_limits<s16>::min());
+	const auto product = vqrdmulhq_s16(a, b);
+	const auto result = vqaddq_s16(c, product);
+	const auto overflow_product = vandq_u16(vceqq_s16(a, min_s16), vceqq_s16(b, min_s16));
+	const auto correction_mask = vandq_u16(overflow_product, vcltq_s16(c, vdupq_n_s16(0)));
+	const auto correction = vreinterpretq_s16_u16(vandq_u16(correction_mask, vdupq_n_u16(1)));
+	return vaddq_s16(result, correction);
+	#endif
 #elif defined(ARCH_X64)
 	const auto x80 = _mm_set1_epi16(0x80); // 0x80 * 0x80 = 0x4000, add this to the product
 	const auto al = _mm_unpacklo_epi16(a, x80);

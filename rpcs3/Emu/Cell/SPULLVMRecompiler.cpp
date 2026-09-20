@@ -11207,6 +11207,12 @@ const char* spu_llvm_codegen_build_stamp()
 
 #else
 
+#ifdef ARCH_ARM64
+void spu_llvm_set_compile_context(spu_llvm_compile_context*) noexcept
+{
+}
+#endif
+
 std::unique_ptr<spu_recompiler_base> spu_recompiler_base::make_llvm_recompiler(u8 magn)
 {
 	if (magn)
