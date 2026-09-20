@@ -9,6 +9,11 @@ endif()
 
 project(rpcs3 LANGUAGES C CXX)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(ARMSX3_IOS ON)
+    add_compile_definitions(ARMSX3_IOS=1)
+endif()
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
@@ -116,7 +121,7 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "RPCS3 can only be compiled on 64-bit platforms.")
 endif()
 
-if(APPLE AND CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+if(APPLE AND NOT ARMSX3_IOS AND CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
     list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew")
     list(APPEND CMAKE_SYSTEM_PREFIX_PATH "/opt/homebrew")
 endif()
@@ -170,6 +175,10 @@ add_subdirectory(rpcs3)
 # are byte-for-byte unaffected.
 if(ANDROID)
     add_subdirectory(android)
+endif()
+
+if(ARMSX3_IOS)
+    add_subdirectory(ios)
 endif()
 
 set_directory_properties(PROPERTIES VS_STARTUP_PROJECT rpcs3)

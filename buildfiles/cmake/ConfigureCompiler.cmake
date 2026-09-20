@@ -19,8 +19,8 @@ if(MSVC)
 else()
 	check_cxx_compiler_flag("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
 	check_cxx_compiler_flag("-msse -msse2 -mcx16" COMPILER_X86)
-	if (APPLE)
-		check_cxx_compiler_flag("-march=armv8.4-a" COMPILER_ARM)
+		if (APPLE)
+			check_cxx_compiler_flag("-march=armv8.4-a" COMPILER_ARM)
 	else()
 		# Per-variant, set by android/build-variants.sh. Default is the standard/new target;
 		# the legacy variant passes armv8-a so it still runs on Cortex-A53/A73-class cores.
@@ -45,7 +45,10 @@ else()
 	elseif(COMPILER_ARM)
 		# This section needs a review. Apple claims armv8.5-a on M-series but doesn't support SVE.
 		# Note that compared to the rest of the 8.x family, 8.1 is very restrictive and we'll have to bump the requirement in future to get anything meaningful.
-		if (APPLE)
+		if (ARMSX3_IOS)
+			# Keep the compiler at the architecture baseline selected by the iPhoneOS
+			# SDK. iOS 15 itself does not imply ARMv8.4-A hardware.
+		elseif(APPLE)
 			add_compile_options(-march=armv8.4-a)
 		else()
 			# Default armv8.2-a+dotprod+fp16. dotprod is only mandatory from 8.4 and FP16

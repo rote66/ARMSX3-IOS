@@ -51,7 +51,12 @@ else()
 endif()
 
 # libusb
-if(CMAKE_SYSTEM_NAME MATCHES "DragonFly|FreeBSD")
+if(ARMSX3_IOS)
+	add_library(usb-1.0-static STATIC
+		${CMAKE_SOURCE_DIR}/ios/src/libusb_stub.cpp)
+	target_include_directories(usb-1.0-static PUBLIC
+		${CMAKE_CURRENT_SOURCE_DIR}/libusb/libusb/libusb)
+elseif(CMAKE_SYSTEM_NAME MATCHES "DragonFly|FreeBSD")
 	pkg_check_modules(LIBUSB REQUIRED IMPORTED_TARGET libusb-1.0>=1.0 )
 	cmake_dependent_option(USE_SYSTEM_LIBUSB "Use system libusb-1.0 as shared library" ON
 			"LIBUSB_FOUND" OFF)
@@ -60,7 +65,9 @@ else()
 	cmake_dependent_option(USE_SYSTEM_LIBUSB "Use system libusb-1.0 as shared library" OFF
 			"LIBUSB_FOUND" OFF)
 endif()
-if(CMAKE_SYSTEM_NAME MATCHES "DragonFly|FreeBSD")
+if(ARMSX3_IOS)
+	# The empty host backend was created above.
+elseif(CMAKE_SYSTEM_NAME MATCHES "DragonFly|FreeBSD")
 	# Always use system libusb as reference implementation isn't supported
 	add_library(usb-1.0-shared INTERFACE)
 	target_link_libraries(usb-1.0-shared INTERFACE PkgConfig::LIBUSB)
@@ -86,7 +93,12 @@ endif()
 
 
 # hidapi
-add_subdirectory(hidapi)
+if(ARMSX3_IOS)
+	# iOS does not expose IOKit USB/HID device enumeration to applications.
+	add_library(3rdparty_hidapi INTERFACE)
+else()
+	add_subdirectory(hidapi)
+endif()
 
 # glslang
 add_subdirectory(glslang EXCLUDE_FROM_ALL)
@@ -132,7 +144,10 @@ add_subdirectory(stblib)
 add_subdirectory(discord-rpc)
 
 # Cubeb
-if(USE_SYSTEM_CUBEB)
+if(ARMSX3_IOS)
+	add_library(3rdparty_cubeb INTERFACE)
+	add_library(3rdparty::cubeb ALIAS 3rdparty_cubeb)
+elseif(USE_SYSTEM_CUBEB)
 	find_package(cubeb REQUIRED GLOBAL)
 	message(STATUS "Using system cubeb version '${cubeb_VERSION}'")
 	add_library(3rdparty::cubeb ALIAS cubeb::cubeb)
@@ -169,7 +184,35 @@ endif()
 # Vulkan
 set(VULKAN_TARGET 3rdparty_dummy_lib)
 if(USE_VULKAN)
-	if(APPLE)
+	if(ARMSX3_IOS)
+		set(ARMSX3_IOS_DEPS_DIR "${CMAKE_BINARY_DIR}/ios-deps" CACHE PATH
+			"Root containing iOS dependency headers and static libraries")
+		set(ARMSX3_IOS_MOLTENVK_LIBRARY "${ARMSX3_IOS_DEPS_DIR}/moltenvk/lib/libMoltenVK.a"
+			CACHE FILEPATH "MoltenVK static library for iPhoneOS")
+
+		find_path(ARMSX3_IOS_VULKAN_INCLUDE_DIR vulkan/vulkan.h
+			PATHS "${ARMSX3_IOS_DEPS_DIR}/moltenvk/include"
+			NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
+		find_path(ARMSX3_IOS_MVK_INCLUDE_DIR MoltenVK/mvk_vulkan.h
+			PATHS "${ARMSX3_IOS_DEPS_DIR}/moltenvk/include"
+			NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
+
+		if(NOT ARMSX3_IOS_VULKAN_INCLUDE_DIR OR NOT ARMSX3_IOS_MVK_INCLUDE_DIR OR
+		   NOT EXISTS "${ARMSX3_IOS_MOLTENVK_LIBRARY}")
+			message(FATAL_ERROR
+				"iOS MoltenVK is missing. Run ios/build-dependencies.sh before configuring.")
+		endif()
+
+		add_library(3rdparty_vulkan INTERFACE)
+		target_compile_definitions(3rdparty_vulkan INTERFACE HAVE_VULKAN VK_USE_PLATFORM_METAL_EXT)
+		target_include_directories(3rdparty_vulkan SYSTEM INTERFACE
+			"${ARMSX3_IOS_VULKAN_INCLUDE_DIR}" "${ARMSX3_IOS_MVK_INCLUDE_DIR}")
+		target_link_libraries(3rdparty_vulkan INTERFACE
+			"${ARMSX3_IOS_MOLTENVK_LIBRARY}"
+			"-framework Foundation" "-framework Metal" "-framework QuartzCore"
+			"-framework CoreGraphics" "-framework IOSurface")
+		set(VULKAN_TARGET 3rdparty_vulkan)
+	elseif(APPLE)
 		if(USE_SYSTEM_MVK)
 			message(STATUS "RPCS3: Using system MoltenVK")
 		else()
@@ -196,8 +239,12 @@ if(USE_VULKAN)
 		endif()
 	endif()
 
-	find_package(Vulkan)
-	if(VULKAN_FOUND)
+	if(NOT ARMSX3_IOS)
+		find_package(Vulkan)
+	endif()
+	if(ARMSX3_IOS)
+		# The imported iPhoneOS MoltenVK target above is the Vulkan implementation.
+	elseif(VULKAN_FOUND)
 		add_library(3rdparty_vulkan INTERFACE)
 		target_compile_definitions(3rdparty_vulkan INTERFACE -DHAVE_VULKAN)
 		target_link_libraries(3rdparty_vulkan INTERFACE Vulkan::Vulkan)
@@ -298,7 +345,31 @@ set_property(TARGET ${FAUDIO_TARGET} PROPERTY FOLDER "3rdparty/")
 
 
 # FFMPEG
-if(NOT ANDROID)
+if(ARMSX3_IOS)
+	set(ARMSX3_IOS_DEPS_DIR "${CMAKE_BINARY_DIR}/ios-deps" CACHE PATH
+		"Root containing iOS dependency headers and static libraries")
+	set(ARMSX3_IOS_FFMPEG_DIR "${ARMSX3_IOS_DEPS_DIR}/ffmpeg" CACHE PATH
+		"FFmpeg installation prefix for iPhoneOS")
+
+	foreach(ffmpeg_lib avformat avcodec avutil swscale swresample)
+		if(NOT EXISTS "${ARMSX3_IOS_FFMPEG_DIR}/lib/lib${ffmpeg_lib}.a")
+			message(FATAL_ERROR
+				"iOS FFmpeg is missing (${ffmpeg_lib}). Run ios/build-dependencies.sh first.")
+		endif()
+	endforeach()
+
+	add_library(3rdparty_ffmpeg INTERFACE)
+	target_include_directories(3rdparty_ffmpeg SYSTEM INTERFACE
+		"${ARMSX3_IOS_FFMPEG_DIR}/include")
+	target_link_libraries(3rdparty_ffmpeg INTERFACE
+		"${ARMSX3_IOS_FFMPEG_DIR}/lib/libavformat.a"
+		"${ARMSX3_IOS_FFMPEG_DIR}/lib/libavcodec.a"
+		"${ARMSX3_IOS_FFMPEG_DIR}/lib/libavutil.a"
+		"${ARMSX3_IOS_FFMPEG_DIR}/lib/libswscale.a"
+		"${ARMSX3_IOS_FFMPEG_DIR}/lib/libswresample.a"
+		"-framework AudioToolbox" "-framework CoreMedia" "-framework CoreVideo"
+		"-framework VideoToolbox" "-framework Security" "-liconv" "-lz")
+elseif(NOT ANDROID)
 	add_library(3rdparty_ffmpeg INTERFACE)
 
 	# Select the version of ffmpeg to use, default is builtin

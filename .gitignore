@@ -166,3 +166,6 @@ android/**/cpp/libadrenotools/
 android/armsx3-ui/.kotlin/
 # claude
 CLAUDE.md
+
+# Device crash log collected during iOS testing
+/log.log
