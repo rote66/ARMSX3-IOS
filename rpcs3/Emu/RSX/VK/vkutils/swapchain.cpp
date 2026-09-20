@@ -291,6 +291,13 @@ namespace vk
 		VkPresentModeKHR swapchain_present_mode = VK_PRESENT_MODE_FIFO_KHR;
 		std::vector<VkPresentModeKHR> preferred_modes;
 
+#ifdef __ANDROID__
+		const bool frame_generation_enabled =
+			g_cfg.video.frame_generation != frame_generation_mode::off;
+#else
+		constexpr bool frame_generation_enabled = false;
+#endif
+
 		// Frame generation needs FIFO, whatever vsync is set to.
 		//
 		// Interpolated frames are presented BETWEEN the real ones, so each has to survive to a
@@ -302,7 +309,7 @@ namespace vk
 		// the camera moves.
 		//
 		// ARMSX2 forces FIFO for the same reason at the same point (VKSwapChain::SelectPresentMode).
-		if (g_cfg.video.frame_generation != frame_generation_mode::off &&
+		if (frame_generation_enabled &&
 			g_cfg.video.vsync != vsync_mode::full)
 		{
 			rsx_log.warning("Frame generation is enabled; using FIFO presentation so interpolated "
@@ -358,8 +365,7 @@ namespace vk
 		//
 		// ARMSX2 gates its own pipelined path on the chain having at least four images for the
 		// same reason.
-		const u32 extra_for_framegen =
-			g_cfg.video.frame_generation != frame_generation_mode::off ? 2u : 0u;
+		const u32 extra_for_framegen = frame_generation_enabled ? 2u : 0u;
 
 		if (surface_descriptors.maxImageCount > 0)
 		{
@@ -421,12 +427,12 @@ namespace vk
 		// Requested only where the surface offers it, since TRANSFER_SRC is not guaranteed on
 		// Android surfaces. Where it is missing, frame generation captures nothing valid, which
 		// is a better failure than an invalid one.
-		if (g_cfg.video.frame_generation != frame_generation_mode::off &&
+		if (frame_generation_enabled &&
 			(surface_descriptors.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
 		{
 			swap_info.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 		}
-		else if (g_cfg.video.frame_generation != frame_generation_mode::off)
+		else if (frame_generation_enabled)
 		{
 			rsx_log.warning("Swapchain: surface does not support TRANSFER_SRC; frame generation"
 				" cannot read presented frames on this surface.");

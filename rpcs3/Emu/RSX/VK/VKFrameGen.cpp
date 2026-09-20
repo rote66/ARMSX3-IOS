@@ -825,7 +825,8 @@ namespace vk::frame_gen
 	}
 
 #else
-	bool capture_presented_frame(const vk::command_buffer&, const vk::render_device&, VkImage, VkImageLayout, u32, u32)
+	bool capture_presented_frame(const vk::command_buffer&, const vk::render_device&, VkImage, VkImageLayout,
+		u32, u32, u32, u32)
 	{
 		return false;
 	}

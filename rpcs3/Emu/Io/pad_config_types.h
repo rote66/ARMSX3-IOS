@@ -21,7 +21,7 @@ enum class pad_handler
 #ifdef HAVE_LIBEVDEV
 	evdev,
 #endif
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(ARMSX3_IOS)
 	virtual_pad,
 #endif
 };

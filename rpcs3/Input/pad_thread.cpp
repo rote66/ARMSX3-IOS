@@ -1,12 +1,14 @@
 #include "stdafx.h"
 #include "pad_thread.h"
 #include "product_info.h"
+#if !defined(ARMSX3_IOS)
 #include "ds3_pad_handler.h"
 #include "ds4_pad_handler.h"
 #include "dualsense_pad_handler.h"
 #include "skateboard_pad_handler.h"
 #include "ps_move_handler.h"
-#ifdef __ANDROID__
+#endif
+#if defined(__ANDROID__) || defined(ARMSX3_IOS)
 #include "virtual_pad_handler.h"
 #endif
 #ifdef _WIN32
@@ -18,7 +20,7 @@
 #ifdef HAVE_SDL3
 #include "sdl_pad_handler.h"
 #endif
-#ifndef ANDROID
+#if !defined(ANDROID) && !defined(ARMSX3_IOS)
 #include "keyboard_pad_handler.h"
 #endif
 #include "Emu/Io/Null/NullPadHandler.h"
@@ -160,7 +162,7 @@ void pad_thread::Init()
 
 	input_log.trace("Using pad config:\n%s", g_cfg_input);
 
-#ifndef ANDROID
+#if !defined(ANDROID) && !defined(ARMSX3_IOS)
 	std::shared_ptr<keyboard_pad_handler> keyptr;
 #endif
 
@@ -183,7 +185,7 @@ void pad_thread::Init()
 		{
 			if (handler_type == pad_handler::keyboard)
 			{
-#ifndef ANDROID
+#if !defined(ANDROID) && !defined(ARMSX3_IOS)
 				keyptr = std::make_shared<keyboard_pad_handler>();
 				keyptr->moveToThread(static_cast<QThread*>(m_curthread));
 				keyptr->SetTargetWindow(static_cast<QWindow*>(m_curwindow));
@@ -941,11 +943,19 @@ std::shared_ptr<PadHandlerBase> pad_thread::GetHandler(pad_handler type)
 	case pad_handler::null:
 		return std::make_shared<NullPadHandler>();
 	case pad_handler::keyboard:
-#ifdef ANDROID
+	#if defined(ANDROID) || defined(ARMSX3_IOS)
 		return std::make_shared<NullPadHandler>();
 #else
 		return std::make_shared<keyboard_pad_handler>();
 #endif
+#if defined(ARMSX3_IOS)
+	case pad_handler::ds3:
+	case pad_handler::ds4:
+	case pad_handler::dualsense:
+	case pad_handler::skateboard:
+	case pad_handler::move:
+		return std::make_shared<NullPadHandler>();
+#else
 	case pad_handler::ds3:
 		return std::make_shared<ds3_pad_handler>();
 	case pad_handler::ds4:
@@ -956,6 +966,7 @@ std::shared_ptr<PadHandlerBase> pad_thread::GetHandler(pad_handler type)
 		return std::make_shared<skateboard_pad_handler>();
 	case pad_handler::move:
 		return std::make_shared<ps_move_handler>();
+#endif
 #ifdef _WIN32
 	case pad_handler::xinput:
 		return std::make_shared<xinput_pad_handler>();
@@ -970,7 +981,7 @@ std::shared_ptr<PadHandlerBase> pad_thread::GetHandler(pad_handler type)
 	case pad_handler::evdev:
 		return std::make_shared<evdev_joystick_handler>();
 #endif
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(ARMSX3_IOS)
 	// ARMSX3: on-screen touch controls. Guard must match the enum value in
 	// Emu/Io/pad_config_types.h and the fmt_class_string case beside it.
 	case pad_handler::virtual_pad:

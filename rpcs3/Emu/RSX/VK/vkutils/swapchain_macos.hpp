@@ -15,7 +15,11 @@ namespace vk
 		VkSurfaceKHR result = VK_NULL_HANDLE;
 		VkMetalSurfaceCreateInfoEXT createInfo = {};
 		createInfo.sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT;
-		createInfo.pLayer = GetCAMetalLayerFromMetalView(window_handle);
+		#if defined(__OBJC__) && __has_feature(objc_arc)
+		createInfo.pLayer = (__bridge const CAMetalLayer*)GetCAMetalLayerFromMetalView(window_handle);
+		#else
+		createInfo.pLayer = static_cast<const CAMetalLayer*>(GetCAMetalLayerFromMetalView(window_handle));
+		#endif
 
 		CHECK_RESULT(vkCreateMetalSurfaceEXT(vk_instance, &createInfo, NULL, &result));
 		return result;
