@@ -794,7 +794,10 @@ static NSString *armsx3_prepare_shared_documents(void)
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         const BOOL stopped = armsx3_ios_stop();
         if (stopped)
+        {
+            armsx3_ios_log_memory_state("stop complete");
             [self setFrontendVisible:YES];
+        }
         else
             [self showStatus:@"停止模拟器超时；核心仍在清理中。" error:YES];
     });

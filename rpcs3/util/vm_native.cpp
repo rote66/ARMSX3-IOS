@@ -469,7 +469,25 @@ namespace utils
 		memory_commit(pointer, size, prot);
 #else
 		const u64 ptr64 = reinterpret_cast<u64>(pointer);
-#if defined(__APPLE__) && defined(ARCH_ARM64)
+#if defined(ARMSX3_IOS) && defined(__APPLE__) && defined(ARCH_ARM64)
+		// iOS uses memory_reset() for the shared JIT arena when an emulation
+		// session ends. Recreate the mapping to guarantee zeroed pages, but do not
+		// follow the generic Darwin path with MADV_WILLNEED: the arena can be
+		// 512 MiB and eagerly faulting it back in after every stop leaves roughly
+		// half a gigabyte resident before the next game even starts. That retained
+		// baseline compounds with Metal/guest memory and can make iOS jetsam the
+		// process during the second session.
+		ensure(::munmap(pointer, size) != -1);
+		ensure(::mmap(pointer, size, +prot, MAP_ANON | MAP_PRIVATE | (can_be_jit ? MAP_JIT : 0), -1, 0) == pointer);
+		if constexpr (c_madv_free != 0)
+		{
+			// The fresh anonymous mapping is already zero-filled. This is only a
+			// residency hint: keep untouched JIT capacity reclaimable until code is
+			// actually written again.
+			ensure(::madvise(pointer, size, c_madv_free) != -1);
+		}
+		return;
+#elif defined(__APPLE__) && defined(ARCH_ARM64)
 		ensure(::munmap(pointer, size) != -1);
 		ensure(::mmap(pointer, size, +prot,  MAP_ANON | MAP_PRIVATE | (can_be_jit ? MAP_JIT : 0), -1, 0) == pointer);
 #else

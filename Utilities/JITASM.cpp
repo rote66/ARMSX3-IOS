@@ -560,6 +560,13 @@ void jit_runtime::finalize() noexcept
 #if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
 	const bool was_execution_ready = s_ios_jit_execution_ready.exchange(false);
 	const bool map_jit = get_jit_memory_arena().map_jit;
+	const u64 code_state = s_code_pos.load();
+	const u64 data_state = s_data_pos.load();
+	armsx3_ios_diagnostic_log(fmt::format(
+		"jit finalize: arena=%uMB code_used=%uMB code_committed=%uMB data_used=%uMB data_committed=%uMB",
+		static_cast<u32>((segment_size * 2) >> 20),
+		static_cast<u32>((code_state & 0xffff'ffff) >> 20), static_cast<u32>((code_state >> 32) >> 20),
+		static_cast<u32>((data_state & 0xffff'ffff) >> 20), static_cast<u32>((data_state >> 32) >> 20)).c_str());
 #endif
 
 	// Reset JIT memory
@@ -571,6 +578,7 @@ void jit_runtime::finalize() noexcept
 	// issue a redundant mprotect(RW). Preserve that invariant across resets.
 #if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
 	utils::memory_reset(arena_base, segment_size * 2, utils::protection::rw, map_jit);
+	armsx3_ios_diagnostic_log("jit finalize: arena reset without prefetch");
 #else
 	utils::memory_decommit(arena_base, segment_size * 2, true);
 #endif
