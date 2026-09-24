@@ -1,4 +1,7 @@
 #import "ARMSX3SettingsViewController.h"
+#import "ARMSX3LibraryManagers.h"
+#import "ARMSX3ControllerMappings.h"
+#import "ARMSX3Localization.h"
 
 #include "armsx3_ios_core.h"
 
@@ -38,9 +41,12 @@
 @implementation ARMSX3SliderAccessory
 - (instancetype)init
 {
-    if ((self = [super initWithFrame:CGRectMake(0, 0, 210, 44)]))
+    // accessoryView is laid out by UITableView using its frame/bounds. A 210-point
+    // accessory consumed most of an iPhone settings row and visually sat on top of
+    // the title/subtitle. Keep the control compact and let the table reserve exactly
+    // this amount of trailing space.
+    if ((self = [super initWithFrame:CGRectMake(0, 0, 154, 44)]))
     {
-        self.translatesAutoresizingMaskIntoConstraints = NO;
         _slider = [[UISlider alloc] init];
         _slider.translatesAutoresizingMaskIntoConstraints = NO;
         _valueLabel = [[UILabel alloc] init];
@@ -51,17 +57,146 @@
         [self addSubview:_slider];
         [self addSubview:_valueLabel];
         [NSLayoutConstraint activateConstraints:@[
-            [self.widthAnchor constraintEqualToConstant:210],
-            [self.heightAnchor constraintEqualToConstant:44],
             [_slider.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
             [_slider.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
-            [_slider.widthAnchor constraintEqualToConstant:150],
             [_valueLabel.leadingAnchor constraintEqualToAnchor:_slider.trailingAnchor constant:6],
             [_valueLabel.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
             [_valueLabel.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+            [_valueLabel.widthAnchor constraintEqualToConstant:48],
         ]];
     }
     return self;
+}
+
+static NSString *ARMSX3PolishedSettingName(NSString *raw, NSString *path)
+{
+    // The table below is intentionally hand-polished Simplified Chinese. Other
+    // locales must never inherit it: their Android JSON may not contain every
+    // low-level RPCS3 node, so English RPCS3 names are the correct fallback.
+    if (!ARMSX3LanguageIsSimplifiedChinese()) return raw;
+    NSDictionary<NSString *, NSString *> *pathNames = @{
+        @"Video@@Debug overlay": @"RSX 调试叠加层（开发者）",
+        @"Video@@Performance Overlay@@Enabled": @"性能监控叠加层（FPS）",
+        @"Video@@Performance Overlay@@Enable Framerate Graph": @"帧率曲线",
+        @"Video@@Performance Overlay@@Enable Frametime Graph": @"帧时间曲线",
+        @"Video@@Performance Overlay@@Framerate datapoints": @"帧率曲线采样点数",
+        @"Video@@Performance Overlay@@Frametime datapoints": @"帧时间曲线采样点数",
+        @"Video@@Performance Overlay@@Detail level": @"性能信息详细程度",
+        @"Video@@Performance Overlay@@Framerate graph detail level": @"帧率曲线详细程度",
+        @"Video@@Performance Overlay@@Frametime graph detail level": @"帧时间曲线详细程度",
+        @"Video@@Performance Overlay@@Metrics update interval (ms)": @"统计刷新间隔（毫秒）",
+        @"Video@@Performance Overlay@@Font size (px)": @"OSD 字体大小",
+        @"Video@@Performance Overlay@@Position": @"OSD 显示位置",
+        @"Video@@Performance Overlay@@Horizontal Margin (%)": @"水平边距",
+        @"Video@@Performance Overlay@@Vertical Margin (%)": @"垂直边距",
+        @"Video@@Performance Overlay@@Center Horizontally": @"水平居中",
+        @"Video@@Performance Overlay@@Center Vertically": @"垂直居中",
+        @"Video@@Performance Overlay@@Opacity (%)": @"OSD 不透明度",
+        @"Video@@Performance Overlay@@Body Color (hex)": @"正文颜色",
+        @"Video@@Performance Overlay@@Body Background (hex)": @"正文背景色",
+        @"Video@@Performance Overlay@@Title Color (hex)": @"标题颜色",
+        @"Video@@Performance Overlay@@Title Background (hex)": @"标题背景色",
+        @"Video@@Performance Overlay@@Use Window Space": @"按窗口空间定位",
+        @"Audio@@Renderer": @"音频后端",
+        @"Video@@Renderer": @"图形后端",
+        @"System@@Language": @"PS3 系统语言",
+    };
+    NSString *specific = pathNames[path];
+    if (specific) return specific;
+
+    NSDictionary<NSString *, NSString *> *names = @{
+        @"PPU Decoder": @"PPU 解码器", @"PPU Threads": @"PPU 线程数",
+        @"Max LLVM Compile Threads": @"LLVM 最大编译线程数", @"LLVM Precompilation": @"LLVM 预编译",
+        @"Thread Scheduler Mode": @"线程调度模式", @"Set DAZ and FTZ": @"DAZ / FTZ 浮点模式",
+        @"SPU Decoder": @"SPU 解码器", @"Preferred SPU Threads": @"首选 SPU 线程数",
+        @"SPU delay penalty": @"SPU 延迟惩罚", @"SPU loop detection": @"SPU 循环检测",
+        @"Max SPURS Threads": @"SPURS 最大线程数", @"SPU Block Size": @"SPU 块大小",
+        @"Accurate SPU DMA": @"精确 SPU DMA", @"Accurate SPU Reservations": @"精确 SPU 保留",
+        @"Accurate Cache Line Stores": @"精确缓存行写入", @"SPU Verification": @"SPU 校验",
+        @"SPU Cache": @"SPU 缓存", @"SPU Profiler": @"SPU 性能分析",
+        @"PPU Profiler": @"PPU 性能分析", @"Clocks scale": @"时钟倍率",
+        @"SPU Wake-Up Delay": @"SPU 唤醒延迟", @"Sleep Timers Accuracy": @"休眠计时精度",
+        @"Resolution": @"输出分辨率", @"Aspect ratio": @"画面宽高比", @"Frame limit": @"帧率限制",
+        @"Second Frame Limit": @"第二帧率限制", @"Shader Mode": @"着色器编译模式",
+        @"Shader Precision": @"着色器精度", @"VSync Mode": @"垂直同步（VSync）",
+        @"Write Color Buffers": @"写入颜色缓冲区", @"Write Depth Buffer": @"写入深度缓冲区",
+        @"Read Color Buffers": @"读取颜色缓冲区", @"Read Depth Buffer": @"读取深度缓冲区",
+        @"Strict Rendering Mode": @"严格渲染模式", @"Enable Frame Skip": @"启用跳帧",
+        @"Resolution Scale": @"内部渲染分辨率", @"Anisotropic Filter Override": @"各向异性过滤",
+        @"Shader Compiler Threads": @"着色器编译线程数", @"Vblank Rate": @"VBlank 刷新率",
+        @"Output Scaling Mode": @"画面缩放方式", @"Multithreaded RSX": @"多线程 RSX",
+        @"Relaxed ZCULL Sync": @"宽松 ZCULL 同步", @"RSX Profiler": @"RSX 性能分析",
+        @"VRAM allocation limit (MB)": @"显存分配上限（MB）", @"Asynchronous Texture Streaming": @"异步纹理流送",
+        @"Asynchronous Queue Scheduler": @"异步队列调度", @"Use Re-BAR for GPU uploads": @"GPU 上传使用 Re-BAR",
+        @"Audio Provider": @"音频提供器", @"Audio Format": @"音频格式",
+        @"Audio Channel Layout": @"声道布局", @"Audio Device": @"音频设备", @"Master Volume": @"主音量",
+        @"Enable Buffering": @"启用音频缓冲", @"Desired Audio Buffer Duration": @"目标音频缓冲时长",
+        @"Enable Time Stretching": @"启用时间拉伸", @"Time Stretching Threshold": @"时间拉伸阈值",
+        @"Microphone Type": @"麦克风类型", @"Microphone Devices": @"麦克风设备",
+        @"Keyboard": @"键盘处理器", @"Mouse": @"鼠标处理器", @"Camera": @"摄像头处理器",
+        @"Pad handler mode": @"手柄处理模式", @"Keep pads connected": @"保持手柄连接",
+        @"Pad handler sleep (microseconds)": @"手柄轮询休眠（微秒）", @"Background input enabled": @"允许后台输入",
+        @"Load SDL GameController Mappings": @"加载 SDL 手柄映射", @"IO Debug overlay": @"输入设备调试叠加层",
+        @"Mouse Debug overlay": @"鼠标调试叠加层", @"Keyboard Type": @"PS3 键盘布局",
+        @"Enter button assignment": @"确认键分配", @"Date Format": @"日期格式", @"Time Format": @"时间格式",
+        @"Internet enabled": @"网络连接", @"IP address": @"IP 地址", @"Bind address": @"绑定地址",
+        @"DNS address": @"DNS 地址", @"UPNP Enabled": @"启用 UPnP", @"PSN status": @"PSN 状态",
+        @"PSN Country": @"PSN 国家/地区", @"Start Paused": @"读取即时存档后暂停",
+        @"Suspend Emulation Savestate Mode": @"暂停模拟后保存即时存档", @"Compatible Savestate Mode": @"兼容模式即时存档",
+        @"Inspection Mode Savestates": @"检查模式即时存档", @"Save Disc Game Data": @"保存光盘游戏数据",
+        @"Maximum SaveState Files": @"即时存档最大数量", @"Maximum SaveState Files Space (MiB)": @"即时存档空间上限（MiB）",
+        @"Show trophy popups": @"显示奖杯通知", @"Show RPCN popups": @"显示 RPCN 通知",
+        @"Show shader compilation hint": @"显示着色器编译提示", @"Show PPU compilation hint": @"显示 PPU 编译提示",
+        @"Show autosave/autoload hint": @"显示自动保存/读取提示", @"Show fatal error hints": @"显示严重错误提示",
+        @"Prevent display sleep while running games": @"游戏运行时防止息屏", @"Silence All Logs": @"关闭全部日志",
+        @"Pause Emulation During Home Menu": @"打开主菜单时暂停模拟", @"Play music during boot sequence": @"启动过程播放音乐",
+    };
+    return names[raw] ?: raw;
+}
+
+static NSString *ARMSX3PolishedSettingDetail(ARMSX3CoreSetting *setting)
+{
+    if (!ARMSX3LanguageIsSimplifiedChinese()) return setting.path;
+    NSDictionary<NSString *, NSString *> *details = @{
+        @"Video@@Performance Overlay@@Enabled": @"在游戏画面上显示 FPS、帧时间、CPU/GPU 负载等性能信息。要看帧率请开启这一项。",
+        @"Video@@Debug overlay": @"显示 RSX/渲染器内部调试信息，主要给开发者排查问题；它本身不显示常规 FPS 统计。",
+        @"Video@@Performance Overlay@@Detail level": @"“最简”只显示核心性能数据；级别越高，显示的线程、内存和帧时间信息越多。",
+        @"Video@@Performance Overlay@@Enable Framerate Graph": @"绘制帧率随时间变化的曲线，方便观察掉帧。",
+        @"Video@@Performance Overlay@@Enable Frametime Graph": @"绘制每帧耗时曲线，比平均 FPS 更容易看出瞬时卡顿。",
+        @"Core@@PPU Decoder": @"PPU 的执行方式。LLVM 重编译器通常性能最好。",
+        @"Core@@SPU Decoder": @"SPU 的执行方式。LLVM 重编译器通常是推荐选择。",
+        @"Video@@Resolution Scale": @"调整内部渲染分辨率。数值越高画面越清晰，但 GPU 压力也越大。",
+        @"Video@@Write Color Buffers": @"部分游戏的后处理、HUD 或画面特效需要；会增加开销，遇到相关图形问题时再开启。",
+        @"Video@@Read Color Buffers": @"允许 RSX 读取 CPU 写入的颜色数据。少数游戏需要，开启会降低性能。",
+        @"Audio@@Enable Buffering": @"增加音频缓冲可减少爆音和断续，但会略微增加声音延迟。",
+        @"Audio@@Desired Audio Buffer Duration": @"目标音频缓冲长度。卡顿设备可适当提高，追求低延迟可适当降低。",
+        @"Audio@@Enable Time Stretching": @"模拟速度波动时通过时间拉伸维持更连续的声音。",
+        @"Input/Output@@Background input enabled": @"应用不在前台焦点时仍接收手柄输入。",
+    };
+    return details[setting.path] ?: setting.path;
+}
+
+static NSString *ARMSX3PolishedValue(id value)
+{
+    NSString *raw = [value description] ?: @"";
+    if (!ARMSX3LanguageIsSimplifiedChinese()) return raw;
+    NSDictionary<NSString *, NSString *> *values = @{
+        @"Auto": @"自动", @"Automatic": @"自动", @"Default": @"默认", @"Disabled": @"关闭",
+        @"Enabled": @"开启", @"None": @"无", @"Unknown": @"未知", @"All": @"全部",
+        @"Low": @"低", @"Medium": @"中等", @"High": @"高", @"Minimal": @"最简",
+        @"Top Left": @"左上", @"Top Right": @"右上", @"Bottom Left": @"左下", @"Bottom Right": @"右下",
+        @"Recompiler (LLVM)": @"重编译器（LLVM）", @"Operating System": @"由系统调度",
+        @"Safe": @"安全", @"Atomic": @"原子", @"Approximate": @"近似", @"As Host": @"跟随主机",
+        @"Async Recompiler (multi-threaded)": @"异步重编译（多线程）", @"Bilinear": @"双线性",
+        @"Single-threaded": @"单线程", @"Disconnected": @"未连接", @"Stereo": @"立体声",
+        @"English (US)": @"英语（美国）", @"Enter with cross": @"× 键确认", @"Basic": @"基础",
+    };
+    return values[raw] ?: raw;
+}
+
+- (CGSize)intrinsicContentSize
+{
+    return CGSizeMake(154, 44);
 }
 @end
 
@@ -72,9 +207,13 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     ARMSX3SettingsCategoryGraphics,
     ARMSX3SettingsCategoryAudio,
     ARMSX3SettingsCategoryControls,
+    ARMSX3SettingsCategoryHotkeys,
+    ARMSX3SettingsCategorySkins,
     ARMSX3SettingsCategoryNetwork,
     ARMSX3SettingsCategoryOnScreen,
     ARMSX3SettingsCategoryAdvanced,
+    ARMSX3SettingsCategoryPatches,
+    ARMSX3SettingsCategoryMods,
     ARMSX3SettingsCategoryCore,
 };
 
@@ -85,6 +224,7 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
 {
     __weak id<ARMSX3SettingsHost> _host;
     BOOL _jitAvailable;
+    BOOL _coreOnly;
     ARMSX3SettingsCategory _category;
     NSArray<ARMSX3CoreSetting *> *_allSettings;
     NSArray<ARMSX3CoreSetting *> *_visibleSettings;
@@ -94,16 +234,23 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     UISearchBar *_searchBar;
     NSLayoutConstraint *_searchHeight;
     UILabel *_subtitleLabel;
+    UILabel *_pageTitleLabel;
     NSArray<UIButton *> *_categoryButtons;
 }
 
 - (instancetype)initWithHost:(id<ARMSX3SettingsHost>)host jitAvailable:(BOOL)jitAvailable
 {
+    return [self initWithHost:host jitAvailable:jitAvailable coreOnly:NO];
+}
+
+- (instancetype)initWithHost:(id<ARMSX3SettingsHost>)host jitAvailable:(BOOL)jitAvailable coreOnly:(BOOL)coreOnly
+{
     if ((self = [super initWithNibName:nil bundle:nil]))
     {
         _host = host;
         _jitAvailable = jitAvailable;
-        _category = ARMSX3SettingsCategoryGeneral;
+        _coreOnly = coreOnly;
+        _category = coreOnly ? ARMSX3SettingsCategoryCore : ARMSX3SettingsCategoryGeneral;
         _allSettings = @[];
         _visibleSettings = @[];
         self.modalPresentationStyle = UIModalPresentationFullScreen;
@@ -120,18 +267,30 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     [self reloadCoreSettings];
 }
 
+- (void)viewWillAppear:(BOOL)animated
+{
+    [super viewWillAppear:animated];
+    [self updateLocalizedChrome];
+    [self reloadCoreSettings];
+}
+
 - (NSArray<NSDictionary *> *)categories
 {
+    if (_coreOnly)
+        return @[@{@"title": ARMSX3L(@"ios.settings.core", @"All Core Settings"), @"glyph": @"🧩", @"category": @(ARMSX3SettingsCategoryCore)}];
     return @[
-        @{@"title": @"通用", @"glyph": @"⌂"},
-        @{@"title": @"性能", @"glyph": @"↯"},
-        @{@"title": @"图形", @"glyph": @"◫"},
-        @{@"title": @"音频", @"glyph": @"♫"},
-        @{@"title": @"控制", @"glyph": @"⌁"},
-        @{@"title": @"网络", @"glyph": @"◎"},
-        @{@"title": @"屏幕显示", @"glyph": @"⊕"},
-        @{@"title": @"高级", @"glyph": @"⌘"},
-        @{@"title": @"Core", @"glyph": @"⚙"},
+        @{@"title": ARMSX3L(@"tab.app", @"App"), @"glyph": @"⌂", @"category": @(ARMSX3SettingsCategoryGeneral)},
+        @{@"title": ARMSX3L(@"tab.performance", @"Performance"), @"glyph": @"↯", @"category": @(ARMSX3SettingsCategoryPerformance)},
+        @{@"title": ARMSX3L(@"tab.renderer", @"Graphics"), @"glyph": @"◫", @"category": @(ARMSX3SettingsCategoryGraphics)},
+        @{@"title": ARMSX3L(@"tab.audio", @"Audio"), @"glyph": @"♫", @"category": @(ARMSX3SettingsCategoryAudio)},
+        @{@"title": ARMSX3L(@"tab.controls", @"Controls"), @"glyph": @"⌁", @"category": @(ARMSX3SettingsCategoryControls)},
+        @{@"title": ARMSX3L(@"tab.hotkeys", @"Hotkeys"), @"glyph": @"⌘", @"category": @(ARMSX3SettingsCategoryHotkeys)},
+        @{@"title": ARMSX3L(@"tab.skins", @"Skins"), @"glyph": @"◈", @"category": @(ARMSX3SettingsCategorySkins)},
+        @{@"title": ARMSX3L(@"tab.network", @"Network"), @"glyph": @"◎", @"category": @(ARMSX3SettingsCategoryNetwork)},
+        @{@"title": ARMSX3L(@"tab.overlay", @"On-Screen"), @"glyph": @"⊕", @"category": @(ARMSX3SettingsCategoryOnScreen)},
+        @{@"title": ARMSX3L(@"tab.fixes", @"Advanced"), @"glyph": @"⌘", @"category": @(ARMSX3SettingsCategoryAdvanced)},
+        @{@"title": ARMSX3L(@"tab.patches", @"Patches & Cheats"), @"glyph": @"✦", @"category": @(ARMSX3SettingsCategoryPatches)},
+        @{@"title": ARMSX3L(@"tab.mods", @"Mods"), @"glyph": @"▣", @"category": @(ARMSX3SettingsCategoryMods)},
     ];
 }
 
@@ -153,18 +312,18 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     back.accessibilityLabel = @"返回";
     [back addTarget:self action:@selector(closeSettings) forControlEvents:UIControlEventTouchUpInside];
 
-    UILabel *title = [[UILabel alloc] init];
-    title.translatesAutoresizingMaskIntoConstraints = NO;
-    title.text = @"ARMSX3 设置";
-    title.font = [UIFont systemFontOfSize:22 weight:UIFontWeightBold];
-    title.textColor = UIColor.labelColor;
+    _pageTitleLabel = [[UILabel alloc] init];
+    _pageTitleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _pageTitleLabel.text = _coreOnly ? ARMSX3L(@"ios.settings.core", @"All Core Settings") : ARMSX3L(@"ios.settings.title", @"ARMSX3 Settings");
+    _pageTitleLabel.font = [UIFont systemFontOfSize:22 weight:UIFontWeightBold];
+    _pageTitleLabel.textColor = UIColor.labelColor;
 
     _subtitleLabel = [[UILabel alloc] init];
     _subtitleLabel.translatesAutoresizingMaskIntoConstraints = NO;
     _subtitleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
     _subtitleLabel.textColor = UIColor.secondaryLabelColor;
 
-    UIStackView *titles = [[UIStackView alloc] initWithArrangedSubviews:@[title, _subtitleLabel]];
+    UIStackView *titles = [[UIStackView alloc] initWithArrangedSubviews:@[_pageTitleLabel, _subtitleLabel]];
     titles.translatesAutoresizingMaskIntoConstraints = NO;
     titles.axis = UILayoutConstraintAxisVertical;
     titles.spacing = 1;
@@ -198,7 +357,7 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     {
         NSDictionary *item = categories[index];
         UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
-        button.tag = index;
+        button.tag = [item[@"category"] integerValue];
         button.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
         [button setTitle:[NSString stringWithFormat:@"%@  %@", item[@"glyph"], item[@"title"]]
             forState:UIControlStateNormal];
@@ -216,7 +375,7 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     _searchBar = [[UISearchBar alloc] init];
     _searchBar.translatesAutoresizingMaskIntoConstraints = NO;
     _searchBar.delegate = self;
-    _searchBar.placeholder = @"搜索 RPCS3 设置";
+    _searchBar.placeholder = ARMSX3L(@"games.search.placeholder", @"Search settings…");
     _searchBar.searchBarStyle = UISearchBarStyleMinimal;
     _searchBar.alpha = 0;
     [self.view addSubview:_searchBar];
@@ -270,6 +429,19 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
         [_tableView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
     ]];
     [self updateCategoryButtons];
+}
+
+- (void)updateLocalizedChrome
+{
+    _pageTitleLabel.text = _coreOnly ? ARMSX3L(@"ios.settings.core", @"All Core Settings") : ARMSX3L(@"ios.settings.title", @"ARMSX3 Settings");
+    _searchBar.placeholder = ARMSX3L(@"games.search.placeholder", @"Search settings…");
+    NSArray *categories = [self categories];
+    for (NSUInteger i = 0; i < MIN(categories.count, _categoryButtons.count); i++)
+    {
+        NSDictionary *item = categories[i];
+        [_categoryButtons[i] setTitle:[NSString stringWithFormat:@"%@  %@", item[@"glyph"], item[@"title"]] forState:UIControlStateNormal];
+    }
+    [_tableView reloadData];
 }
 
 - (void)closeSettings
@@ -327,6 +499,13 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     }
 }
 
+- (NSString *)titleForCategory:(ARMSX3SettingsCategory)category
+{
+    for (NSDictionary *item in [self categories])
+        if ([item[@"category"] integerValue] == category) return item[@"title"];
+    return ARMSX3L(@"action.settings", @"Settings");
+}
+
 - (void)reloadCoreSettings
 {
     if (!armsx3_ios_is_initialized())
@@ -380,7 +559,7 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
 
         ARMSX3CoreSetting *setting = [[ARMSX3CoreSetting alloc] init];
         setting.path = path;
-        setting.name = key;
+        setting.name = ARMSX3PolishedSettingName(key, path);
         setting.section = section.length ? section : key;
         setting.type = type;
         setting.value = child[@"value"] ?: @"";
@@ -451,11 +630,24 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
                 [setting.path localizedCaseInsensitiveContainsString:query];
             if (categoryMatch && queryMatch) [filtered addObject:setting];
         }
+        if (_category == ARMSX3SettingsCategoryOnScreen && query.length == 0)
+        {
+            [filtered sortUsingComparator:^NSComparisonResult(ARMSX3CoreSetting *a, ARMSX3CoreSetting *b) {
+                NSInteger (^rank)(ARMSX3CoreSetting *) = ^NSInteger(ARMSX3CoreSetting *s) {
+                    if ([s.path hasPrefix:@"Video@@Performance Overlay@@"]) return 0;
+                    if ([s.path isEqualToString:@"Video@@Debug overlay"]) return 2;
+                    return 1;
+                };
+                NSInteger ra = rank(a), rb = rank(b);
+                if (ra != rb) return ra < rb ? NSOrderedAscending : NSOrderedDescending;
+                return [a.path localizedCaseInsensitiveCompare:b.path];
+            }];
+        }
         _visibleSettings = filtered;
     }
 
     const char *firmwareVersion = armsx3_ios_firmware_version();
-    NSString *firmware = firmwareVersion && *firmwareVersion ? [NSString stringWithUTF8String:firmwareVersion] : @"未安装";
+    NSString *firmware = firmwareVersion && *firmwareVersion ? [NSString stringWithUTF8String:firmwareVersion] : ARMSX3L(@"ios.general.notInstalled", @"Not installed");
     _subtitleLabel.text = [NSString stringWithFormat:@"全局 · 固件 %@ · %@",
         firmware, armsx3_ios_settings_editable() ? @"可编辑" : @"运行中只读"];
     [_tableView reloadData];
@@ -473,26 +665,66 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
 {
-    if (_category == ARMSX3SettingsCategoryGeneral && _searchBar.text.length == 0) return 7;
+    if (_category == ARMSX3SettingsCategoryGeneral && _searchBar.text.length == 0) return 8;
+    if (_searchBar.text.length == 0 && _category == ARMSX3SettingsCategoryControls) return _visibleSettings.count + 1;
+    if (_searchBar.text.length == 0 && _category == ARMSX3SettingsCategoryHotkeys) return 1;
+    if (_searchBar.text.length == 0 && _category == ARMSX3SettingsCategorySkins) return 3;
+    if (_searchBar.text.length == 0 && _category == ARMSX3SettingsCategoryPatches) return 2;
+    if (_searchBar.text.length == 0 && _category == ARMSX3SettingsCategoryMods) return 2;
     return _visibleSettings.count;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section
 {
     if (_searchBar.text.length)
-        return [NSString stringWithFormat:@"搜索结果 · %lu 项", (unsigned long)_visibleSettings.count];
-    return [self categories][_category][@"title"];
+        return [NSString stringWithFormat:@"%@ · %lu", ARMSX3L(@"ios.search.results", @"Search Results"), (unsigned long)_visibleSettings.count];
+    return [self titleForCategory:_category];
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
 {
     if (_category == ARMSX3SettingsCategoryGeneral && _searchBar.text.length == 0)
-        return @"设置中心按 Android ARMSX3 的结构移植。固件安装源默认打开 Documents/Firmware；RPCS3 参数直接读写全局 config.yml。";
+        return ARMSX3L(@"ios.settings.footer.general", @"The settings center follows the Android ARMSX3 structure. RPCS3 options directly edit the shared config.yml.");
     if (!armsx3_ios_settings_editable())
-        return @"游戏或 XMB 正在运行。当前配置只读；停止模拟器后即可修改。";
+        return ARMSX3L(@"ios.settings.footer.running", @"A game or XMB is running. Core configuration is read-only until emulation stops.");
     if (_category == ARMSX3SettingsCategoryCore)
-        return @"Core 显示 RPCS3 当前配置树中的全部可编辑节点，用来覆盖精选标签页没有单独列出的参数。";
+        return ARMSX3L(@"ios.settings.footer.core", @"Core shows every editable node in RPCS3's current configuration tree, including options not surfaced in the curated tabs.");
+    if (_category == ARMSX3SettingsCategoryOnScreen)
+        return ARMSX3L(@"ios.settings.footer.osd", @"FPS belongs to the Performance Overlay, not the RSX Debug Overlay. Minimal detail is enough for basic FPS; enable graphs only when needed.");
     return nil;
+}
+
+- (UITableViewCell *)androidStaticCellAtRow:(NSInteger)row
+{
+    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+    cell.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+    cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+    cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    if (_category == ARMSX3SettingsCategoryHotkeys)
+    {
+        cell.textLabel.text = ARMSX3L(@"ios.hotkeys.title", @"Controller Hotkeys");
+        cell.detailTextLabel.text = ARMSX3L(@"hotkeys.help", @"Bind physical buttons to menu, savestate, screenshot, OSD, resolution and session actions.");
+    }
+    else if (_category == ARMSX3SettingsCategorySkins)
+    {
+        NSArray *rows = @[
+            @[@"触控皮肤与布局", @"Android TouchControls 的布局、透明度和控件选项"],
+            @[@"编辑触控布局", @"拖动、缩放、网格与重叠检查"],
+            @[@"恢复 Android 默认", @"恢复 Android TouchLayout.default()"],
+        ];
+        cell.textLabel.text = rows[row][0]; cell.detailTextLabel.text = rows[row][1];
+    }
+    else if (_category == ARMSX3SettingsCategoryPatches)
+    {
+        cell.textLabel.text = row ? @"全部 Core Patch 相关节点" : @"RPCS3 补丁";
+        cell.detailTextLabel.text = row ? @"使用全部 Core 设置搜索 patch/patches" : @"使用 RPCS3 patch.yml；不引入 iOS 专用补丁格式";
+    }
+    else
+    {
+        cell.textLabel.text = row ? @"每游戏 Mods" : @"Mods 库";
+        cell.detailTextLabel.text = row ? @"沿用 Android 的按标题作用域概念" : @"使用 ARMSX3/RPCS3 数据目录，不建立第二套 iOS 格式";
+    }
+    return cell;
 }
 
 - (UITableViewCell *)generalCellAtRow:(NSInteger)row
@@ -507,17 +739,21 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     switch (row)
     {
     case 0:
-        cell.textLabel.text = @"PS3 系统软件";
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"当前：%@", firmware];
+        cell.textLabel.text = ARMSX3L(@"ios.general.systemSoftware", @"PS3 System Software");
+        cell.detailTextLabel.text = [NSString stringWithFormat:@"%@", firmware];
         cell.accessoryType = UITableViewCellAccessoryNone;
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
         break;
+    case 7:
+        cell.textLabel.text = ARMSX3L(@"app.language", @"Language");
+        cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ · %@", ARMSX3L(@"app.language.desc", @"Choose the app language. Applies instantly."), ARMSX3ResolvedLanguageCode()];
+        break;
     case 1:
-        cell.textLabel.text = @"安装 PS3 系统软件 (.PUP)";
+        cell.textLabel.text = ARMSX3L(@"ios.general.installFirmware", @"Install PS3 System Software (.PUP)");
         cell.detailTextLabel.text = @"默认从 ARMSX3/Firmware 目录选择";
         break;
     case 2:
-        cell.textLabel.text = @"启动 PS3 系统软件（XMB/VSH）";
+        cell.textLabel.text = ARMSX3L(@"ios.general.bootFirmware", @"Boot PS3 System Software (XMB/VSH)");
         cell.detailTextLabel.text = armsx3_ios_can_boot_firmware() ? @"直接启动已安装的 dev_flash/vsh/module/vsh.self" : @"尚未找到可启动的 VSH";
         cell.userInteractionEnabled = armsx3_ios_can_boot_firmware();
         cell.textLabel.enabled = cell.userInteractionEnabled;
@@ -527,15 +763,15 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
         cell.detailTextLabel.text = _jitAvailable ? @"已可用" : @"不可用；打开 JIT helper 授权";
         break;
     case 4:
-        cell.textLabel.text = @"虚拟手柄";
-        cell.detailTextLabel.text = @"显示或隐藏屏幕触控控制";
+        cell.textLabel.text = ARMSX3L(@"ios.general.touch", @"Touch Controller");
+        cell.detailTextLabel.text = @"Android 同源触控布局、透明度与编辑器";
         break;
     case 5:
-        cell.textLabel.text = @"共享运行日志";
+        cell.textLabel.text = ARMSX3L(@"ios.general.shareLog", @"Share Runtime Log");
         cell.detailTextLabel.text = @"导出当前 ARMSX3 日志用于排查";
         break;
     case 6:
-        cell.textLabel.text = @"RPCS3 配置状态";
+        cell.textLabel.text = ARMSX3L(@"ios.general.configState", @"RPCS3 Configuration State");
         cell.detailTextLabel.text = armsx3_ios_settings_editable() ? @"模拟器已停止，可以修改参数" : @"模拟器运行中，参数暂时只读";
         cell.accessoryType = UITableViewCellAccessoryNone;
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
@@ -548,6 +784,19 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
 {
     if (_category == ARMSX3SettingsCategoryGeneral && _searchBar.text.length == 0)
         return [self generalCellAtRow:indexPath.row];
+    if (_category == ARMSX3SettingsCategoryControls && _searchBar.text.length == 0 && indexPath.row == 0)
+    {
+        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+        cell.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+        cell.textLabel.text = ARMSX3L(@"ios.controller.remap", @"Controller Remapping");
+        cell.detailTextLabel.text = ARMSX3L(@"ios.controller.remap.desc", @"Rebind PS3 digital controls to physical controller buttons.");
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        return cell;
+    }
+    if (_searchBar.text.length == 0 && (_category == ARMSX3SettingsCategoryHotkeys ||
+        _category == ARMSX3SettingsCategorySkins || _category == ARMSX3SettingsCategoryPatches ||
+        _category == ARMSX3SettingsCategoryMods))
+        return [self androidStaticCellAtRow:indexPath.row];
 
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"setting"];
     if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"setting"];
@@ -561,9 +810,11 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
     cell.textLabel.numberOfLines = 2;
 
-    ARMSX3CoreSetting *setting = _visibleSettings[indexPath.row];
+    NSInteger settingRow = indexPath.row;
+    if (_category == ARMSX3SettingsCategoryControls && _searchBar.text.length == 0) settingRow--;
+    ARMSX3CoreSetting *setting = _visibleSettings[settingRow];
     cell.textLabel.text = setting.name;
-    cell.detailTextLabel.text = setting.path;
+    cell.detailTextLabel.text = ARMSX3PolishedSettingDetail(setting);
     const BOOL editable = armsx3_ios_settings_editable();
     cell.userInteractionEnabled = editable;
     cell.textLabel.enabled = editable;
@@ -582,14 +833,14 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     else if ([setting.type isEqualToString:@"enum"] && setting.variants.count)
     {
         UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
-        [button setTitle:[setting.value description] forState:UIControlStateNormal];
+        [button setTitle:ARMSX3PolishedValue(setting.value) forState:UIControlStateNormal];
         button.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
         button.showsMenuAsPrimaryAction = YES;
         NSMutableArray<UIMenuElement *> *actions = [NSMutableArray array];
         __weak typeof(self) weakSelf = self;
         for (NSString *variant in setting.variants)
         {
-            UIAction *action = [UIAction actionWithTitle:variant image:nil identifier:nil
+            UIAction *action = [UIAction actionWithTitle:ARMSX3PolishedValue(variant) image:nil identifier:nil
                 handler:^(__unused UIAction *selectedAction) {
                     [weakSelf writeString:variant toSetting:setting];
                 }];
@@ -624,7 +875,7 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     else
     {
         UILabel *value = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 150, 40)];
-        value.text = [setting.value description];
+        value.text = ARMSX3PolishedValue(setting.value);
         value.textAlignment = NSTextAlignmentRight;
         value.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightMedium];
         value.textColor = UIColor.secondaryLabelColor;
@@ -745,17 +996,57 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
         }
         else if (indexPath.row == 4)
         {
-            [host toggleControls];
+            [self dismissViewControllerAnimated:YES completion:^{ [host showTouchControlsSettings]; }];
         }
         else if (indexPath.row == 5)
         {
             [self dismissViewControllerAnimated:YES completion:^{ [host shareLog]; }];
         }
+        else if (indexPath.row == 7)
+        {
+            UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[[ARMSX3LanguageViewController alloc] init]];
+            [self presentViewController:nav animated:YES completion:nil];
+        }
         return;
     }
 
-    if (!armsx3_ios_settings_editable() || indexPath.row >= (NSInteger)_visibleSettings.count) return;
-    ARMSX3CoreSetting *setting = _visibleSettings[indexPath.row];
+    if (_searchBar.text.length == 0 && _category == ARMSX3SettingsCategoryControls && indexPath.row == 0)
+    {
+        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[[ARMSX3ControllerSettingsViewController alloc] initWithMode:ARMSX3ControllerSettingsModeRemapping]];
+        [self presentViewController:nav animated:YES completion:nil];
+        return;
+    }
+
+    if (_searchBar.text.length == 0 && _category == ARMSX3SettingsCategorySkins)
+    {
+        id<ARMSX3SettingsHost> host = _host;
+        if (!host) return;
+        [self dismissViewControllerAnimated:YES completion:^{ [host showTouchControlsSettings]; }];
+        return;
+    }
+    if (_searchBar.text.length == 0 && _category == ARMSX3SettingsCategoryPatches)
+    {
+        if (indexPath.row == 0)
+            [self presentViewController:ARMSX3MakePatchManager() animated:YES completion:nil];
+        return;
+    }
+    if (_searchBar.text.length == 0 && _category == ARMSX3SettingsCategoryMods)
+    {
+        if (indexPath.row == 0)
+            [self presentViewController:ARMSX3MakeModManager() animated:YES completion:nil];
+        return;
+    }
+    if (_searchBar.text.length == 0 && _category == ARMSX3SettingsCategoryHotkeys)
+    {
+        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[[ARMSX3ControllerSettingsViewController alloc] initWithMode:ARMSX3ControllerSettingsModeHotkeys]];
+        [self presentViewController:nav animated:YES completion:nil];
+        return;
+    }
+
+    NSInteger settingRow = indexPath.row;
+    if (_category == ARMSX3SettingsCategoryControls && _searchBar.text.length == 0) settingRow--;
+    if (!armsx3_ios_settings_editable() || settingRow < 0 || settingRow >= (NSInteger)_visibleSettings.count) return;
+    ARMSX3CoreSetting *setting = _visibleSettings[settingRow];
     if ([setting.type isEqualToString:@"bool"] || [setting.type isEqualToString:@"enum"] || [self canUseSliderForSetting:setting]) return;
 
     UIAlertController *editor = [UIAlertController alertControllerWithTitle:setting.name

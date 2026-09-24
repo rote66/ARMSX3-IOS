@@ -1,6 +1,10 @@
 #import "ARMSX3FrontendViewController.h"
+#import "ARMSX3LibraryManagers.h"
+#import "ARMSX3Localization.h"
 
 #import <GameController/GameController.h>
+
+#include <unistd.h>
 
 #include "armsx3_ios_core.h"
 
@@ -240,7 +244,7 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
 
     UILabel *title = [[UILabel alloc] init];
     title.translatesAutoresizingMaskIntoConstraints = NO;
-    title.text = @"游戏库";
+    title.text = ARMSX3L(@"games.section.library", @"Library");
     title.textColor = ARMSX3TextColor();
     title.font = [UIFont systemFontOfSize:22 weight:UIFontWeightBold];
     [topBar addSubview:title];
@@ -255,7 +259,7 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
     _searchBar.translatesAutoresizingMaskIntoConstraints = NO;
     _searchBar.delegate = self;
     _searchBar.searchBarStyle = UISearchBarStyleMinimal;
-    _searchBar.placeholder = @"搜索游戏、序列号或文件名";
+    _searchBar.placeholder = ARMSX3L(@"games.search.placeholder", @"Search games…");
     _searchBar.tintColor = ARMSX3AccentColor();
     _searchBar.searchTextField.textColor = ARMSX3TextColor();
     _searchBar.searchTextField.backgroundColor = [ARMSX3RaisedColor() colorWithAlphaComponent:0.92];
@@ -268,7 +272,7 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
 
     UILabel *recentTitle = [[UILabel alloc] init];
     recentTitle.translatesAutoresizingMaskIntoConstraints = NO;
-    recentTitle.text = @"最近游玩";
+    recentTitle.text = ARMSX3L(@"games.section.recentlyPlayed", @"Recently Played");
     recentTitle.textColor = ARMSX3TextColor();
     recentTitle.font = [UIFont systemFontOfSize:20 weight:UIFontWeightSemibold];
     [self.view addSubview:recentTitle];
@@ -286,7 +290,7 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
 
     UILabel *allTitle = [[UILabel alloc] init];
     allTitle.translatesAutoresizingMaskIntoConstraints = NO;
-    allTitle.text = @"所有游戏";
+    allTitle.text = ARMSX3L(@"ios.library.all", @"All Games");
     allTitle.textColor = ARMSX3TextColor();
     allTitle.font = [UIFont systemFontOfSize:20 weight:UIFontWeightSemibold];
     [self.view addSubview:allTitle];
@@ -306,7 +310,7 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
 
     _emptyLabel = [[UILabel alloc] init];
     _emptyLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    _emptyLabel.text = @"游戏库为空\n把 PS3 游戏放到 Documents/Games，或点右上角添加。";
+    _emptyLabel.text = ARMSX3L(@"ios.library.empty", @"Your library is empty.\nPut PS3 games in Documents/Games, or use Add Game.");
     _emptyLabel.textColor = ARMSX3MutedTextColor();
     _emptyLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
     _emptyLabel.numberOfLines = 0;
@@ -418,28 +422,31 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
     ]];
     [_drawerStack addArrangedSubview:brand];
 
-    [self addDrawerSection:@"游戏库" rows:@[
-        @[@"🎮", @"游戏库", @"drawerLibrary"],
-        @[@"▶️", @"启动 PS3 系统软件", @"drawerBootFirmware"],
-        @[@"🏆", @"奖杯", @"drawerTrophies"],
-        @[@"⚙️", @"设置", @"drawerSettings"],
-        @[@"🧩", @"全部 Core 设置", @"drawerCoreSettings"],
+    [self addDrawerSection:ARMSX3L(@"games.section.library", @"Library") rows:@[
+        @[@"🎮", ARMSX3L(@"games.section.library", @"Library"), @"drawerLibrary"],
+        @[@"▶️", ARMSX3L(@"ios.general.bootFirmware", @"Boot PS3 System Software"), @"drawerBootFirmware"],
+        @[@"🏆", ARMSX3L(@"trophies.title", @"Trophies"), @"drawerTrophies"],
+        @[@"⚙️", ARMSX3L(@"action.settings", @"Settings"), @"drawerSettings"],
+        @[@"🧩", ARMSX3L(@"ios.settings.core", @"All Core Settings"), @"drawerCoreSettings"],
     ]];
     [self addDrawerDivider];
-    [self addDrawerSection:@"管理" rows:@[
-        @[@"📂", @"游戏与目录", @"drawerOpenGame"],
-        @[@"📀", @"系统软件", @"drawerFirmware"],
-        @[@"📦", @"PKG 安装器", @"drawerPackages"],
-        @[@"📥", @"存档管理", @"drawerSaves"],
-        @[@"🕹️", @"控制器", @"drawerControllers"],
-        @[@"✨", @"补丁", @"drawerPatches"],
-        @[@"🛠️", @"Mods", @"drawerMods"],
+    [self addDrawerSection:ARMSX3L(@"ios.drawer.manage", @"Manage") rows:@[
+        @[@"📂", ARMSX3L(@"app.gameFolders", @"Game Folders"), @"drawerOpenGame"],
+        @[@"📀", ARMSX3L(@"ios.drawer.firmware", @"System Software"), @"drawerFirmware"],
+        @[@"📦", ARMSX3L(@"ios.drawer.packages", @"PKG Installer"), @"drawerPackages"],
+        @[@"📥", ARMSX3L(@"ios.drawer.saves", @"Save Manager"), @"drawerSaves"],
+        @[@"🕹️", ARMSX3L(@"pad.assign.rumble.controller", @"Controller"), @"drawerControllers"],
+        @[@"✨", ARMSX3L(@"tab.patches", @"Patches & Cheats"), @"drawerPatches"],
+        @[@"🛠️", ARMSX3L(@"tab.mods", @"Mods"), @"drawerMods"],
     ]];
     [self addDrawerDivider];
-    [self addDrawerSection:@"关于" rows:@[
-        @[@"📰", @"新闻与更新", @"drawerNews"],
-        @[@"👥", @"好友", @"drawerFriends"],
-        @[@"ℹ️", @"关于 ARMSX3", @"drawerAbout"],
+    [self addDrawerSection:ARMSX3L(@"about.section.header", @"About") rows:@[
+        @[@"💬", @"Discord", @"drawerDiscord"],
+        @[@"🐙", @"GitHub", @"drawerGithub"],
+        @[@"🌐", ARMSX3L(@"about.website", @"Website"), @"drawerWebsite"],
+        @[@"📰", ARMSX3L(@"ios.drawer.news", @"News & Updates"), @"drawerNews"],
+        @[@"👥", ARMSX3L(@"friends.title", @"Friends"), @"drawerFriends"],
+        @[@"ℹ️", ARMSX3L(@"ios.drawer.aboutApp", @"About ARMSX3"), @"drawerAbout"],
     ]];
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
@@ -835,18 +842,57 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
 - (void)drawerLibrary { [self hideDrawer]; }
 - (void)drawerBootFirmware { [self hideDrawer]; [_host bootFirmware]; }
 - (void)drawerSettings { [self hideDrawer]; [_host showSettings]; }
-- (void)drawerCoreSettings { [self hideDrawer]; [_host showSettings]; }
+- (void)drawerCoreSettings { [self hideDrawer]; [_host showCoreSettings]; }
 - (void)drawerOpenGame { [self hideDrawer]; [_host openGame]; }
 - (void)drawerFirmware { [self hideDrawer]; [self presentFirmwareManager]; }
 - (void)drawerPackages { [self hideDrawer]; [self presentPackageManager]; }
-- (void)drawerSaves { [self hideDrawer]; [self presentFileManagerScreen:@"存档管理" relativePath:@"ARMSX3/dev_hdd0/home"]; }
+- (void)drawerSaves { [self hideDrawer]; [self presentViewController:ARMSX3MakeSaveManager() animated:YES completion:nil]; }
 - (void)drawerControllers { [self hideDrawer]; [self presentControllerScreen]; }
-- (void)drawerPatches { [self hideDrawer]; [self presentInfoScreen:@"补丁" icon:@"✨" body:@"补丁页入口按 Android 导航保留。下一步直接接 RPCS3 patch.yml 数据，而不是另造一套 iOS 专用配置。" primary:@"打开设置" action:@selector(openSettingsFromInfo)]; }
-- (void)drawerMods { [self hideDrawer]; [self presentInfoScreen:@"Mods" icon:@"🛠️" body:@"Mods 库页面已经纳入 iOS Frontend 导航；当前底层尚未暴露 Android 端对应的 ModLibrary 数据接口。" primary:nil action:nil]; }
-- (void)drawerTrophies { [self hideDrawer]; [self presentFileManagerScreen:@"奖杯" relativePath:@"ARMSX3/dev_hdd0/home"]; }
-- (void)drawerNews { [self hideDrawer]; [self presentInfoScreen:@"新闻与更新" icon:@"📰" body:@"ARMSX3 iOS Frontend 已切换为 Android 同源导航结构。Build 7 开始不再以临时工具条作为主界面。" primary:nil action:nil]; }
-- (void)drawerFriends { [self hideDrawer]; [self presentInfoScreen:@"好友" icon:@"👥" body:@"RPCN 好友 UI 入口已迁移。RPCN 账户和好友数据接口仍需从 Android bridge 对齐到 iOS Core bridge。" primary:nil action:nil]; }
-- (void)drawerAbout { [self hideDrawer]; [self presentInfoScreen:@"关于 ARMSX3" icon:@"ℹ️" body:@"ARMSX3\nRPCS3-based PS3 emulator frontend\n\niOS 端现在采用与 Android ARMSX3 相同的 Purple 视觉语言、游戏库主页、抽屉导航和统一页面框架。" primary:nil action:nil]; }
+- (void)drawerPatches { [self hideDrawer]; [self presentViewController:ARMSX3MakePatchManager() animated:YES completion:nil]; }
+- (void)drawerMods { [self hideDrawer]; [self presentViewController:ARMSX3MakeModManager() animated:YES completion:nil]; }
+- (void)drawerTrophies { [self hideDrawer]; [self presentViewController:ARMSX3MakeTrophyManager() animated:YES completion:nil]; }
+- (void)openExternalURLString:(NSString *)raw
+{
+    NSURL *url = [NSURL URLWithString:raw];
+    if (url) [UIApplication.sharedApplication openURL:url options:@{} completionHandler:nil];
+}
+- (void)drawerDiscord { [self hideDrawer]; [self openExternalURLString:@"https://discord.gg/2Tynvwhc4A"]; }
+- (void)drawerGithub { [self hideDrawer]; [self openExternalURLString:@"https://github.com/ARMSX2/ARMSX3"]; }
+- (void)drawerWebsite { [self hideDrawer]; [self openExternalURLString:@"https://armsx2.net/"]; }
+- (void)drawerNews { [self hideDrawer]; [self presentInfoScreen:@"新闻与更新" icon:@"📰" body:@"与 Android News 入口保持一致。iOS 不额外维护第二套公告数据；项目更新从同一 ARMSX3 发布源进入。" primary:@"打开项目主页" action:@selector(openWebsiteFromInfo)]; }
+- (void)drawerFriends
+{
+    [self hideDrawer];
+    [self presentInfoScreen:@"好友" icon:@"👥"
+        body:@"Android 的好友页使用 Discord Social SDK Presence，并通过独立 :discord 进程隔离专有 SDK。当前 iOS target 没有链接对应的 Discord Social SDK，因此按 Android 的 unavailable 状态处理；不会错误地改成 RPCN 好友。"
+        primary:@"打开 Discord" action:@selector(openDiscordFromInfo)];
+}
+- (void)drawerAbout
+{
+    [self hideDrawer];
+    NSString *shortVersion = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"-";
+    NSString *build = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"-";
+    NSProcessInfo *process = NSProcessInfo.processInfo;
+    NSString *device = UIDevice.currentDevice.model ?: @"iOS Device";
+    NSString *os = [NSString stringWithFormat:@"iOS %@", UIDevice.currentDevice.systemVersion ?: @"-"];
+    NSString *display = [NSString stringWithFormat:@"%.0f × %.0f @ %.0fx",
+        UIScreen.mainScreen.nativeBounds.size.width, UIScreen.mainScreen.nativeBounds.size.height,
+        UIScreen.mainScreen.nativeScale];
+    NSString *memory = [NSString stringWithFormat:@"%.1f GB", process.physicalMemory / 1073741824.0];
+    NSString *body = [NSString stringWithFormat:
+        @"ARMSX3\nRPCS3-based PS3 emulator frontend\n\n"
+         "应用版本：%@ (%@)\n"
+         "设备：%@\n"
+         "系统：%@\n"
+         "CPU 核心：%ld\n"
+         "内存：%@\n"
+         "显示：%@\n"
+         "架构：arm64\n"
+         "页大小：%ld KB\n\n"
+         "界面结构与 Android ARMSX3 对齐；文件选择、JIT、GameController、AVAudioSession/RemoteIO 与 Metal 保留为 iOS 平台实现。",
+        shortVersion, build, device, os, (long)process.processorCount, memory, display, (long)(getpagesize() / 1024)];
+    [self presentInfoScreen:@"关于 ARMSX3" icon:@"ℹ️" body:body primary:@"打开 GitHub" action:@selector(openGithubFromInfo)];
+}
 
 - (void)presentFirmwareManager
 {
@@ -1000,6 +1046,9 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
 - (void)openGameFromInfo { [self.presentedViewController dismissViewControllerAnimated:YES completion:^{ [self->_host openGame]; }]; }
 - (void)openPackageFromInfo { [self.presentedViewController dismissViewControllerAnimated:YES completion:^{ [self->_host openPackage]; }]; }
 - (void)openSettingsFromInfo { [self.presentedViewController dismissViewControllerAnimated:YES completion:^{ [self->_host showSettings]; }]; }
+- (void)openWebsiteFromInfo { [self openExternalURLString:@"https://armsx2.net/"]; }
+- (void)openDiscordFromInfo { [self openExternalURLString:@"https://discord.gg/2Tynvwhc4A"]; }
+- (void)openGithubFromInfo { [self openExternalURLString:@"https://github.com/ARMSX2/ARMSX3"]; }
 - (void)toggleControlsFromInfo { [_host toggleControls]; }
 
 @end

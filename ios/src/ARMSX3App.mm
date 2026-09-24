@@ -5,25 +5,73 @@
 #import <UIKit/UIKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <os/log.h>
+#import <os/proc.h>
+#import <mach/mach.h>
 
 #import "ARMSX3SettingsViewController.h"
 #import "ARMSX3FrontendViewController.h"
 #import "ARMSX3EmulationMenuViewController.h"
+#import "ARMSX3TouchControls.h"
+#import "ARMSX3ControllerMappings.h"
+#import "ARMSX3Localization.h"
 
 #include "armsx3_ios_core.h"
 #include "Emu/Io/pad_types.h"
 
 #include <csignal>
+#include <atomic>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <fcntl.h>
+#include <sys/ucontext.h>
 #include <unistd.h>
 
 // Ask jailbreak injectors that honor dyld's restriction marker to leave this
 // process untouched. JIT authorization comes from the app entitlements.
 __attribute__((used, section("__RESTRICT,__restrict")))
 static const char g_restrict_tweak_injection = 0;
+
+static std::atomic<int> g_diagnostic_log_fd{-1};
+
+extern "C" void armsx3_ios_diagnostic_log(const char *message);
+
+static void armsx3_ios_log_memory_state(const char *reason)
+{
+    task_vm_info_data_t info{};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    uint64_t footprint = 0;
+    if (task_info(mach_task_self(), TASK_VM_INFO,
+            reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS)
+        footprint = info.phys_footprint;
+
+    const uint64_t headroom = os_proc_available_memory();
+    char message[256]{};
+    std::snprintf(message, sizeof(message),
+        "memory %s: footprint=%lluMB headroom=%lluMB",
+        reason ? reason : "snapshot",
+        static_cast<unsigned long long>(footprint / (1024 * 1024)),
+        static_cast<unsigned long long>(headroom / (1024 * 1024)));
+    armsx3_ios_diagnostic_log(message);
+}
+
+extern "C" void armsx3_ios_set_diagnostic_log_path(const char *path)
+{
+    if (!path || !*path) return;
+    const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
+    if (fd < 0) return;
+    const int old = g_diagnostic_log_fd.exchange(fd, std::memory_order_acq_rel);
+    if (old >= 0) close(old);
+}
+
+static void armsx3_ios_diagnostic_write(const char *data, size_t size)
+{
+    if (!data || !size) return;
+    if (const int fd = g_diagnostic_log_fd.load(std::memory_order_acquire); fd >= 0)
+        (void)write(fd, data, size);
+}
 
 extern "C" void armsx3_ios_diagnostic_log(const char *message)
 {
@@ -32,52 +80,66 @@ extern "C" void armsx3_ios_diagnostic_log(const char *message)
     write(STDERR_FILENO, prefix, sizeof(prefix) - 1);
     write(STDERR_FILENO, message, std::strlen(message));
     write(STDERR_FILENO, "\n", 1);
+    armsx3_ios_diagnostic_write(prefix, sizeof(prefix) - 1);
+    armsx3_ios_diagnostic_write(message, std::strlen(message));
+    armsx3_ios_diagnostic_write("\n", 1);
+    if (const int fd = g_diagnostic_log_fd.load(std::memory_order_acquire); fd >= 0)
+        (void)fsync(fd);
     os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_ERROR,
         "[ARMSX3_BOOT] %{public}s", message);
 }
 
-static void armsx3_signal_handler(int signal_number)
+static const char *armsx3_signal_name(int signal_number)
 {
     switch (signal_number)
     {
-    case SIGABRT:
+    case SIGABRT: return "SIGABRT";
+    case SIGBUS: return "SIGBUS";
+    case SIGILL: return "SIGILL";
+    case SIGSEGV: return "SIGSEGV";
+    case SIGTRAP: return "SIGTRAP";
+    default: return "UNKNOWN";
+    }
+}
+
+static void armsx3_signal_handler(int signal_number, siginfo_t *info, void *context_ptr)
+{
+    uintptr_t pc = 0;
+    uintptr_t lr = 0;
+    uintptr_t sp = 0;
+#if defined(__aarch64__)
+    if (auto *context = static_cast<ucontext_t *>(context_ptr); context && context->uc_mcontext)
     {
-        const char message[] = "[ARMSX3_BOOT] fatal signal SIGABRT\n";
-        write(STDERR_FILENO, message, sizeof(message) - 1);
-        break;
+        pc = static_cast<uintptr_t>(context->uc_mcontext->__ss.__pc);
+        lr = static_cast<uintptr_t>(context->uc_mcontext->__ss.__lr);
+        sp = static_cast<uintptr_t>(context->uc_mcontext->__ss.__sp);
     }
-    case SIGBUS:
+#endif
+
+    char message[256]{};
+    const int length = std::snprintf(message, sizeof(message),
+        "[ARMSX3_BOOT] fatal signal %s code=%d addr=%p pc=0x%llx lr=0x%llx sp=0x%llx\n",
+        armsx3_signal_name(signal_number), info ? info->si_code : 0,
+        info ? info->si_addr : nullptr,
+        static_cast<unsigned long long>(pc), static_cast<unsigned long long>(lr),
+        static_cast<unsigned long long>(sp));
+    const size_t size = length > 0
+        ? (static_cast<size_t>(length) < sizeof(message) ? static_cast<size_t>(length) : sizeof(message) - 1)
+        : 0;
+    if (size)
     {
-        const char message[] = "[ARMSX3_BOOT] fatal signal SIGBUS\n";
-        write(STDERR_FILENO, message, sizeof(message) - 1);
-        break;
+        (void)write(STDERR_FILENO, message, size);
+        armsx3_ios_diagnostic_write(message, size);
     }
-    case SIGILL:
-    {
-        const char message[] = "[ARMSX3_BOOT] fatal signal SIGILL\n";
-        write(STDERR_FILENO, message, sizeof(message) - 1);
-        break;
-    }
-    case SIGSEGV:
-    {
-        const char message[] = "[ARMSX3_BOOT] fatal signal SIGSEGV\n";
-        write(STDERR_FILENO, message, sizeof(message) - 1);
-        break;
-    }
-    case SIGTRAP:
-    {
-        const char message[] = "[ARMSX3_BOOT] fatal signal SIGTRAP\n";
-        write(STDERR_FILENO, message, sizeof(message) - 1);
-        break;
-    }
-    }
+    if (const int fd = g_diagnostic_log_fd.load(std::memory_order_relaxed); fd >= 0)
+        (void)fsync(fd);
 }
 
 static void armsx3_install_crash_handlers()
 {
     struct sigaction action{};
-    action.sa_handler = armsx3_signal_handler;
-    action.sa_flags = SA_RESETHAND;
+    action.sa_sigaction = armsx3_signal_handler;
+    action.sa_flags = SA_SIGINFO | SA_RESETHAND;
     sigemptyset(&action.sa_mask);
     for (const int signal_number : {SIGABRT, SIGBUS, SIGILL, SIGSEGV, SIGTRAP})
         sigaction(signal_number, &action, nullptr);
@@ -176,7 +238,11 @@ static NSString *armsx3_prepare_shared_documents(void)
     ARMSX3MetalView *_metalView;
     UILabel *_statusLabel;
     UIVisualEffectView *_toolbar;
-    UIView *_touchControls;
+    UIVisualEffectView *_progressHUD;
+    UILabel *_progressLabel;
+    UIProgressView *_progressBar;
+    BOOL _progressActive;
+    ARMSX3TouchControlsView *_touchControls;
     ARMSX3PickerPurpose _pickerPurpose;
     NSURL *_activeSecurityURL;
     uint32_t _digital1;
@@ -190,7 +256,15 @@ static NSString *armsx3_prepare_shared_documents(void)
     BOOL _paused;
     BOOL _coreInitializationStarted;
     BOOL _jitAvailable;
+    BOOL _touchEditingFromFrontend;
     ARMSX3FrontendViewController *_frontend;
+    NSMutableSet<NSString *> *_activeHotkeyPhysical;
+    id _languageObserver;
+}
+
+- (void)dealloc
+{
+    if (_languageObserver) [NSNotificationCenter.defaultCenter removeObserver:_languageObserver];
 }
 
 - (void)viewDidLoad
@@ -200,6 +274,7 @@ static NSString *armsx3_prepare_shared_documents(void)
     g_view_controller = self;
     self.view.backgroundColor = UIColor.blackColor;
     _leftX = _leftY = _rightX = _rightY = 128;
+    _activeHotkeyPhysical = [NSMutableSet set];
 
     _metalView = [[ARMSX3MetalView alloc] initWithFrame:CGRectZero];
     _metalView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -226,6 +301,29 @@ static NSString *armsx3_prepare_shared_documents(void)
     ]];
     [_frontend didMoveToParentViewController:self];
     [self setFrontendVisible:YES];
+    __weak ARMSX3ViewController *weakSelf = self;
+    _languageObserver = [NSNotificationCenter.defaultCenter addObserverForName:ARMSX3LanguageDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
+        ARMSX3ViewController *self = weakSelf;
+        if (!self) return;
+        BOOL wasHidden = self->_frontend.view.hidden;
+        [self->_frontend willMoveToParentViewController:nil];
+        [self->_frontend.view removeFromSuperview];
+        [self->_frontend removeFromParentViewController];
+        self->_frontend = [[ARMSX3FrontendViewController alloc] initWithHost:self documentsPath:g_documents_path];
+        [self addChildViewController:self->_frontend];
+        self->_frontend.view.translatesAutoresizingMaskIntoConstraints = NO;
+        [self.view addSubview:self->_frontend.view];
+        [NSLayoutConstraint activateConstraints:@[
+            [self->_frontend.view.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+            [self->_frontend.view.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+            [self->_frontend.view.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+            [self->_frontend.view.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        ]];
+        [self->_frontend didMoveToParentViewController:self];
+        [self->_frontend setCoreReady:armsx3_ios_is_initialized()];
+        self->_frontend.view.hidden = wasHidden;
+        if (!wasHidden) [self.view bringSubviewToFront:self->_frontend.view];
+    }];
     [self showStatus:@"Starting..." error:NO];
     armsx3_ios_diagnostic_log("viewDidLoad UI ready");
 }
@@ -294,7 +392,10 @@ static NSString *armsx3_prepare_shared_documents(void)
         }
         else
         {
+            self->_touchControls.hidden = !self->_touchControls.controlsVisible;
             [self.view bringSubviewToFront:self->_toolbar];
+            if (!self->_progressHUD.hidden)
+                [self.view bringSubviewToFront:self->_progressHUD];
             if (!self->_touchControls.hidden)
                 [self.view bringSubviewToFront:self->_touchControls];
         }
@@ -366,6 +467,40 @@ static NSString *armsx3_prepare_shared_documents(void)
         [pause.centerXAnchor constraintEqualToAnchor:_toolbar.contentView.centerXAnchor],
         [pause.centerYAnchor constraintEqualToAnchor:_toolbar.contentView.centerYAnchor],
     ]];
+
+    _progressHUD = [[UIVisualEffectView alloc] initWithEffect:
+        [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterialDark]];
+    _progressHUD.translatesAutoresizingMaskIntoConstraints = NO;
+    _progressHUD.layer.cornerRadius = 12;
+    _progressHUD.clipsToBounds = YES;
+    _progressHUD.hidden = YES;
+    [self.view addSubview:_progressHUD];
+
+    _progressLabel = [[UILabel alloc] init];
+    _progressLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _progressLabel.textColor = UIColor.whiteColor;
+    _progressLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    _progressLabel.textAlignment = NSTextAlignmentCenter;
+    _progressLabel.numberOfLines = 2;
+
+    _progressBar = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
+    _progressBar.translatesAutoresizingMaskIntoConstraints = NO;
+    _progressBar.progress = 0.f;
+
+    [_progressHUD.contentView addSubview:_progressLabel];
+    [_progressHUD.contentView addSubview:_progressBar];
+    [NSLayoutConstraint activateConstraints:@[
+        [_progressHUD.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+        [_progressHUD.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:68],
+        [_progressHUD.widthAnchor constraintEqualToConstant:300],
+        [_progressLabel.leadingAnchor constraintEqualToAnchor:_progressHUD.contentView.leadingAnchor constant:12],
+        [_progressLabel.trailingAnchor constraintEqualToAnchor:_progressHUD.contentView.trailingAnchor constant:-12],
+        [_progressLabel.topAnchor constraintEqualToAnchor:_progressHUD.contentView.topAnchor constant:9],
+        [_progressBar.leadingAnchor constraintEqualToAnchor:_progressHUD.contentView.leadingAnchor constant:12],
+        [_progressBar.trailingAnchor constraintEqualToAnchor:_progressHUD.contentView.trailingAnchor constant:-12],
+        [_progressBar.topAnchor constraintEqualToAnchor:_progressLabel.bottomAnchor constant:8],
+        [_progressBar.bottomAnchor constraintEqualToAnchor:_progressHUD.contentView.bottomAnchor constant:-10],
+    ]];
 }
 
 - (void)showEmulationMenu
@@ -387,6 +522,13 @@ static NSString *armsx3_prepare_shared_documents(void)
 {
     ARMSX3SettingsViewController *settings = [[ARMSX3SettingsViewController alloc]
         initWithHost:self jitAvailable:_jitAvailable];
+    [self presentViewController:settings animated:YES completion:nil];
+}
+
+- (void)showCoreSettings
+{
+    ARMSX3SettingsViewController *settings = [[ARMSX3SettingsViewController alloc]
+        initWithHost:self jitAvailable:_jitAvailable coreOnly:YES];
     [self presentViewController:settings animated:YES completion:nil];
 }
 
@@ -426,66 +568,50 @@ static NSString *armsx3_prepare_shared_documents(void)
     }];
 }
 
-- (UIButton *)padButton:(NSString *)title digital:(uint32_t)digital second:(BOOL)second
-{
-    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
-    button.translatesAutoresizingMaskIntoConstraints = NO;
-    [button setTitle:title forState:UIControlStateNormal];
-    button.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightBold];
-    button.tintColor = UIColor.whiteColor;
-    button.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.62];
-    button.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.5].CGColor;
-    button.layer.borderWidth = 1;
-    button.layer.cornerRadius = 25;
-    button.tag = (NSInteger)digital | (second ? (1ll << 32) : 0);
-    [button addTarget:self action:@selector(padDown:) forControlEvents:UIControlEventTouchDown];
-    [button addTarget:self action:@selector(padUp:) forControlEvents:
-        UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
-    [NSLayoutConstraint activateConstraints:@[
-        [button.widthAnchor constraintEqualToConstant:50],
-        [button.heightAnchor constraintEqualToConstant:50],
-    ]];
-    return button;
-}
-
 - (void)buildTouchControls
 {
-    _touchControls = [[UIView alloc] init];
+    _touchControls = [[ARMSX3TouchControlsView alloc] initWithFrame:CGRectZero];
     _touchControls.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:_touchControls];
-
-    UIButton *up = [self padButton:@"UP" digital:CELL_PAD_CTRL_UP second:NO];
-    UIButton *down = [self padButton:@"DN" digital:CELL_PAD_CTRL_DOWN second:NO];
-    UIButton *left = [self padButton:@"LT" digital:CELL_PAD_CTRL_LEFT second:NO];
-    UIButton *right = [self padButton:@"RT" digital:CELL_PAD_CTRL_RIGHT second:NO];
-    UIButton *triangle = [self padButton:@"△" digital:CELL_PAD_CTRL_TRIANGLE second:YES];
-    UIButton *cross = [self padButton:@"×" digital:CELL_PAD_CTRL_CROSS second:YES];
-    UIButton *square = [self padButton:@"□" digital:CELL_PAD_CTRL_SQUARE second:YES];
-    UIButton *circle = [self padButton:@"○" digital:CELL_PAD_CTRL_CIRCLE second:YES];
-    for (UIView *view in @[up, down, left, right, triangle, cross, square, circle])
-        [_touchControls addSubview:view];
-
+    __weak ARMSX3ViewController *weakSelf = self;
+    _touchControls.padChanged = ^(uint32_t d1, uint32_t d2, uint8_t lx, uint8_t ly,
+                                  uint8_t rx, uint8_t ry, uint8_t lt, uint8_t rt) {
+        ARMSX3ViewController *self = weakSelf;
+        if (!self) return;
+        self->_digital1 = d1;
+        self->_digital2 = d2;
+        self->_leftX = lx;
+        self->_leftY = ly;
+        self->_rightX = rx;
+        self->_rightY = ry;
+        self->_leftTrigger = lt;
+        self->_rightTrigger = rt;
+        [self pushPad];
+    };
+    _touchControls.pauseRequested = ^{
+        ARMSX3ViewController *self = weakSelf;
+        if (self && !self.presentedViewController) [self showEmulationMenu];
+    };
+    _touchControls.editingEnded = ^{
+        ARMSX3ViewController *self = weakSelf;
+        if (!self) return;
+        if (self->_touchEditingFromFrontend)
+        {
+            self->_touchControls.hidden = YES;
+            [self.view bringSubviewToFront:self->_frontend.view];
+        }
+        else
+        {
+            self->_touchControls.hidden = !self->_touchControls.controlsVisible;
+            [self.view bringSubviewToFront:self->_toolbar];
+            if (!self->_touchControls.hidden) [self.view bringSubviewToFront:self->_touchControls];
+        }
+    };
     [NSLayoutConstraint activateConstraints:@[
-        [_touchControls.leadingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.leadingAnchor],
-        [_touchControls.trailingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.trailingAnchor],
-        [_touchControls.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-8],
-        [_touchControls.heightAnchor constraintEqualToConstant:160],
-        [left.leadingAnchor constraintEqualToAnchor:_touchControls.leadingAnchor constant:12],
-        [left.centerYAnchor constraintEqualToAnchor:_touchControls.centerYAnchor],
-        [right.leadingAnchor constraintEqualToAnchor:left.trailingAnchor constant:54],
-        [right.centerYAnchor constraintEqualToAnchor:left.centerYAnchor],
-        [up.centerXAnchor constraintEqualToAnchor:left.trailingAnchor constant:27],
-        [up.bottomAnchor constraintEqualToAnchor:left.topAnchor constant:-2],
-        [down.centerXAnchor constraintEqualToAnchor:up.centerXAnchor],
-        [down.topAnchor constraintEqualToAnchor:left.bottomAnchor constant:2],
-        [square.trailingAnchor constraintEqualToAnchor:circle.leadingAnchor constant:-54],
-        [square.centerYAnchor constraintEqualToAnchor:_touchControls.centerYAnchor],
-        [circle.trailingAnchor constraintEqualToAnchor:_touchControls.trailingAnchor constant:-12],
-        [circle.centerYAnchor constraintEqualToAnchor:square.centerYAnchor],
-        [triangle.centerXAnchor constraintEqualToAnchor:square.trailingAnchor constant:27],
-        [triangle.bottomAnchor constraintEqualToAnchor:square.topAnchor constant:-2],
-        [cross.centerXAnchor constraintEqualToAnchor:triangle.centerXAnchor],
-        [cross.topAnchor constraintEqualToAnchor:square.bottomAnchor constant:2],
+        [_touchControls.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [_touchControls.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [_touchControls.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [_touchControls.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
     ]];
 }
 
@@ -494,6 +620,44 @@ static NSString *armsx3_prepare_shared_documents(void)
     dispatch_async(dispatch_get_main_queue(), ^{
         self->_statusLabel.text = message;
         self->_statusLabel.textColor = error ? UIColor.systemRedColor : UIColor.whiteColor;
+
+        if (self->_frontend && self->_frontend.view.hidden && message.length)
+        {
+            self->_progressLabel.text = message;
+            self->_progressLabel.textColor = error ? UIColor.systemRedColor : UIColor.whiteColor;
+            self->_progressHUD.hidden = NO;
+            [self.view bringSubviewToFront:self->_progressHUD];
+
+            if (!self->_progressActive)
+            {
+                NSString *shownMessage = [message copy];
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    if (!self->_progressActive && [self->_progressLabel.text isEqualToString:shownMessage])
+                        self->_progressHUD.hidden = YES;
+                });
+            }
+        }
+    });
+}
+
+- (void)showProgressValue:(float)value limit:(float)limit
+{
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self->_progressActive = YES;
+        self->_progressBar.progress = limit > 0.f ? fmaxf(0.f, fminf(1.f, value / limit)) : 0.f;
+        if (!self->_progressLabel.text.length)
+            self->_progressLabel.text = @"正在编译...";
+        self->_progressHUD.hidden = NO;
+        [self.view bringSubviewToFront:self->_progressHUD];
+    });
+}
+
+- (void)hideProgress
+{
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self->_progressActive = NO;
+        self->_progressBar.progress = 0.f;
+        self->_progressHUD.hidden = YES;
     });
 }
 
@@ -626,38 +790,54 @@ static NSString *armsx3_prepare_shared_documents(void)
 
 - (void)stopGame
 {
+    [self showStatus:@"Stopping emulator..." error:NO];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        armsx3_ios_stop();
-        [self setFrontendVisible:YES];
+        const BOOL stopped = armsx3_ios_stop();
+        if (stopped)
+            [self setFrontendVisible:YES];
+        else
+            [self showStatus:@"停止模拟器超时；核心仍在清理中。" error:YES];
     });
 }
 
-- (void)toggleControls { _touchControls.hidden = !_touchControls.hidden; }
+- (void)toggleControls
+{
+    _touchControls.controlsVisible = !_touchControls.controlsVisible;
+    if (!_frontend.view.hidden) _touchControls.hidden = YES;
+}
+
+- (void)showTouchControlsSettings
+{
+    if (self.presentedViewController) return;
+    __weak ARMSX3ViewController *weakSelf = self;
+    ARMSX3TouchSettingsViewController *settings = [[ARMSX3TouchSettingsViewController alloc]
+        initWithControls:_touchControls editAction:^{ [weakSelf editTouchControls]; }];
+    settings.modalPresentationStyle = UIModalPresentationFullScreen;
+    [self presentViewController:settings animated:YES completion:nil];
+}
+
+- (void)editTouchControls
+{
+    _touchEditingFromFrontend = !_frontend.view.hidden;
+    _touchControls.hidden = NO;
+    [_touchControls beginLayoutEditing];
+    [self.view bringSubviewToFront:_touchControls];
+}
 
 - (void)shareLog
 {
-    const char *path = armsx3_ios_log_path();
-    if (!path || !*path) return;
-    NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
-    UIActivityViewController *activity = [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
+    NSMutableArray *items = [NSMutableArray array];
+    for (const char *path : {armsx3_ios_log_path(), armsx3_ios_boot_log_path()})
+    {
+        if (!path || !*path) continue;
+        NSString *string = [NSString stringWithUTF8String:path];
+        if (string.length && [NSFileManager.defaultManager fileExistsAtPath:string])
+            [items addObject:[NSURL fileURLWithPath:string]];
+    }
+    if (!items.count) return;
+    UIActivityViewController *activity = [[UIActivityViewController alloc] initWithActivityItems:items applicationActivities:nil];
     activity.popoverPresentationController.sourceView = _toolbar;
     [self presentViewController:activity animated:YES completion:nil];
-}
-
-- (void)padDown:(UIButton *)sender
-{
-    BOOL second = ((uint64_t)sender.tag >> 32) != 0;
-    uint32_t bit = (uint32_t)sender.tag;
-    if (second) _digital2 |= bit; else _digital1 |= bit;
-    [self pushPad];
-}
-
-- (void)padUp:(UIButton *)sender
-{
-    BOOL second = ((uint64_t)sender.tag >> 32) != 0;
-    uint32_t bit = (uint32_t)sender.tag;
-    if (second) _digital2 &= ~bit; else _digital1 &= ~bit;
-    [self pushPad];
 }
 
 - (void)pushPad
@@ -674,6 +854,76 @@ static NSString *armsx3_prepare_shared_documents(void)
     for (GCController *controller in GCController.controllers) [self bindController:controller];
 }
 
+- (NSInteger)currentSaveSlot
+{
+    NSInteger slot = [NSUserDefaults.standardUserDefaults integerForKey:@"ARMSX3.SaveStateSlot"];
+    return MIN(MAX(slot, 0), 9);
+}
+
+- (void)cycleSaveSlot
+{
+    NSInteger next = ([self currentSaveSlot] + 1) % 10;
+    [NSUserDefaults.standardUserDefaults setInteger:next forKey:@"ARMSX3.SaveStateSlot"];
+    [self showStatus:[NSString stringWithFormat:@"Save slot %ld", (long)(next + 1)] error:NO];
+}
+
+- (void)performControllerHotkey:(NSString *)action
+{
+    if (!action.length || !_frontend.view.hidden || self.presentedViewController) return;
+    const unsigned int slot = (unsigned int)[self currentSaveSlot];
+    if ([action isEqualToString:@"menu"])
+    {
+        if (!self.presentedViewController) [self showEmulationMenu];
+    }
+    else if ([action isEqualToString:@"saveState"])
+    {
+        BOOL ok = armsx3_ios_save_state_slot(slot, true);
+        [self showStatus:ok ? [NSString stringWithFormat:@"Saving state · slot %u", slot + 1] : @"Save state unavailable" error:!ok];
+    }
+    else if ([action isEqualToString:@"loadState"])
+    {
+        BOOL ok = armsx3_ios_load_state_slot(slot);
+        [self showStatus:ok ? [NSString stringWithFormat:@"Loading state · slot %u", slot + 1] : @"Save slot is empty" error:!ok];
+    }
+    else if ([action isEqualToString:@"cycleSlot"]) [self cycleSaveSlot];
+    else if ([action isEqualToString:@"screenshot"])
+    {
+        BOOL ok = armsx3_ios_request_screenshot();
+        if (!ok) [self showStatus:@"Screenshot unavailable" error:YES];
+    }
+    else if ([action isEqualToString:@"toggleOSD"])
+    {
+        const BOOL next = !armsx3_ios_performance_overlay_enabled();
+        if (armsx3_ios_set_performance_overlay_enabled(next))
+            [self showStatus:next ? @"Performance OSD enabled" : @"Performance OSD disabled" error:NO];
+    }
+    else if ([action isEqualToString:@"resolutionUp"] || [action isEqualToString:@"resolutionDown"])
+    {
+        const int percent = armsx3_ios_step_resolution([action isEqualToString:@"resolutionUp"] ? 1 : -1);
+        [self showStatus:[NSString stringWithFormat:@"Resolution %.2gx", percent / 100.0] error:NO];
+    }
+    else if ([action isEqualToString:@"closeGame"]) [self stopGame];
+    else if ([action isEqualToString:@"resetGame"])
+    {
+        if (!armsx3_ios_restart()) [self showStatus:@"Restart unavailable" error:YES];
+    }
+    else if ([action isEqualToString:@"saveAndExit"])
+    {
+        if (!armsx3_ios_save_state_slot(slot, false))
+        {
+            [self showStatus:@"Save state unavailable" error:YES];
+            return;
+        }
+        [self showStatus:[NSString stringWithFormat:@"Saving state · slot %u", slot + 1] error:NO];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            for (int elapsed = 0; elapsed < 15000 && !armsx3_ios_settings_editable(); elapsed += 25)
+                usleep(25000);
+            if (armsx3_ios_settings_editable()) [self setFrontendVisible:YES];
+            else [self showStatus:@"Save & exit is still finishing" error:YES];
+        });
+    }
+}
+
 - (void)bindController:(GCController *)controller
 {
     GCExtendedGamepad *pad = controller.extendedGamepad;
@@ -682,31 +932,45 @@ static NSString *armsx3_prepare_shared_documents(void)
     pad.valueChangedHandler = ^(GCExtendedGamepad *gamepad, GCControllerElement *element) {
         ARMSX3ViewController *self = weakSelf;
         if (!self) return;
+        ARMSX3ControllerMappings *mappings = ARMSX3ControllerMappings.shared;
+        if ([mappings consumeCaptureForElement:element gamepad:gamepad]) return;
+        NSSet<NSString *> *pressed = [mappings pressedPhysicalIdentifiersForGamepad:gamepad];
+        NSMutableSet<NSString *> *activeHotkeys = [NSMutableSet set];
+        for (NSString *physical in pressed)
+        {
+            NSString *hotkey = [mappings hotkeyForPhysicalIdentifier:physical];
+            if (!hotkey.length) continue;
+            [activeHotkeys addObject:physical];
+            if (![self->_activeHotkeyPhysical containsObject:physical]) [self performControllerHotkey:hotkey];
+        }
+        self->_activeHotkeyPhysical = activeHotkeys;
         uint32_t d1 = 0, d2 = 0;
-        if (gamepad.dpad.up.isPressed) d1 |= CELL_PAD_CTRL_UP;
-        if (gamepad.dpad.down.isPressed) d1 |= CELL_PAD_CTRL_DOWN;
-        if (gamepad.dpad.left.isPressed) d1 |= CELL_PAD_CTRL_LEFT;
-        if (gamepad.dpad.right.isPressed) d1 |= CELL_PAD_CTRL_RIGHT;
-        if (gamepad.buttonA.isPressed) d2 |= CELL_PAD_CTRL_CROSS;
-        if (gamepad.buttonB.isPressed) d2 |= CELL_PAD_CTRL_CIRCLE;
-        if (gamepad.buttonX.isPressed) d2 |= CELL_PAD_CTRL_SQUARE;
-        if (gamepad.buttonY.isPressed) d2 |= CELL_PAD_CTRL_TRIANGLE;
-        if (gamepad.leftShoulder.isPressed) d2 |= CELL_PAD_CTRL_L1;
-        if (gamepad.rightShoulder.isPressed) d2 |= CELL_PAD_CTRL_R1;
-        if (gamepad.leftTrigger.isPressed) d2 |= CELL_PAD_CTRL_L2;
-        if (gamepad.rightTrigger.isPressed) d2 |= CELL_PAD_CTRL_R2;
-        if (gamepad.leftThumbstickButton.isPressed) d1 |= CELL_PAD_CTRL_L3;
-        if (gamepad.rightThumbstickButton.isPressed) d1 |= CELL_PAD_CTRL_R3;
-        if (gamepad.buttonMenu.isPressed) d1 |= CELL_PAD_CTRL_START;
-        if (gamepad.buttonOptions.isPressed) d1 |= CELL_PAD_CTRL_SELECT;
+        if ([mappings isTarget:@"up" pressedIn:pressed]) d1 |= CELL_PAD_CTRL_UP;
+        if ([mappings isTarget:@"down" pressedIn:pressed]) d1 |= CELL_PAD_CTRL_DOWN;
+        if ([mappings isTarget:@"left" pressedIn:pressed]) d1 |= CELL_PAD_CTRL_LEFT;
+        if ([mappings isTarget:@"right" pressedIn:pressed]) d1 |= CELL_PAD_CTRL_RIGHT;
+        if ([mappings isTarget:@"cross" pressedIn:pressed]) d2 |= CELL_PAD_CTRL_CROSS;
+        if ([mappings isTarget:@"circle" pressedIn:pressed]) d2 |= CELL_PAD_CTRL_CIRCLE;
+        if ([mappings isTarget:@"square" pressedIn:pressed]) d2 |= CELL_PAD_CTRL_SQUARE;
+        if ([mappings isTarget:@"triangle" pressedIn:pressed]) d2 |= CELL_PAD_CTRL_TRIANGLE;
+        if ([mappings isTarget:@"l1" pressedIn:pressed]) d2 |= CELL_PAD_CTRL_L1;
+        if ([mappings isTarget:@"r1" pressedIn:pressed]) d2 |= CELL_PAD_CTRL_R1;
+        if ([mappings isTarget:@"l2" pressedIn:pressed]) d2 |= CELL_PAD_CTRL_L2;
+        if ([mappings isTarget:@"r2" pressedIn:pressed]) d2 |= CELL_PAD_CTRL_R2;
+        if ([mappings isTarget:@"l3" pressedIn:pressed]) d1 |= CELL_PAD_CTRL_L3;
+        if ([mappings isTarget:@"r3" pressedIn:pressed]) d1 |= CELL_PAD_CTRL_R3;
+        if ([mappings isTarget:@"start" pressedIn:pressed]) d1 |= CELL_PAD_CTRL_START;
+        if ([mappings isTarget:@"select" pressedIn:pressed]) d1 |= CELL_PAD_CTRL_SELECT;
         self->_digital1 = d1;
         self->_digital2 = d2;
         self->_leftX = (uint8_t)lrintf((gamepad.leftThumbstick.xAxis.value + 1.f) * 127.5f);
         self->_leftY = (uint8_t)lrintf((1.f - gamepad.leftThumbstick.yAxis.value) * 127.5f);
         self->_rightX = (uint8_t)lrintf((gamepad.rightThumbstick.xAxis.value + 1.f) * 127.5f);
         self->_rightY = (uint8_t)lrintf((1.f - gamepad.rightThumbstick.yAxis.value) * 127.5f);
-        self->_leftTrigger = (uint8_t)lrintf(gamepad.leftTrigger.value * 255.f);
-        self->_rightTrigger = (uint8_t)lrintf(gamepad.rightTrigger.value * 255.f);
+        NSString *leftTriggerBinding = [mappings bindingForTarget:@"l2"];
+        NSString *rightTriggerBinding = [mappings bindingForTarget:@"r2"];
+        self->_leftTrigger = (d2 & CELL_PAD_CTRL_L2) ? ([leftTriggerBinding isEqualToString:@"leftTrigger"] ? (uint8_t)lrintf(gamepad.leftTrigger.value * 255.f) : 255) : 0;
+        self->_rightTrigger = (d2 & CELL_PAD_CTRL_R2) ? ([rightTriggerBinding isEqualToString:@"rightTrigger"] ? (uint8_t)lrintf(gamepad.rightTrigger.value * 255.f) : 255) : 0;
         [self pushPad];
     };
 }
@@ -718,10 +982,21 @@ static void armsx3_event_callback(int event, const char *message)
     NSString *text = message && *message ? [NSString stringWithUTF8String:message] : nil;
     switch (event)
     {
-    case ARMSX3_IOS_EVENT_RUNNING: text = @"Running"; break;
-    case ARMSX3_IOS_EVENT_STOPPED: text = @"Stopped"; break;
-    case ARMSX3_IOS_EVENT_PAUSED: text = @"Paused"; break;
-    case ARMSX3_IOS_EVENT_RESUMED: text = @"Running"; break;
+    case ARMSX3_IOS_EVENT_PROGRESS:
+    {
+        NSArray<NSString *> *parts = [text componentsSeparatedByString:@":"];
+        float value = parts.count > 0 ? parts[0].floatValue : 0.f;
+        float limit = parts.count > 1 ? parts[1].floatValue : 100.f;
+        [controller showProgressValue:value limit:limit];
+        return;
+    }
+    case ARMSX3_IOS_EVENT_PROGRESS_END:
+        [controller hideProgress];
+        return;
+    case ARMSX3_IOS_EVENT_RUNNING: controller->_paused = NO; text = @"Running"; break;
+    case ARMSX3_IOS_EVENT_STOPPED: controller->_paused = NO; text = @"Stopped"; break;
+    case ARMSX3_IOS_EVENT_PAUSED: controller->_paused = YES; text = @"Paused"; break;
+    case ARMSX3_IOS_EVENT_RESUMED: controller->_paused = NO; text = @"Running"; break;
     default: break;
     }
     if (text) [controller showStatus:text error:event == ARMSX3_IOS_EVENT_ERROR];
@@ -740,12 +1015,24 @@ static void armsx3_event_callback(int event, const char *message)
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)options
 {
     armsx3_ios_diagnostic_log("application didFinishLaunching entered");
+    AVAudioSession *audioSession = AVAudioSession.sharedInstance;
+    NSError *audioError = nil;
+    [audioSession setCategory:AVAudioSessionCategoryPlayback mode:AVAudioSessionModeDefault options:0 error:&audioError];
+    [audioSession setPreferredSampleRate:48000 error:nil];
+    [audioSession setPreferredIOBufferDuration:0.010 error:nil];
+    [audioSession setActive:YES error:&audioError];
+    armsx3_ios_diagnostic_log(audioError ? "iOS audio session activation failed" : "iOS audio session active");
     g_documents_path = armsx3_prepare_shared_documents();
     self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
     self.window.rootViewController = [[ARMSX3ViewController alloc] init];
     [self.window makeKeyAndVisible];
     armsx3_ios_diagnostic_log("application window visible");
+    armsx3_ios_log_memory_state("launch");
     return YES;
+}
+- (void)applicationDidReceiveMemoryWarning:(UIApplication *)application
+{
+    armsx3_ios_log_memory_state("warning");
 }
 - (void)applicationDidEnterBackground:(UIApplication *)application
 {
@@ -762,7 +1049,14 @@ static void armsx3_event_callback(int event, const char *message)
 int main(int argc, char *argv[])
 {
     armsx3_ios_diagnostic_log("main entered");
-    armsx3_install_crash_handlers();
+    // Do not reinstall SIGBUS/SIGSEGV handlers here. Utilities/Thread.cpp installs
+    // RPCS3's full fault handler during C++ static initialization, after our early
+    // constructor fallback. Reinstalling this lightweight app handler from main()
+    // used to overwrite RPCS3's handler and discarded its fault classification,
+    // real host PC and guest-memory diagnostics. Keep the constructor handler only
+    // as an early-startup fallback; once the core handler is installed it owns
+    // memory faults for the lifetime of emulation.
+    armsx3_ios_diagnostic_log("main preserving RPCS3 native memory fault handlers");
     @autoreleasepool
     {
         armsx3_ios_diagnostic_log("UIApplicationMain begin");

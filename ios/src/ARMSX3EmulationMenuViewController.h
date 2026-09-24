@@ -7,6 +7,8 @@
 - (void)stopGame;
 - (void)showSettings;
 - (void)toggleControls;
+- (void)showTouchControlsSettings;
+- (void)editTouchControls;
 - (void)shareLog;
 @end
 

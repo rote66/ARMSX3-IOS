@@ -8,6 +8,7 @@
 - (void)openPackage;
 - (void)bootFirmware;
 - (void)showSettings;
+- (void)showCoreSettings;
 - (void)toggleControls;
 - (void)shareLog;
 - (void)stopGame;

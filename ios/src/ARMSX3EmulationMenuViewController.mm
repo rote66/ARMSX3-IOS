@@ -1,4 +1,6 @@
 #import "ARMSX3EmulationMenuViewController.h"
+#import "ARMSX3ControllerMappings.h"
+#import "ARMSX3Localization.h"
 
 #import <GameController/GameController.h>
 
@@ -343,6 +345,33 @@ typedef NS_ENUM(NSInteger, ARMSX3MenuTab)
         [grid.bottomAnchor constraintEqualToAnchor:gridCard.bottomAnchor constant:-10],
     ]];
 
+    UIView *saveCard = [self card];
+    saveCard.translatesAutoresizingMaskIntoConstraints = NO;
+    [_content addArrangedSubview:saveCard];
+    UIStackView *saveStack = [[UIStackView alloc] init];
+    saveStack.translatesAutoresizingMaskIntoConstraints = NO;
+    saveStack.axis = UILayoutConstraintAxisVertical;
+    saveStack.spacing = 10;
+    [saveCard addSubview:saveStack];
+    NSInteger slot = [self currentSaveSlot];
+    BOOL occupied = armsx3_ios_has_state_slot((unsigned int)slot);
+    NSString *slotDetail = [NSString stringWithFormat:@"%@ · %@", [NSString stringWithFormat:ARMSX3L(@"ios.savestate.current", @"Current slot %ld"), (long)(slot + 1)], occupied ? ARMSX3L(@"savestate.autosave.savedOnExit", @"saved") : ARMSX3L(@"ios.savestate.empty", @"Empty")];
+    [saveStack addArrangedSubview:[self sectionTitle:ARMSX3L(@"ios.savestate.slot", @"Save State Slot") detail:slotDetail]];
+    [saveStack addArrangedSubview:[self rowButton:ARMSX3L(@"ios.savestate.save", @"Save State") detail:@"Write or replace the selected numbered slot" symbol:@"square.and.arrow.down" action:@selector(saveStateFromMenu)]];
+    UIButton *load = [self rowButton:ARMSX3L(@"ios.savestate.load", @"Load State") detail:occupied ? @"Restart the game from this slot" : ARMSX3L(@"ios.savestate.empty", @"Empty") symbol:@"arrow.clockwise" action:@selector(loadStateFromMenu)];
+    load.enabled = occupied;
+    load.alpha = occupied ? 1.0 : 0.45;
+    [saveStack addArrangedSubview:load];
+    [saveStack addArrangedSubview:[self rowButton:@"Next Slot" detail:@"Cycle through slots 1–10" symbol:@"rectangle.3.group" action:@selector(cycleSaveSlotFromMenu)]];
+    if (occupied)
+        [saveStack addArrangedSubview:[self rowButton:ARMSX3L(@"ios.savestate.delete", @"Delete Save State") detail:@"Remove only the selected numbered slot" symbol:@"trash" action:@selector(deleteStateFromMenu)]];
+    [NSLayoutConstraint activateConstraints:@[
+        [saveStack.leadingAnchor constraintEqualToAnchor:saveCard.leadingAnchor constant:14],
+        [saveStack.trailingAnchor constraintEqualToAnchor:saveCard.trailingAnchor constant:-14],
+        [saveStack.topAnchor constraintEqualToAnchor:saveCard.topAnchor constant:14],
+        [saveStack.bottomAnchor constraintEqualToAnchor:saveCard.bottomAnchor constant:-14],
+    ]];
+
     UIView *display = [self card];
     display.translatesAutoresizingMaskIntoConstraints = NO;
     [_content addArrangedSubview:display];
@@ -351,7 +380,12 @@ typedef NS_ENUM(NSInteger, ARMSX3MenuTab)
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 10;
     [display addSubview:stack];
-    [stack addArrangedSubview:[self sectionTitle:@"屏幕显示" detail:@"OSD 详细项目仍由 RPCS3 Core 设置控制。"]];
+    [stack addArrangedSubview:[self sectionTitle:@"屏幕显示" detail:@"FPS 使用 RPCS3 性能监控叠加层；RSX Debug Overlay 是另一套开发者调试信息。"]];
+    BOOL perf = armsx3_ios_performance_overlay_enabled();
+    [stack addArrangedSubview:[self rowButton:perf ? @"关闭 FPS 性能监控" : @"开启 FPS 性能监控"
+        detail:perf ? @"当前已开启；恢复游戏后继续显示 FPS/帧时间等信息" : @"实时开启 RPCS3 Performance Overlay，无需退出游戏"
+        symbol:perf ? @"gauge.with.dots.needle.67percent" : @"gauge.with.dots.needle.33percent"
+        action:@selector(togglePerformanceOverlayFromMenu)]];
     [stack addArrangedSubview:[self rowButton:@"全部设置" detail:@"查看正在运行时的 Core/OSD 参数" symbol:@"gearshape.2" action:@selector(settingsFromMenu)]];
     [stack addArrangedSubview:[self rowButton:@"触控控制" detail:@"显示或隐藏虚拟控制器" symbol:@"hand.tap" action:@selector(toggleControlsFromMenu)]];
     [NSLayoutConstraint activateConstraints:@[
@@ -477,8 +511,12 @@ typedef NS_ENUM(NSInteger, ARMSX3MenuTab)
             [label.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-12],
         ]];
     }
-    [_content addArrangedSubview:[self rowButton:@"切换触控控制" detail:@"显示/隐藏屏幕按钮" symbol:@"hand.tap" action:@selector(toggleControlsFromMenu)]];
-    [_content addArrangedSubview:[self rowButton:@"控制设置" detail:@"查看控制器、热键及输入相关 Core 参数" symbol:@"gamecontroller" action:@selector(settingsFromMenu)]];
+    [_content addArrangedSubview:[self rowButton:@"切换触控控制" detail:@"显示/隐藏 Android 同源虚拟手柄" symbol:@"hand.tap" action:@selector(toggleControlsFromMenu)]];
+    [_content addArrangedSubview:[self rowButton:@"虚拟手柄设置" detail:@"透明度、布局和 Android 默认控件" symbol:@"gamecontroller" action:@selector(touchSettingsFromMenu)]];
+    [_content addArrangedSubview:[self rowButton:@"编辑触控布局" detail:@"直接在游戏画面上拖动、缩放并检查重叠" symbol:@"move.3d" action:@selector(editTouchControlsFromMenu)]];
+    [_content addArrangedSubview:[self rowButton:ARMSX3L(@"ios.controller.remap", @"Controller Remapping") detail:ARMSX3L(@"ios.controller.remap.desc", @"Rebind PS3 buttons to the connected physical controller") symbol:@"arrow.triangle.2.circlepath" action:@selector(controllerRemapFromMenu)]];
+    [_content addArrangedSubview:[self rowButton:ARMSX3L(@"ios.hotkeys.title", @"Controller Hotkeys") detail:ARMSX3L(@"hotkeys.help", @"Bind menu, savestate, screenshot, OSD, resolution and session actions") symbol:@"command" action:@selector(hotkeysFromMenu)]];
+    [_content addArrangedSubview:[self rowButton:@"全部控制设置" detail:@"查看热键及 Core 输入参数" symbol:@"gearshape.2" action:@selector(settingsFromMenu)]];
 }
 
 - (void)buildOptionsTab
@@ -551,6 +589,83 @@ typedef NS_ENUM(NSInteger, ARMSX3MenuTab)
 }
 
 - (void)toggleControlsFromMenu { [_host toggleControls]; }
+
+- (NSInteger)currentSaveSlot
+{
+    NSInteger slot = [NSUserDefaults.standardUserDefaults integerForKey:@"ARMSX3.SaveStateSlot"];
+    return MIN(MAX(slot, 0), 9);
+}
+
+- (void)cycleSaveSlotFromMenu
+{
+    NSInteger next = ([self currentSaveSlot] + 1) % 10;
+    [NSUserDefaults.standardUserDefaults setInteger:next forKey:@"ARMSX3.SaveStateSlot"];
+    [self selectTab:ARMSX3MenuTabSession];
+}
+
+- (void)saveStateFromMenu
+{
+    if (_dismissing) return;
+    if (!armsx3_ios_save_state_slot((unsigned int)[self currentSaveSlot], true)) return;
+    _dismissing = YES;
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)loadStateFromMenu
+{
+    if (_dismissing) return;
+    if (!armsx3_ios_load_state_slot((unsigned int)[self currentSaveSlot])) return;
+    _dismissing = YES;
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)deleteStateFromMenu
+{
+    const NSInteger slot = [self currentSaveSlot];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:ARMSX3L(@"savestate.delete.title", @"Delete save state")
+        message:[NSString stringWithFormat:@"Delete slot %ld?", (long)(slot + 1)] preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:ARMSX3L(@"action.cancel", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:ARMSX3L(@"action.delete", @"Delete") style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
+        if (armsx3_ios_delete_state_slot((unsigned int)slot)) [weakSelf selectTab:ARMSX3MenuTabSession];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)controllerRemapFromMenu
+{
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[[ARMSX3ControllerSettingsViewController alloc] initWithMode:ARMSX3ControllerSettingsModeRemapping]];
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)hotkeysFromMenu
+{
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[[ARMSX3ControllerSettingsViewController alloc] initWithMode:ARMSX3ControllerSettingsModeHotkeys]];
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)togglePerformanceOverlayFromMenu
+{
+    const BOOL next = !armsx3_ios_performance_overlay_enabled();
+    if (armsx3_ios_set_performance_overlay_enabled(next))
+        [self selectTab:_tab];
+}
+
+- (void)touchSettingsFromMenu
+{
+    [self dismissViewControllerAnimated:YES completion:^{
+        [self->_host resumeGameFromMenu];
+        [self->_host showTouchControlsSettings];
+    }];
+}
+
+- (void)editTouchControlsFromMenu
+{
+    [self dismissViewControllerAnimated:YES completion:^{
+        [self->_host resumeGameFromMenu];
+        [self->_host editTouchControls];
+    }];
+}
 - (void)shareLogFromMenu
 {
     [self dismissViewControllerAnimated:YES completion:^{

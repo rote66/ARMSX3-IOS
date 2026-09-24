@@ -10,15 +10,41 @@ set(ARMSX3_IOS_INPUT_SOURCES
 
 configure_file(Info.plist.in ${CMAKE_CURRENT_BINARY_DIR}/Info.plist @ONLY)
 
+# Reuse Android's bundled controller skins verbatim. Keep the directory names in
+# the app bundle so both frontends share the same asset naming contract.
+set(ARMSX3_CONTROLLER_SKIN_ROOT
+    ${CMAKE_SOURCE_DIR}/android/armsx3-ui/app/src/main/assets/controller_skins)
+file(GLOB_RECURSE ARMSX3_CONTROLLER_SKIN_RESOURCES CONFIGURE_DEPENDS
+    "${ARMSX3_CONTROLLER_SKIN_ROOT}/*.png")
+foreach(skin_file IN LISTS ARMSX3_CONTROLLER_SKIN_RESOURCES)
+    file(RELATIVE_PATH skin_rel "${ARMSX3_CONTROLLER_SKIN_ROOT}" "${skin_file}")
+    get_filename_component(skin_dir "${skin_rel}" DIRECTORY)
+    set_source_files_properties("${skin_file}" PROPERTIES
+        MACOSX_PACKAGE_LOCATION "Resources/controller_skins/${skin_dir}")
+endforeach()
+
+set(ARMSX3_I18N_ROOT ${CMAKE_SOURCE_DIR}/android/armsx3-ui/app/src/main/assets/i18n)
+file(GLOB ARMSX3_I18N_RESOURCES CONFIGURE_DEPENDS "${ARMSX3_I18N_ROOT}/*.json")
+foreach(i18n_file IN LISTS ARMSX3_I18N_RESOURCES)
+    set_source_files_properties("${i18n_file}" PROPERTIES MACOSX_PACKAGE_LOCATION "Resources/i18n")
+endforeach()
+
 add_executable(ARMSX3 MACOSX_BUNDLE
     src/ARMSX3App.mm
     src/ARMSX3FrontendViewController.mm
+    src/ARMSX3LibraryManagers.mm
     src/ARMSX3EmulationMenuViewController.mm
     src/ARMSX3SettingsViewController.mm
+    src/ARMSX3TouchControls.mm
+    src/ARMSX3Localization.mm
+    src/ARMSX3ControllerMappings.mm
+    src/ARMSX3IOSAudioBackend.mm
     src/armsx3_ios_core.mm
     ${ARMSX3_IOS_INPUT_SOURCES}
     ${CMAKE_SOURCE_DIR}/rpcs3/dev/iso.cpp
     ${CMAKE_SOURCE_DIR}/rpcs3/rpcs3_version.cpp
+    ${ARMSX3_CONTROLLER_SKIN_RESOURCES}
+    ${ARMSX3_I18N_RESOURCES}
     Assets.xcassets)
 
 target_compile_definitions(ARMSX3 PRIVATE ARMSX3_IOS=1)
@@ -49,6 +75,8 @@ target_link_libraries(ARMSX3 PRIVATE
     "-framework GameController"
     "-framework UniformTypeIdentifiers"
     "-framework AVFoundation"
+    "-framework AudioToolbox"
+    "-framework CoreAudio"
     "-framework CoreHaptics")
 
 set_source_files_properties(Assets.xcassets PROPERTIES
@@ -59,7 +87,7 @@ set_target_properties(ARMSX3 PROPERTIES
     MACOSX_BUNDLE_BUNDLE_NAME ARMSX3
     MACOSX_BUNDLE_GUI_IDENTIFIER com.armsx3.ios
     MACOSX_BUNDLE_SHORT_VERSION_STRING 0.9.9
-    MACOSX_BUNDLE_BUNDLE_VERSION 7
+    MACOSX_BUNDLE_BUNDLE_VERSION 36
     XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER com.armsx3.ios
     XCODE_ATTRIBUTE_CLANG_ENABLE_OBJC_ARC YES
     XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET 15.0
