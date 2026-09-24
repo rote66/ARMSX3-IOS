@@ -4,6 +4,8 @@
 #include "Crypto/unpkg.h"
 #include "Crypto/unself.h"
 #include "Emu/Audio/Null/NullAudioBackend.h"
+#include "Emu/Audio/Null/null_enumerator.h"
+#include "ARMSX3IOSAudioBackend.h"
 #include "Emu/Cell/Modules/cellMsgDialog.h"
 #include "Emu/Cell/Modules/cellSaveData.h"
 #include "Emu/Cell/Modules/cellSysutil.h"
@@ -19,11 +21,14 @@
 #include "Emu/RSX/GSFrameBase.h"
 #include "Emu/RSX/Null/NullGSRender.h"
 #include "Emu/RSX/Overlays/overlay_manager.h"
+#include "Emu/RSX/Overlays/overlay_perf_metrics.h"
 #include "Emu/RSX/Overlays/overlay_save_dialog.h"
 #include "Emu/RSX/Overlays/overlay_trophy_notification.h"
 #include "Emu/RSX/RSXThread.h"
 #include "Emu/RSX/VK/VKGSRender.h"
 #include "Emu/System.h"
+#include "Emu/savestate_utils.hpp"
+#include "Emu/localized_string_id.h"
 #include "Emu/VFS.h"
 #include "Emu/system_config.h"
 #include "Emu/system_utils.hpp"
@@ -34,6 +39,7 @@
 #include "Loader/TAR.h"
 #include "Utilities/File.h"
 #include "Utilities/Config.h"
+#include "Utilities/bin_patch.h"
 #include "Utilities/JIT.h"
 #include "Utilities/StrFmt.h"
 #include "Utilities/Thread.h"
@@ -50,6 +56,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -57,6 +65,7 @@
 #include <mutex>
 #include <optional>
 #include <pthread.h>
+#include <sstream>
 #include <sys/mman.h>
 #include <thread>
 #include <unistd.h>
@@ -66,6 +75,7 @@ extern "C" int csops(pid_t pid, unsigned int ops, void* useraddr, size_t usersiz
 extern std::string g_android_executable_dir;
 extern std::string g_android_config_dir;
 extern std::string g_android_cache_dir;
+extern atomic_t<bool> g_user_asked_for_screenshot;
 
 std::string g_input_config_override;
 cfg_input_configurations g_cfg_input_configs;
@@ -87,7 +97,134 @@ std::mutex g_pad_mutex;
 std::mutex g_lifecycle_mutex;
 std::string g_settings_json;
 std::string g_log_path;
+std::string g_boot_log_path;
 std::string g_firmware_version;
+std::string g_patch_json;
+std::optional<bool> g_firmware_saved_llvm_precompilation;
+std::optional<ppu_decoder_type> g_firmware_saved_ppu_decoder;
+std::optional<spu_decoder_type> g_firmware_saved_spu_decoder;
+
+std::string json_quote(std::string_view v)
+{
+	std::string out = "\"";
+	for (char c : v)
+	{
+		switch (c)
+		{
+		case '"': out += "\\\""; break;
+		case '\\': out += "\\\\"; break;
+		case '\n': out += "\\n"; break;
+		case '\r': out += "\\r"; break;
+		case '\t': out += "\\t"; break;
+		default:
+			if (static_cast<unsigned char>(c) < 0x20)
+				out += fmt::format("\\u%04x", static_cast<unsigned char>(c));
+			else
+				out += c;
+		}
+	}
+	return out + "\"";
+}
+
+std::string ios_slot_dir(std::string_view title)
+{
+	return fs::get_config_dir() + "/savestates/" + std::string(title) + "/armsx3_slots/";
+}
+
+std::string ios_slot_find(std::string_view title, unsigned int slot)
+{
+	if (title.empty() || slot >= 10) return {};
+	const std::string base = ios_slot_dir(title) + "slot" + std::to_string(slot) + ".SAVESTAT";
+	for (std::string_view ext : {".zst", ".gz", ""})
+	{
+		std::string path = base + std::string(ext);
+		if (fs::is_file(path)) return path;
+	}
+	return {};
+}
+
+bool ios_slot_capture(unsigned int slot, const std::string& title, const std::string& boot)
+{
+	const std::string newest = get_savestate_file(title, boot, 1);
+	if (!fs::is_file(newest))
+	{
+		armsx3_ios_log.error("savestate slot %u: newest state missing at '%s'", slot, newest);
+		return false;
+	}
+	const std::string dir = ios_slot_dir(title);
+	if (!fs::create_path(dir) && fs::g_tls_error != fs::error::exist)
+	{
+		armsx3_ios_log.error("savestate slot %u: cannot create '%s': %s", slot, dir, fs::g_tls_error);
+		return false;
+	}
+	constexpr std::string_view stem = ".SAVESTAT";
+	const usz pos = newest.rfind(stem);
+	const std::string suffix = pos == umax ? std::string{} : newest.substr(pos + stem.size());
+	const std::string dest = dir + "slot" + std::to_string(slot) + std::string(stem) + suffix;
+	for (std::string_view ext : {".zst", ".gz", ""})
+	{
+		std::string old = dir + "slot" + std::to_string(slot) + std::string(stem) + std::string(ext);
+		if (old != dest && fs::is_file(old)) fs::remove_file(old);
+	}
+	if (!fs::copy_file(newest, dest, true))
+	{
+		armsx3_ios_log.error("savestate slot %u: copy '%s' -> '%s' failed: %s", slot, newest, dest, fs::g_tls_error);
+		return false;
+	}
+	armsx3_ios_log.success("savestate slot %u saved to '%s'", slot, dest);
+	return true;
+}
+
+const patch_engine::patch_map& cached_patch_db()
+{
+	static std::mutex mutex;
+	static patch_engine::patch_map db;
+	static u64 cached_size = 0;
+	static s64 cached_mtime = 0;
+	static bool loaded = false;
+	std::lock_guard lock(mutex);
+
+	const std::string path = patch_engine::get_patches_path() + "patch.yml";
+	fs::stat_t info{};
+	const bool exists = fs::get_stat(path, info);
+	if (loaded && exists && info.size == cached_size && info.mtime == cached_mtime)
+		return db;
+
+	db.clear();
+	std::stringstream log;
+	patch_engine::load(db, path, {}, false, &log);
+	cached_size = exists ? info.size : 0;
+	cached_mtime = exists ? info.mtime : 0;
+	loaded = true;
+	return db;
+}
+
+void restore_firmware_runtime_overrides()
+{
+	if (g_firmware_saved_llvm_precompilation)
+	{
+		g_cfg.core.llvm_precompilation.set(*g_firmware_saved_llvm_precompilation);
+		armsx3_ios_diagnostic_log(fmt::format("firmware LLVM precompilation override restored=%d",
+			*g_firmware_saved_llvm_precompilation ? 1 : 0).c_str());
+		g_firmware_saved_llvm_precompilation.reset();
+	}
+
+	if (g_firmware_saved_ppu_decoder)
+	{
+		g_cfg.core.ppu_decoder.set(*g_firmware_saved_ppu_decoder);
+		armsx3_ios_diagnostic_log(fmt::format("firmware PPU decoder override restored=%s",
+			g_cfg.core.ppu_decoder.to_string()).c_str());
+		g_firmware_saved_ppu_decoder.reset();
+	}
+
+	if (g_firmware_saved_spu_decoder)
+	{
+		g_cfg.core.spu_decoder.set(*g_firmware_saved_spu_decoder);
+		armsx3_ios_diagnostic_log(fmt::format("firmware SPU decoder override restored=%s",
+			g_cfg.core.spu_decoder.to_string()).c_str());
+		g_firmware_saved_spu_decoder.reset();
+	}
+}
 
 void emit_event(armsx3_ios_event event, std::string_view message);
 cfg::_base* find_cfg_node_ios(cfg::_base* root, std::string_view path);
@@ -99,14 +236,68 @@ bool save_global_settings_locked();
 int boot_path_locked(const std::string& path)
 {
 	if (path.empty()) return static_cast<int>(game_boot_result::invalid_file_or_folder);
+
+	std::string boot_path = path;
+	while (boot_path.size() > 1 && boot_path.ends_with('/'))
+		boot_path.pop_back();
+
+	armsx3_ios_diagnostic_log(fmt::format("boot begin state=%d path=%s",
+		static_cast<int>(Emu.GetStatus(false)), boot_path).c_str());
+
+	// The startup JIT canary promotes the bootstrap arena once, but BootGame may
+	// run after a JIT reset/restore. Re-check immediately before any PPU/SPU code
+	// can execute so a missing executable transition becomes a normal boot error
+	// instead of an unlogged protection fault.
+	if (!jit_runtime::prepare_execution())
+	{
+		armsx3_ios_diagnostic_log("boot rejected: JIT execution is not ready");
+		emit_event(ARMSX3_IOS_EVENT_ERROR, "JIT execution is not ready");
+		return static_cast<int>(game_boot_result::generic_error);
+	}
+	armsx3_ios_diagnostic_log("boot JIT ready");
+
 	if (!Emu.IsStopped(true))
 	{
+		armsx3_ios_diagnostic_log("boot stopping previous VM");
 		Emu.Kill();
 		for (int elapsed = 0; !Emu.IsStopped(true) && elapsed < 10000; elapsed += 20)
 			std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		if (!Emu.IsStopped(true))
+		{
+			armsx3_ios_diagnostic_log("boot rejected: previous VM did not stop");
+			return static_cast<int>(game_boot_result::still_running);
+		}
 	}
+
+	if (fs::is_file(boot_path))
+	{
+		fs::file probe(boot_path);
+		char byte = 0;
+		if (!probe)
+		{
+			armsx3_ios_diagnostic_log("boot rejected: target cannot be opened");
+			return static_cast<int>(game_boot_result::invalid_file_or_folder);
+		}
+		const bool head_ok = probe.read_at(0, &byte, 1) == 1;
+		const u64 size = probe.size();
+		const bool body_ok = size <= 32769 || probe.read_at(32769, &byte, 1) == 1;
+		if (!head_ok || !body_ok)
+		{
+			armsx3_ios_diagnostic_log(fmt::format(
+				"boot rejected: target unreadable size=%d head=%d body=%d",
+				static_cast<int>(size), head_ok ? 1 : 0, body_ok ? 1 : 0).c_str());
+			return static_cast<int>(game_boot_result::invalid_file_or_folder);
+		}
+		armsx3_ios_diagnostic_log(fmt::format("boot target readable size=%d",
+			static_cast<int>(size)).c_str());
+	}
+
 	Emu.SetForceBoot(true);
-	return static_cast<int>(Emu.BootGame(path, "", false, cfg_mode::custom));
+	armsx3_ios_diagnostic_log("BootGame enter");
+	const auto result = Emu.BootGame(boot_path, "", false, cfg_mode::custom);
+	armsx3_ios_diagnostic_log(fmt::format("BootGame returned result=%d",
+		static_cast<int>(result)).c_str());
+	return static_cast<int>(result);
 }
 
 extern "C" bool armsx3_ios_install_package(const char* path)
@@ -353,6 +544,26 @@ bool save_global_settings_locked()
 	return true;
 }
 
+extern "C" bool armsx3_ios_performance_overlay_enabled(void)
+{
+	return g_initialized.load(std::memory_order_acquire) && g_cfg.video.perf_overlay.enabled.get();
+}
+
+extern "C" bool armsx3_ios_set_performance_overlay_enabled(bool enabled)
+{
+	if (!g_initialized.load(std::memory_order_acquire)) return false;
+	const bool running = !Emu.IsStopped();
+	{
+		std::lock_guard lock(g_lifecycle_mutex);
+		if (!g_cfg.video.perf_overlay.enabled.from_string(enabled ? "true" : "false", running))
+			return false;
+		Emulator::SaveSettings(g_cfg.to_string(), {});
+	}
+	if (running)
+		rsx::overlays::reset_performance_overlay();
+	return true;
+}
+
 } // namespace
 
 extern "C" bool armsx3_ios_settings_editable()
@@ -384,6 +595,15 @@ extern "C" bool armsx3_ios_set_setting_json(const char* path, const char* json_v
 #if defined(ARCH_ARM64)
 	if (std::string_view(path) == "Core@@SPU Decoder" && decoded == "Recompiler (ASMJIT)") return false;
 #endif
+	if (std::string_view(path) == "Video@@Shader Mode" &&
+		(decoded == "Async Recompiler with Shader Interpreter" || decoded == "Shader Interpreter only"))
+	{
+		// The interpreter requires 64 combined fragment samplers. Apple A-series
+		// Metal exposes only 16 fragment sampler slots, so MoltenVK cannot compile
+		// that ubershader. Keep the iOS configuration on the regular async recompiler.
+		if (!node->from_string("Async Recompiler (multi-threaded)", false)) return false;
+		return save_global_settings_locked();
+	}
 	if (!node->from_string(decoded, false)) return false;
 	return save_global_settings_locked();
 }
@@ -429,29 +649,74 @@ public:
 	u64 display_epoch() const override { return g_surface_epoch.load(); }
 	bool can_consume_frame() const override { return false; }
 	void present_frame(std::vector<u8>&&, u32, u32, u32, bool) const override {}
-	void take_screenshot(std::vector<u8>&&, u32, u32, bool) override {}
+	void take_screenshot(std::vector<u8>&& data, u32 width, u32 height, bool is_bgra) override
+	{
+		if (data.size() < static_cast<usz>(width) * height * 4 || !width || !height) return;
+		NSMutableData *rgba = [NSMutableData dataWithLength:static_cast<NSUInteger>(width) * height * 4];
+		u8 *dst = static_cast<u8 *>(rgba.mutableBytes);
+		for (usz i = 0; i < static_cast<usz>(width) * height; i++)
+		{
+			const u8 *src = data.data() + i * 4;
+			dst[i * 4 + 0] = is_bgra ? src[2] : src[0];
+			dst[i * 4 + 1] = src[1];
+			dst[i * 4 + 2] = is_bgra ? src[0] : src[2];
+			dst[i * 4 + 3] = src[3];
+		}
+		CGColorSpaceRef color_space = CGColorSpaceCreateDeviceRGB();
+		CGDataProviderRef provider = CGDataProviderCreateWithCFData((__bridge CFDataRef)rgba);
+		CGImageRef cg = CGImageCreate(width, height, 8, 32, width * 4, color_space,
+			static_cast<CGBitmapInfo>(kCGImageAlphaLast | kCGBitmapByteOrder32Big), provider, nullptr, false, kCGRenderingIntentDefault);
+		UIImage *image = cg ? [UIImage imageWithCGImage:cg] : nil;
+		NSData *png = image ? UIImagePNGRepresentation(image) : nil;
+		if (cg) CGImageRelease(cg);
+		if (provider) CGDataProviderRelease(provider);
+		if (color_space) CGColorSpaceRelease(color_space);
+		if (!png.length) return;
+		NSString *documents = NSProcessInfo.processInfo.environment[@"ARMSX3_DOCUMENTS_DIR"];
+		if (!documents.length) return;
+		NSString *dir = [documents stringByAppendingPathComponent:@"Screenshots"];
+		[NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+		NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+		formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+		formatter.dateFormat = @"yyyyMMdd-HHmmss-SSS";
+		NSString *name = [NSString stringWithFormat:@"ARMSX3-%@.png", [formatter stringFromDate:NSDate.date]];
+		NSString *path = [dir stringByAppendingPathComponent:name];
+		if ([png writeToFile:path atomically:YES])
+			emit_event(ARMSX3_IOS_EVENT_STATUS, fmt::format("Screenshot saved: {}", name.UTF8String));
+	}
 	void update_title(double) override {}
 };
 
 class IOSMessageDialog final : public MsgDialogBase
 {
+private:
+	u32 m_progress_value = 0;
+	u32 m_progress_limit = 100;
+
+	void emit_progress() const
+	{
+		emit_event(ARMSX3_IOS_EVENT_PROGRESS,
+			fmt::format("{}:{}", m_progress_value, std::max<u32>(m_progress_limit, 1)));
+	}
+
 public:
 	void Create(const std::string& msg, const std::string& title) override
 	{
-		emit_event(ARMSX3_IOS_EVENT_STATUS, title.empty() ? msg : title + ": " + msg);
+		emit_event(ARMSX3_IOS_EVENT_STATUS, title.empty() || title == msg ? msg : title + ": " + msg);
 		state = MsgDialogState::Open;
 	}
 	void Close(bool success) override
 	{
+		(void)success;
 		state = MsgDialogState::Close;
-		if (on_close) on_close(success ? CELL_MSGDIALOG_BUTTON_OK : CELL_MSGDIALOG_BUTTON_ESCAPE);
+		emit_event(ARMSX3_IOS_EVENT_PROGRESS_END, {});
 	}
 	void SetMsg(const std::string& msg) override { emit_event(ARMSX3_IOS_EVENT_STATUS, msg); }
 	void ProgressBarSetMsg(u32, const std::string& msg) override { SetMsg(msg); }
-	void ProgressBarReset(u32) override {}
-	void ProgressBarInc(u32, u32) override {}
-	void ProgressBarSetValue(u32, u32) override {}
-	void ProgressBarSetLimit(u32, u32) override {}
+	void ProgressBarReset(u32) override { m_progress_value = 0; emit_progress(); }
+	void ProgressBarInc(u32, u32 delta) override { m_progress_value += delta; emit_progress(); }
+	void ProgressBarSetValue(u32, u32 value) override { m_progress_value = value; emit_progress(); }
+	void ProgressBarSetLimit(u32, u32 limit) override { m_progress_limit = std::max<u32>(limit, 1); emit_progress(); }
 };
 
 class IOSSaveDialog final : public SaveDialogBase
@@ -534,17 +799,57 @@ bool initialize_virtual_pad(const std::shared_ptr<Pad>& pad)
 	return true;
 }
 
+struct ios_main_callback_dispatcher
+{
+	std::mutex mutex;
+	std::condition_variable cv;
+	std::deque<std::function<void()>> queue;
+	bool started = false;
+
+	void post(std::function<void()> callback)
+	{
+		std::unique_lock lock(mutex);
+		if (!started)
+		{
+			started = true;
+			std::thread([this]
+			{
+				pthread_setname_np("Main Callbacks");
+				for (;;)
+				{
+					std::function<void()> next;
+					{
+						std::unique_lock queue_lock(mutex);
+						cv.wait(queue_lock, [this] { return !queue.empty(); });
+						next = std::move(queue.front());
+						queue.pop_front();
+					}
+					next();
+				}
+			}).detach();
+		}
+
+		queue.push_back(std::move(callback));
+		cv.notify_one();
+	}
+};
+
+ios_main_callback_dispatcher g_ios_main_callbacks;
+
 void set_callbacks()
 {
 	EmuCallbacks callbacks{};
 	callbacks.call_from_main_thread = [](std::function<void()> fn, atomic_t<u32>* wake_up)
 	{
-		fn();
 		if (wake_up)
 		{
+			fn();
 			*wake_up = true;
 			wake_up->notify_one();
+			return;
 		}
+
+		g_ios_main_callbacks.post(std::move(fn));
 	};
 	callbacks.on_run = [](bool) { emit_event(ARMSX3_IOS_EVENT_RUNNING); };
 	callbacks.on_pause = [] { emit_event(ARMSX3_IOS_EVENT_PAUSED); };
@@ -593,16 +898,42 @@ void set_callbacks()
 	};
 	callbacks.get_audio = []() -> std::shared_ptr<AudioBackend>
 	{
-		return std::make_shared<NullAudioBackend>();
+		if (g_cfg.audio.renderer == audio_renderer::null)
+			return std::make_shared<NullAudioBackend>();
+		return std::make_shared<ARMSX3IOSAudioBackend>();
 	};
-	callbacks.get_audio_enumerator = [](u64) { return std::shared_ptr<audio_device_enumerator>{}; };
+	callbacks.get_audio_enumerator = [](u64) { return std::make_shared<null_enumerator>(); };
 	callbacks.get_msg_dialog = [] { return std::make_shared<IOSMessageDialog>(); };
 	callbacks.get_osk_dialog = [] { return std::shared_ptr<OskDialogBase>{}; };
 	callbacks.get_save_dialog = [] { return std::make_unique<IOSSaveDialog>(); };
 	callbacks.get_sendmessage_dialog = [] { return std::shared_ptr<SendMessageDialogBase>{}; };
 	callbacks.get_recvmessage_dialog = [] { return std::shared_ptr<RecvMessageDialogBase>{}; };
 	callbacks.get_trophy_notification_dialog = [] { return std::make_unique<IOSTrophyNotification>(); };
-	callbacks.get_localized_string = [](localized_string_id, const char*) { return std::string{}; };
+	callbacks.get_localized_string = [](localized_string_id id, const char* args) -> std::string
+	{
+		switch (id)
+		{
+		case localized_string_id::PROGRESS_DIALOG_PROGRESS: return "进度";
+		case localized_string_id::PROGRESS_DIALOG_PROGRESS_ANALYZING: return "正在分析";
+		case localized_string_id::PROGRESS_DIALOG_REMAINING: return "剩余";
+		case localized_string_id::PROGRESS_DIALOG_DONE: return "完成";
+		case localized_string_id::PROGRESS_DIALOG_FILE: return "文件";
+		case localized_string_id::PROGRESS_DIALOG_MODULE: return "模块";
+		case localized_string_id::PROGRESS_DIALOG_OF: return "/";
+		case localized_string_id::PROGRESS_DIALOG_PLEASE_WAIT: return "请稍候";
+		case localized_string_id::PROGRESS_DIALOG_STOPPING_PLEASE_WAIT: return "正在停止，请稍候";
+		case localized_string_id::PROGRESS_DIALOG_SAVESTATE_PLEASE_WAIT: return "正在处理存档，请稍候";
+		case localized_string_id::PROGRESS_DIALOG_SCANNING_PPU_EXECUTABLE: return "正在扫描 PPU 可执行文件";
+		case localized_string_id::PROGRESS_DIALOG_ANALYZING_PPU_EXECUTABLE: return "正在分析 PPU 可执行文件";
+		case localized_string_id::PROGRESS_DIALOG_SCANNING_PPU_MODULES: return "正在扫描 PPU 模块";
+		case localized_string_id::PROGRESS_DIALOG_LOADING_PPU_MODULES: return "正在加载 PPU 模块";
+		case localized_string_id::PROGRESS_DIALOG_COMPILING_PPU_MODULES: return "正在编译 PPU 模块";
+		case localized_string_id::PROGRESS_DIALOG_LINKING_PPU_MODULES: return "正在链接 PPU 模块";
+		case localized_string_id::PROGRESS_DIALOG_APPLYING_PPU_CODE: return "正在应用 PPU 代码";
+		case localized_string_id::PROGRESS_DIALOG_BUILDING_SPU_CACHE: return "正在构建 SPU 缓存";
+		default: return args ? args : "";
+		}
+	};
 	callbacks.get_localized_u32string = [](localized_string_id, const char*) { return std::u32string{}; };
 	callbacks.get_localized_setting = [](const cfg::_base*, u32) { return std::string{}; };
 	callbacks.get_photo_path = [](std::string_view) { return std::string{}; };
@@ -632,7 +963,9 @@ void set_callbacks()
 [[noreturn]] void report_fatal_error(std::string_view text, bool, bool)
 {
 	emit_event(ARMSX3_IOS_EVENT_ERROR, text);
+	armsx3_ios_diagnostic_log(fmt::format("fatal: %s", text).c_str());
 	armsx3_ios_log.fatal("%s", text);
+	logs::listener::sync_all();
 	std::abort();
 }
 
@@ -669,9 +1002,16 @@ extern "C" bool armsx3_ios_initialize(const char* root_dir, void* metal_view,
 	g_android_cache_dir = root + "cache/";
 	std::filesystem::create_directories(g_android_config_dir);
 	std::filesystem::create_directories(g_android_cache_dir);
-	std::filesystem::create_directories(root + "logs/");
-	g_log_path = fs::get_log_dir() + "ARMSX3.log";
-	armsx3_ios_diagnostic_log("core paths ready");
+
+	std::string logs_dir = root + "logs/";
+	if (const char* documents = std::getenv("ARMSX3_DOCUMENTS_DIR"); documents && *documents)
+		logs_dir = directory_path(documents) + "Logs/";
+	std::filesystem::create_directories(logs_dir);
+	g_log_path = logs_dir + "ARMSX3.log";
+	g_boot_log_path = logs_dir + "ARMSX3-boot.log";
+	armsx3_ios_set_diagnostic_log_path(g_boot_log_path.c_str());
+	armsx3_ios_diagnostic_log(fmt::format("persistent logs ready core=%s boot=%s",
+		g_log_path, g_boot_log_path).c_str());
 
 	armsx3_ios_diagnostic_log("core thread runtime begin");
 	static_cast<void>(named_thread("", [](int) {}));
@@ -691,6 +1031,23 @@ extern "C" bool armsx3_ios_initialize(const char* root_dir, void* metal_view,
 	armsx3_ios_diagnostic_log("Emu.Init begin");
 	Emu.Init();
 	armsx3_ios_diagnostic_log("Emu.Init passed");
+
+	// ASMJIT is not available on this ARM64 mobile target. A stale config copied
+	// from another build must not be allowed to reach the SPU bootstrap path.
+	if (g_cfg.core.spu_decoder == spu_decoder_type::asmjit)
+	{
+		g_cfg.core.spu_decoder.set(spu_decoder_type::llvm);
+		armsx3_ios_diagnostic_log("SPU decoder corrected from ASMJIT to LLVM");
+	}
+	g_cfg.core.llvm_cpu.from_string("");
+
+	if (g_cfg.video.shadermode == shader_mode::async_with_interpreter ||
+		g_cfg.video.shadermode == shader_mode::interpreter_only)
+	{
+		g_cfg.video.shadermode.set(shader_mode::async_recompiler);
+		Emulator::SaveSettings(g_cfg.to_string(), {});
+		armsx3_ios_diagnostic_log("shader mode corrected to Async Recompiler for iOS MoltenVK sampler limit");
+	}
 
 	g_cfg_input.player1.handler.set(pad_handler::virtual_pad);
 	g_cfg_input.player1.device.from_string("Virtual");
@@ -782,6 +1139,7 @@ extern "C" int armsx3_ios_boot(const char* path)
 	if (!path || !*path) return static_cast<int>(game_boot_result::invalid_file_or_folder);
 	if (!g_initialized.load(std::memory_order_acquire)) return static_cast<int>(game_boot_result::generic_error);
 	std::lock_guard lock(g_lifecycle_mutex);
+	restore_firmware_runtime_overrides();
 	return boot_path_locked(path);
 }
 
@@ -800,7 +1158,31 @@ extern "C" int armsx3_ios_boot_firmware()
 	const std::string vsh_path = g_cfg_vfs.get_dev_flash() + "vsh/module/vsh.self";
 	if (!fs::is_file(vsh_path))
 		return static_cast<int>(game_boot_result::invalid_file_or_folder);
-	return boot_path_locked(vsh_path);
+
+	// Booting VSH is the worst case for eager LLVM precompilation on iOS: RPCS3 scans
+	// dev_flash and compiles a large collection of firmware SPRX modules before the XMB
+	// gets a chance to draw a frame. On a 4 GB A-series device that turns a healthy boot
+	// into a long black screen and repeatedly pushes LLVM to its mobile memory limits.
+	//
+	// RPCS3 already supports the intended alternative: with LLVM Precompilation disabled,
+	// the PPU still uses the LLVM recompiler and caches code, but extra modules are compiled
+	// only when they are actually loaded. Apply that policy only to the firmware session;
+	// normal game boots keep the user's setting.
+	if (!g_firmware_saved_llvm_precompilation)
+		g_firmware_saved_llvm_precompilation = static_cast<bool>(g_cfg.core.llvm_precompilation);
+	if (!g_firmware_saved_ppu_decoder)
+		g_firmware_saved_ppu_decoder = g_cfg.core.ppu_decoder.get();
+	if (!g_firmware_saved_spu_decoder)
+		g_firmware_saved_spu_decoder = g_cfg.core.spu_decoder.get();
+	g_cfg.core.llvm_precompilation.set(false);
+	g_cfg.core.ppu_decoder.set(ppu_decoder_type::_static);
+	g_cfg.core.spu_decoder.set(spu_decoder_type::_static);
+	armsx3_ios_diagnostic_log("firmware boot: static PPU + static SPU interpreters + LLVM precompilation override requested");
+
+	const int result = boot_path_locked(vsh_path);
+	if (result != static_cast<int>(game_boot_result::no_errors))
+		restore_firmware_runtime_overrides();
+	return result;
 }
 
 extern "C" bool armsx3_ios_install_firmware(const char* path)
@@ -843,13 +1225,111 @@ extern "C" bool armsx3_ios_install_firmware(const char* path)
 
 extern "C" void armsx3_ios_pause() { if (g_initialized.load(std::memory_order_acquire)) Emu.Pause(); }
 extern "C" void armsx3_ios_resume() { if (g_initialized.load(std::memory_order_acquire)) Emu.Resume(); }
-extern "C" void armsx3_ios_stop()
+extern "C" bool armsx3_ios_stop()
 {
-	if (!g_initialized.load(std::memory_order_acquire)) return;
+	if (!g_initialized.load(std::memory_order_acquire)) return true;
 	std::lock_guard lock(g_lifecycle_mutex);
 	Emu.Kill();
+	for (int elapsed = 0; !Emu.IsStopped(true) && elapsed < 10000; elapsed += 20)
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	const bool stopped = Emu.IsStopped(true);
+	if (stopped)
+	{
+		restore_firmware_runtime_overrides();
+	}
+	else
+	{
+		armsx3_ios_diagnostic_log(fmt::format("stop timed out state=%d",
+			static_cast<int>(Emu.GetStatus(false))).c_str());
+		emit_event(ARMSX3_IOS_EVENT_ERROR, "Emulation did not finish stopping");
+	}
+	return stopped;
 }
 extern "C" int armsx3_ios_state() { return static_cast<int>(Emu.GetStatus(false)); }
+
+extern "C" bool armsx3_ios_save_state_slot(unsigned int slot, bool resume_after_save)
+{
+	if (slot >= 10 || (!Emu.IsRunning() && !Emu.IsPaused())) return false;
+	const std::string title = Emu.GetTitleID();
+	const std::string boot = Emu.GetBoot();
+	if (title.empty()) return false;
+	Emu.CallFromMainThread([slot, title, boot, resume_after_save]()
+	{
+		Emu.after_kill_callback = [slot, title, boot, resume_after_save]()
+		{
+			ios_slot_capture(slot, title, boot);
+			if (resume_after_save) Emu.Restart(true, false);
+		};
+		if (resume_after_save) Emu.SetContinuousMode(true);
+		Emu.Kill(false, true);
+	});
+	return true;
+}
+
+extern "C" bool armsx3_ios_load_state_slot(unsigned int slot)
+{
+	if (slot >= 10) return false;
+	const std::string path = ios_slot_find(Emu.GetTitleID(), slot);
+	if (path.empty()) return false;
+	Emu.CallFromMainThread([path]()
+	{
+		Emu.SetContinuousMode(true);
+		Emu.after_kill_callback = [path]()
+		{
+			const game_boot_result result = Emu.BootGame(path, "", true);
+			if (result != game_boot_result::no_errors)
+				armsx3_ios_log.error("savestate load failed '%s': %s", path, fmt::format("%s", result));
+		};
+		Emu.Kill(false, false);
+	});
+	return true;
+}
+
+extern "C" bool armsx3_ios_has_state_slot(unsigned int slot)
+{
+	return slot < 10 && !ios_slot_find(Emu.GetTitleID(), slot).empty();
+}
+
+extern "C" bool armsx3_ios_delete_state_slot(unsigned int slot)
+{
+	if (slot >= 10) return false;
+	const std::string title = Emu.GetTitleID();
+	const std::string path = ios_slot_find(title, slot);
+	if (path.empty() || !fs::remove_file(path)) return false;
+	const std::string thumb = ios_slot_dir(title) + "slot" + std::to_string(slot) + ".thumb";
+	if (fs::is_file(thumb)) fs::remove_file(thumb);
+	return true;
+}
+
+extern "C" bool armsx3_ios_restart()
+{
+	if (!Emu.IsRunning() && !Emu.IsPaused()) return false;
+	Emu.CallFromMainThread([]()
+	{
+		Emu.SetContinuousMode(true);
+		Emu.Restart(true);
+	});
+	return true;
+}
+
+extern "C" int armsx3_ios_step_resolution(int direction)
+{
+	if (direction == 0) return static_cast<int>(g_cfg.video.resolution_scale_percent);
+	const int current = static_cast<int>(g_cfg.video.resolution_scale_percent);
+	const int current_step = std::clamp((current + 50) / 100, 1, 8);
+	const int next = std::clamp(current_step + (direction > 0 ? 1 : -1), 1, 8) * 100;
+	g_cfg.video.resolution_scale_percent.set(next);
+	Emulator::SaveSettings(g_cfg.to_string(), Emu.GetTitleID());
+	emit_event(ARMSX3_IOS_EVENT_STATUS, fmt::format("Resolution {}x", next / 100));
+	return next;
+}
+
+extern "C" bool armsx3_ios_request_screenshot()
+{
+	if (!Emu.IsRunning() && !Emu.IsPaused()) return false;
+	g_user_asked_for_screenshot = true;
+	return true;
+}
 
 extern "C" bool armsx3_ios_set_pad(int port, uint32_t digital1, uint32_t digital2,
 	uint8_t left_x, uint8_t left_y, uint8_t right_x, uint8_t right_y,
@@ -878,5 +1358,114 @@ extern "C" bool armsx3_ios_set_pad(int port, uint32_t digital1, uint32_t digital
 	return true;
 }
 
+extern "C" const char* armsx3_ios_patches_json(const char* serial_raw)
+{
+	const std::string serial = serial_raw ? serial_raw : "";
+	const patch_engine::patch_map& db = cached_patch_db();
+	const patch_engine::patch_map enabled = patch_engine::load_config();
+
+	std::string out = "[";
+	bool first = true;
+	for (const auto& [hash, container] : db)
+	{
+		for (const auto& [description, info] : container.patch_info_map)
+		{
+			bool applies = serial.empty();
+			std::string app_version = "all";
+			std::string game_title;
+			for (const auto& [title, serials] : info.titles)
+			{
+				for (const auto& [ser, versions] : serials)
+				{
+					const bool hit = !serial.empty() && ser == serial;
+					if (hit || serial.empty())
+						if (game_title.empty()) game_title = title;
+					if (hit)
+					{
+						applies = true;
+						game_title = title;
+						if (!versions.empty()) app_version = versions.begin()->first;
+					}
+				}
+			}
+			if (!applies) continue;
+
+			bool is_on = false;
+			if (auto it = enabled.find(hash); it != enabled.end())
+			{
+				if (auto p = it->second.patch_info_map.find(description); p != it->second.patch_info_map.end())
+				{
+					for (const auto& [title, serials] : p->second.titles)
+						for (const auto& [ser, versions] : serials)
+						{
+							if (!serial.empty() && ser != serial && ser != patch_key::all) continue;
+							for (const auto& [ver, values] : versions)
+								if (values.enabled) is_on = true;
+						}
+				}
+			}
+
+			if (!first) out += ',';
+			first = false;
+			out += "{\"hash\":" + json_quote(hash)
+				+ ",\"name\":" + json_quote(description)
+				+ ",\"author\":" + json_quote(info.author)
+				+ ",\"notes\":" + json_quote(info.notes)
+				+ ",\"version\":" + json_quote(info.patch_version)
+				+ ",\"appVersion\":" + json_quote(app_version)
+				+ ",\"game\":" + json_quote(game_title)
+				+ ",\"enabled\":" + (is_on ? "true" : "false") + "}";
+		}
+	}
+	out += ']';
+	{
+		std::lock_guard lock(g_lifecycle_mutex);
+		g_patch_json = std::move(out);
+		return g_patch_json.c_str();
+	}
+}
+
+extern "C" bool armsx3_ios_patch_set_enabled(const char* hash_raw, const char* description_raw,
+	const char* serial_raw, const char* app_version_raw, bool enabled_value)
+{
+	if (!hash_raw || !description_raw) return false;
+	const std::string hash = hash_raw;
+	const std::string description = description_raw;
+	const std::string serial = serial_raw ? serial_raw : "";
+	const std::string app_version = app_version_raw ? app_version_raw : "all";
+	const patch_engine::patch_map& db = cached_patch_db();
+	patch_engine::patch_map config = patch_engine::load_config();
+
+	auto h = db.find(hash);
+	if (h == db.end()) return false;
+	auto p = h->second.patch_info_map.find(description);
+	if (p == h->second.patch_info_map.end()) return false;
+
+	auto& entry = config[hash];
+	entry.hash = hash;
+	entry.version = h->second.version;
+	auto& info = entry.patch_info_map[description];
+	info = p->second;
+
+	bool touched = false;
+	for (auto& [title, serials] : info.titles)
+		for (auto& [ser, versions] : serials)
+			for (auto& [ver, values] : versions)
+			{
+				if (ser == serial || serial.empty() || ser == patch_key::all)
+				{
+					if (app_version == "all" || ver == app_version || ser == patch_key::all)
+					{
+						values.enabled = enabled_value;
+						touched = true;
+					}
+				}
+			}
+	if (!touched && !serial.empty()) return false;
+	patch_engine::save_config(config);
+	return true;
+}
+
 extern "C" const char* armsx3_ios_log_path() { return g_log_path.c_str(); }
+extern "C" const char* armsx3_ios_boot_log_path() { return g_boot_log_path.c_str(); }
 extern "C" const char* armsx3_ios_firmware_version() { return g_firmware_version.c_str(); }
