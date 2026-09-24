@@ -2498,6 +2498,14 @@ spu_function_t spu_runtime::rebuild_ubertrampoline(u32 id_inst)
 		// Flush the freshly written ubertrampoline BEFORE publishing it via the CAS
 		// below; other cores may branch into it immediately.
 		asmjit::VirtMem::flushInstructionCache(wxptr, raw - wxptr);
+
+		// The iOS Legacy JIT uses immutable executable pages: manual emitters do not
+		// pass through asmjit's runtime or LLVM MemoryManager2, so seal this freshly
+		// generated page explicitly before publishing it to another thread.
+		if (!jit_runtime::finalize_code(wxptr, raw - wxptr))
+		{
+			return nullptr;
+		}
 #endif
 	}
 
@@ -2645,6 +2653,13 @@ spu_function_t spu_runtime::make_branch_patchpoint(u16 data) const
 	// cannot fetch stale instructions for this freshly written patchpoint.
 	asmjit::VirtMem::flushInstructionCache(patch_fn, raw - patch_fn);
 
+	// This patchpoint is immutable on the iOS Legacy JIT path. The branch helper
+	// below performs the lookup on every hit instead of rewriting these bytes.
+	if (!jit_runtime::finalize_code(patch_fn, raw - patch_fn))
+	{
+		return nullptr;
+	}
+
 	return reinterpret_cast<spu_function_t>(patch_fn);
 #else
 #error "Unimplemented"
@@ -2664,6 +2679,13 @@ void spu_recompiler_base::dispatch(spu_thread& spu, void*, u8* rip)
 	// If code verification failed from a patched patchpoint, clear it with a dispatcher jump
 	if (rip)
 	{
+#ifdef ARMSX3_IOS
+		// Legacy iOS code pages are sealed RX and must stay executable for other
+		// threads. Do not self-modify an already published patchpoint. Falling
+		// through to the normal dispatcher is functionally equivalent; it only
+		// forgoes the direct-branch optimization.
+		(void)rip;
+#else
 #if defined(ARCH_X64)
 		const s64 rel = reinterpret_cast<u64>(spu_runtime::tr_all) - reinterpret_cast<u64>(rip - 8) - 5;
 
@@ -2716,6 +2738,7 @@ void spu_recompiler_base::dispatch(spu_thread& spu, void*, u8* rip)
 #else
 #error "Unimplemented"
 #endif
+#endif // ARMSX3_IOS
 	}
 
 	// Second attempt (recover from the recursion after repeated unsuccessful trampoline call)
@@ -2830,6 +2853,18 @@ void spu_recompiler_base::branch(spu_thread& spu, void*, u8* rip)
 	{
 		return;
 	}
+
+#ifdef ARMSX3_IOS
+	// The ARM64 branch patchpoint normally rewrites its 16-byte jump body to the
+	// resolved function. That requires making an already-live executable page
+	// writable. With an ordinary (non-MAP_JIT) iOS mapping page permissions are
+	// process-wide, so doing so either SIGBUSes on RX or races other threads if
+	// changed to RW. Keep the immutable patchpoint and tail-call the resolved
+	// function without modifying code. This costs one lookup on each hit but is
+	// safe and preserves correctness.
+	spu_runtime::g_tail_escape(&spu, func, nullptr);
+	return;
+#endif
 
 #if defined(ARCH_X64)
 	// Overwrite jump to this function with jump to the compiled function

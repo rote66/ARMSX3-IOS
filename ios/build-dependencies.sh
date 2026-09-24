@@ -117,7 +117,12 @@ build_llvm() {
     local build=${BUILD_DIR}/llvm-ios-build
     local prefix=${DEPS_DIR}/llvm
     local tablegen=${ARMSX3_LLVM_TABLEGEN:-/opt/homebrew/opt/llvm@22/bin/llvm-tblgen}
-    if [[ -f ${prefix}/lib/cmake/llvm/LLVMConfig.cmake ]]; then
+    local ios_patch=${SCRIPT_DIR}/llvm-ios-memalloc.patch
+    local ios_patch_stamp=${prefix}/.armsx3-ios-memalloc-v1
+    local llvm_repo=${SOURCE_DIR}/3rdparty/llvm/llvm
+    local llvm_patch_applied=0
+
+    if [[ -f ${prefix}/lib/cmake/llvm/LLVMConfig.cmake && -f ${ios_patch_stamp} ]]; then
         print "LLVM already built"
         return
     fi
@@ -125,6 +130,29 @@ build_llvm() {
         print -u2 "Host llvm-tblgen 22 is required; set ARMSX3_LLVM_TABLEGEN"
         return 1
     fi
+
+    # Keep the LLVM submodule pristine. The iOS allocator fix is applied only
+    # while building the cross-compiled static libraries and is reverted again
+    # after installation. This makes the dependency build reproducible without
+    # carrying a modified third-party checkout in the main working tree.
+    if [[ -f ${ios_patch} ]]; then
+        if git -C ${llvm_repo} apply --check ${ios_patch}; then
+            git -C ${llvm_repo} apply ${ios_patch}
+            llvm_patch_applied=1
+        elif git -C ${llvm_repo} apply --reverse --check ${ios_patch}; then
+            llvm_patch_applied=1
+        else
+            print -u2 "LLVM iOS allocator patch does not apply cleanly"
+            return 1
+        fi
+    fi
+
+    local restore_llvm_patch=''
+    if (( llvm_patch_applied )); then
+        restore_llvm_patch="git -C '${llvm_repo}' checkout -- llvm/lib/Support/MemAlloc.cpp"
+        trap "${restore_llvm_patch}" EXIT INT TERM
+    fi
+
     cmake -S ${source} -B ${build} -G "Unix Makefiles" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_SYSTEM_NAME=iOS \
@@ -160,6 +188,12 @@ build_llvm() {
         -DLLVM_ENABLE_EH=OFF
     cmake --build ${build} -j${JOBS}
     cmake --install ${build}
+    touch ${ios_patch_stamp}
+
+    if (( llvm_patch_applied )); then
+        eval ${restore_llvm_patch}
+        trap - EXIT INT TERM
+    fi
 }
 
 case ${1:-all} in

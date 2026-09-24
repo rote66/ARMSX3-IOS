@@ -232,9 +232,6 @@ static usz get_jit_segment_size()
 static atomic_t<u64> s_code_pos{0}, s_data_pos{0};
 
 #if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
-static std::mutex s_ios_legacy_jit_write_mutex;
-static thread_local u32 s_ios_legacy_jit_write_depth = 0;
-
 extern "C" bool armsx3_ios_legacy_jit_write_protect(int enabled) noexcept
 {
 	const auto& arena = get_jit_memory_arena();
@@ -243,52 +240,13 @@ extern "C" bool armsx3_ios_legacy_jit_write_protect(int enabled) noexcept
 		return false;
 	}
 
-	// Before JIT authorization the bootstrap arena intentionally stays RW.
-	// Treat the toggle as handled so APRR/SPRR is not applied to non-MAP_JIT
-	// memory. Once execution is enabled, use the same Legacy W^X model as
-	// ARMSX2: RW while generating code, RX while executing it.
-	if (!s_ios_jit_execution_ready.load())
-	{
-		return true;
-	}
-
-	const usz used = utils::align<usz>(s_code_pos.load() & 0xffff'ffff,
-		static_cast<usz>(utils::get_page_size()));
-	if (!used)
-	{
-		return true;
-	}
-
-	if (!enabled)
-	{
-		if (s_ios_legacy_jit_write_depth++ == 0)
-		{
-			s_ios_legacy_jit_write_mutex.lock();
-			if (!utils::try_memory_commit(arena.base, used, utils::protection::rw))
-			{
-				s_ios_legacy_jit_write_depth = 0;
-				s_ios_legacy_jit_write_mutex.unlock();
-				armsx3_ios_diagnostic_log("jit legacy protect RW failed");
-			}
-		}
-		return true;
-	}
-
-	if (!s_ios_legacy_jit_write_depth)
-	{
-		return true;
-	}
-
-	if (--s_ios_legacy_jit_write_depth == 0)
-	{
-		asmjit::VirtMem::flushInstructionCache(arena.base, used);
-		if (!utils::try_memory_commit(arena.base, used, utils::protection::rx))
-		{
-			armsx3_ios_diagnostic_log("jit legacy protect RX failed");
-		}
-		s_ios_legacy_jit_write_mutex.unlock();
-	}
-
+	// Ordinary anonymous mappings have process-wide page permissions. Toggling
+	// the complete shared arena RW while another PPU/SPU thread is executing old
+	// code from it races immediately into SIGBUS. Legacy mode therefore never
+	// changes existing executable pages here. New executable allocations are
+	// page-aligned while execution is active and are sealed individually by
+	// jit_runtime::finalize_code() after all writes/relocations are complete.
+	(void)enabled;
 	return true;
 }
 #endif
@@ -440,6 +398,11 @@ void* jit_runtime_base::_add(asmjit::CodeHolder* code, usz align) noexcept
 	asmjit::VirtMem::flushInstructionCache(p, codeSize);
 #endif
 
+	if (!jit_runtime::finalize_code(p, codeSize))
+	{
+		return nullptr;
+	}
+
 	return p;
 }
 
@@ -465,6 +428,16 @@ u8* jit_runtime::alloc(usz size, usz align, bool exec) noexcept
 
 	if (exec)
 	{
+	#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+		const auto& arena = get_jit_memory_arena();
+		if (!arena.map_jit && s_ios_jit_execution_ready.load() && size)
+		{
+			// Once the bootstrap prefix is RX, never allocate new writable code in
+			// the tail of an executable page. Each runtime code object starts on a
+			// fresh page which remains RW until finalize_code() seals it RX.
+			align = std::max<usz>(align, utils::get_page_size());
+		}
+	#endif
 		return add_jit_memory<s_code_pos, true, utils::protection::wx>(size, align);
 	}
 	else
@@ -529,6 +502,38 @@ bool jit_runtime::prepare_execution() noexcept
 #else
 	return true;
 #endif
+}
+
+bool jit_runtime::finalize_code(void* ptr, usz size) noexcept
+{
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+	if (!ptr || !size)
+	{
+		return true;
+	}
+
+	const auto& arena = get_jit_memory_arena();
+	if (arena.map_jit || !s_ios_jit_execution_ready.load())
+	{
+		return true;
+	}
+
+	const usz page_size = utils::get_page_size();
+	const uptr begin = reinterpret_cast<uptr>(ptr) & ~(static_cast<uptr>(page_size) - 1);
+	const uptr end = utils::align<uptr>(reinterpret_cast<uptr>(ptr) + size, page_size);
+
+	asmjit::VirtMem::flushInstructionCache(ptr, size);
+	if (!utils::try_memory_commit(reinterpret_cast<void*>(begin), end - begin, utils::protection::rx))
+	{
+		armsx3_ios_diagnostic_log("jit legacy page seal RX failed");
+		return false;
+	}
+#else
+	(void)ptr;
+	(void)size;
+#endif
+
+	return true;
 }
 
 void jit_runtime::initialize()

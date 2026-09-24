@@ -106,6 +106,12 @@ struct jit_runtime final : jit_runtime_base
 	// exercised. Other platforms simply return true.
 	static bool prepare_execution() noexcept;
 
+	// Seal one completed code allocation for execution. On iOS Legacy JIT this
+	// changes only the newly-written pages from RW to RX, so other threads can
+	// continue executing older JIT pages while code generation is in progress.
+	// Other platforms either already have executable mappings or use MAP_JIT.
+	static bool finalize_code(void* ptr, usz size) noexcept;
+
 	// Deallocate all memory
 	static void finalize() noexcept;
 };

@@ -737,7 +737,7 @@ namespace vk
 	{
 		const u64 device_local = device_local_total;
 
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(ARMSX3_IOS)
 		// Unified memory: the "VRAM" figure is system RAM, most of which belongs to the OS
 		// and everything else running. Budget against what is actually free, keeping back
 		// room for the emulator itself, and clamp so the answer stays sane whether the phone
@@ -745,7 +745,7 @@ namespace vk
 		//
 		// Cached because both cache implementations ask on a periodic check and reading
 		// /proc/meminfo each time is not free.
-		static const u64 android_budget = []() -> u64
+		static const u64 mobile_budget = []() -> u64
 		{
 			constexpr u64 mb = 0x100000;
 			constexpr u64 emulator_reserve = 1536 * mb;
@@ -755,14 +755,19 @@ namespace vk
 			const u64 avail = utils::get_avail_memory();
 			if (!avail)
 			{
+				rsx_log.notice("Mobile unified-memory GPU budget: %llu MB (OS headroom unavailable)",
+					floor_bytes / mb);
 				return floor_bytes;
 			}
 
 			const u64 spare = (avail > emulator_reserve) ? avail - emulator_reserve : 0;
-			return std::clamp(spare, floor_bytes, ceiling_bytes);
+			const u64 budget = std::clamp(spare, floor_bytes, ceiling_bytes);
+			rsx_log.notice("Mobile unified-memory GPU budget: %llu MB (OS headroom %llu MB)",
+				budget / mb, avail / mb);
+			return budget;
 		}();
 
-		return std::min(device_local, android_budget);
+		return std::min(device_local, mobile_budget);
 #else
 		return device_local;
 #endif
@@ -1176,8 +1181,8 @@ namespace vk
 		}
 		else
 		{
-			rsx_log.error("VK_EXT_shader_uniform_buffer_unsized_array is NOT supported by this driver. "
-				"Shaders that declare unsized uniform arrays cannot be compiled here.");
+			rsx_log.warning("VK_EXT_shader_uniform_buffer_unsized_array is not supported by this driver; "
+				"using concrete uniform-array bounds instead.");
 		}
 
 		VkPhysicalDeviceCustomBorderColorFeaturesEXT custom_border_color_features{};

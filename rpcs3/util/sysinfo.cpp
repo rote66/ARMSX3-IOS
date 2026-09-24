@@ -21,6 +21,8 @@ DYNAMIC_IMPORT("ntdll.dll", RtlGetVersion, NTSTATUS(OSVERSIONINFOW* lpVersionInf
 #include <unistd.h>
 #include <sys/resource.h>
 #ifdef __APPLE__
+#include <mach/mach.h>
+#include <os/proc.h>
 #include <sys/sysctl.h>
 #else
 #include <sys/utsname.h>
@@ -757,6 +759,11 @@ std::pair<u64, u64> utils::get_memory_usage()
 	}
 
 	return { mem_total, mem_total - mem_available };
+#elif defined(__APPLE__)
+	// There is no Linux-style MemAvailable figure on Darwin that means the same thing.
+	// perf_monitor reports the process footprint and the process-specific dirty-memory
+	// headroom separately, so do not fabricate a system-wide used/free pair here.
+	return { 0, 0 };
 #else
 	// TODO
 	return { get_total_memory(), 0 };
@@ -786,6 +793,19 @@ u64 utils::get_process_memory_usage()
 	if (statm >> total_pages >> resident_pages)
 	{
 		return resident_pages * static_cast<u64>(::sysconf(_SC_PAGESIZE));
+	}
+
+	return 0;
+#elif defined(__APPLE__)
+	// This is the footprint iOS uses for app memory-pressure accounting. RSS is not a
+	// useful substitute on Darwin because shared/compressed/purgeable mappings are treated
+	// differently by jetsam. TASK_VM_INFO is also what Apple's own diagnostics expose.
+	task_vm_info_data_t info{};
+	mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+	if (::task_info(::mach_task_self(), TASK_VM_INFO,
+		reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS)
+	{
+		return info.phys_footprint;
 	}
 
 	return 0;
@@ -1183,6 +1203,11 @@ u64 utils::get_avail_memory()
 			}
 		}
 	}
+#elif defined(__APPLE__) && defined(ARMSX3_IOS)
+	// iOS 13+: bytes remaining before this app reaches its current dirty-memory limit.
+	// Unlike total physical RAM, this value tracks the limit that actually matters for
+	// jetsam and changes with process state. Do not cache it.
+	return static_cast<u64>(::os_proc_available_memory());
 #endif
 
 	return 0;

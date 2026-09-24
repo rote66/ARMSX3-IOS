@@ -1,0 +1,79 @@
+diff --git a/llvm/lib/Support/MemAlloc.cpp b/llvm/lib/Support/MemAlloc.cpp
+index 6adc9abd75..98fbdde9ba 100644
+--- a/llvm/lib/Support/MemAlloc.cpp
++++ b/llvm/lib/Support/MemAlloc.cpp
+@@ -7,12 +7,52 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #include "llvm/Support/MemAlloc.h"
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#endif
++#include <cerrno>
++#include <cstdio>
++#include <cstdlib>
+ #include <new>
+ 
+ // These are out of line to have __cpp_aligned_new not affect ABI.
+ 
+ LLVM_ATTRIBUTE_RETURNS_NONNULL LLVM_ATTRIBUTE_RETURNS_NOALIAS void *
+ llvm::allocate_buffer(size_t Size, size_t Alignment) {
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++  // libc++'s aligned nothrow operator-new path is not reliable for the
++  // cross-compiled static LLVM runtime used by ARMSX3 on iOS. MCJIT can hit
++  // this while merely creating an ExecutionEngine, long before meaningful
++  // memory pressure exists. Use the C allocation primitive directly on iOS.
++  //
++  // posix_memalign requires at least pointer alignment even when the caller
++  // requests a smaller, otherwise-valid C++ alignment. LLVM only supplies
++  // power-of-two alignments, so normalizing the lower bound is sufficient.
++  if (Size == 0)
++    Size = 1;
++
++  const size_t EffectiveAlignment =
++      Alignment < alignof(void *) ? alignof(void *) : Alignment;
++  void *Result = nullptr;
++  int Error = EINVAL;
++
++  if ((EffectiveAlignment & (EffectiveAlignment - 1)) == 0)
++    Error = ::posix_memalign(&Result, EffectiveAlignment, Size);
++
++  if (Error != 0 || Result == nullptr) {
++    // Keep this allocation-free: report_bad_alloc_error invokes an installed
++    // low-memory handler and allocating while formatting the diagnosis would
++    // recurse back into this function.
++    char Message[192];
++    std::snprintf(Message, sizeof(Message),
++                  "Buffer allocation failed (size=%zu, alignment=%zu, "
++                  "effective_alignment=%zu, posix_memalign=%d)",
++                  Size, Alignment, EffectiveAlignment, Error);
++    report_bad_alloc_error(Message);
++  }
++
++  return Result;
++#else
+   void *Result = ::operator new(Size,
+ #ifdef __cpp_aligned_new
+                                 std::align_val_t(Alignment),
+@@ -22,9 +62,15 @@ llvm::allocate_buffer(size_t Size, size_t Alignment) {
+     report_bad_alloc_error("Buffer allocation failed");
+   }
+   return Result;
++#endif
+ }
+ 
+ void llvm::deallocate_buffer(void *Ptr, size_t Size, size_t Alignment) {
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++  (void)Size;
++  (void)Alignment;
++  std::free(Ptr);
++#else
+   ::operator delete(Ptr
+ #ifdef __cpp_sized_deallocation
+                     ,
+@@ -35,4 +81,5 @@ void llvm::deallocate_buffer(void *Ptr, size_t Size, size_t Alignment) {
+                     std::align_val_t(Alignment)
+ #endif
+   );
++#endif
+ }

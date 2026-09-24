@@ -2030,6 +2030,21 @@ enum : s64
 
 spu_thread::~spu_thread()
 {
+#ifdef ARMSX3_IOS
+	// iOS 15 turns a vm_deallocate/munmap whose range contains an already-unmapped
+	// hole into EXC_GUARD (GUARD_TYPE_VIRT_MEMORY / DEALLOC_GAP) and kills the app.
+	//
+	// The seven-LS reservation is contiguous here: five middle slots are file-backed
+	// mirrors and the two outer slots are anonymous guards. Upstream first unmaps the
+	// five mirrors one by one and then releases the whole reservation. That is tolerated
+	// on Linux, but the second call necessarily spans the five holes just created and is
+	// exactly the Build 22 crash reported by iOS CrashReporter in __munmap().
+	//
+	// Release the still-contiguous reservation in one operation instead. munmap() may
+	// cover adjacent VM entries with different backing objects; it only becomes a guard
+	// violation when the requested range contains an unmapped gap.
+	utils::memory_release(ls - SIGNED_LS_SIZE * 3, SIGNED_LS_SIZE * 7);
+#else
 	// Unmap LS and its mirrors
 	for (s64 ls_offs = 0 - SIGNED_LS_SIZE * 2; ls_offs <= SIGNED_LS_SIZE * 2; ls_offs += SIGNED_LS_SIZE)
 	{
@@ -2037,6 +2052,7 @@ spu_thread::~spu_thread()
 	}
 
 	utils::memory_release(ls - SIGNED_LS_SIZE * 3, SIGNED_LS_SIZE * 7);
+#endif
 }
 
 u8* spu_thread::map_ls(utils::shm& shm, void* ptr)

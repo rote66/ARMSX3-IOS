@@ -281,7 +281,31 @@ namespace vk
 			{
 				VkGraphicsPipelineCreateInfo create_info = *p_graphics_info;
 				create_info.layout = m_pipeline_layout;
-				CHECK_RESULT(vkCreateGraphicsPipelines(m_device, cache, 1, &create_info, nullptr, &m_pipeline));
+				const VkResult result = vkCreateGraphicsPipelines(m_device, cache, 1, &create_info, nullptr, &m_pipeline);
+				if (result != VK_SUCCESS)
+				{
+					const auto* ia = create_info.pInputAssemblyState;
+					const auto* rs = create_info.pRasterizationState;
+					const auto* ds = create_info.pDepthStencilState;
+					const auto* ms = create_info.pMultisampleState;
+					const auto* cb = create_info.pColorBlendState;
+					const auto* dyn = create_info.pDynamicState;
+
+					rsx_log.error(
+						"Vulkan graphics pipeline failed result=%d stages=%u subpass=%u topology=%d restart=%u "
+						"polygon=%d cull=0x%x front=%d line=%.3f discard=%u depth_test=%u depth_write=%u "
+						"depth_compare=%d depth_bounds=%u samples=0x%x sample_shading=%u logic_op=%u attachments=%u dynamics=%u",
+						static_cast<s32>(result), create_info.stageCount, create_info.subpass,
+						ia ? static_cast<s32>(ia->topology) : -1, ia ? ia->primitiveRestartEnable : 0,
+						rs ? static_cast<s32>(rs->polygonMode) : -1, rs ? static_cast<u32>(rs->cullMode) : 0,
+						rs ? static_cast<s32>(rs->frontFace) : -1, rs ? rs->lineWidth : 0.f,
+						rs ? rs->rasterizerDiscardEnable : 0, ds ? ds->depthTestEnable : 0,
+						ds ? ds->depthWriteEnable : 0, ds ? static_cast<s32>(ds->depthCompareOp) : -1,
+						ds ? ds->depthBoundsTestEnable : 0, ms ? static_cast<u32>(ms->rasterizationSamples) : 0,
+						ms ? ms->sampleShadingEnable : 0, cb ? cb->logicOpEnable : 0,
+						cb ? cb->attachmentCount : 0, dyn ? dyn->dynamicStateCount : 0);
+					vk::die_with_error(result);
+				}
 			}
 			else
 			{

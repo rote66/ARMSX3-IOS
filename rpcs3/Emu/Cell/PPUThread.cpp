@@ -4302,7 +4302,7 @@ struct jit_core_allocator
 	// Initialize global semaphore with the max number of threads
 	::semaphore<0x7fff> sem{std::max<s16>(thread_count, 1)};
 
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(ARMSX3_IOS)
 	// Held around a single module's compilation when memory is short, so that workers fall
 	// back to one at a time instead of all of them holding an LLVM context at once.
 	//
@@ -4374,7 +4374,7 @@ struct jit_core_allocator
 	{
 		const s32 by_cores = std::min<s32>(0x7fff, utils::get_thread_count());
 
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(ARMSX3_IOS)
 		// Bound the compile workers by RAM as well as by core count.
 		//
 		// Each LLVM PPU compile worker carries its own context, module and relocation
@@ -5372,8 +5372,13 @@ extern void ppu_initialize()
 
 	const std::string firmware_sprx_path = vfs::get("/dev_flash/sys/external/");
 
-	// If empty we have no indication for firmware cache state, check everything
-	bool compile_fw = !Emu.IsVsh();
+	// If empty we have no indication for firmware cache state, check everything.
+	// Respect LLVM Precompilation here as well: when it is disabled, firmware PRX
+	// modules must be compiled only when they are actually loaded. Previously a
+	// normal title still started with compile_fw=true, so ppu_precompile() scanned
+	// all of /dev_flash/sys/external even though LLVM Precompilation was false.
+	const bool allow_precompilation = static_cast<bool>(g_cfg.core.llvm_precompilation);
+	bool compile_fw = allow_precompilation && !Emu.IsVsh();
 
 	idm::select<lv2_obj, lv2_prx>([&](u32, lv2_prx& _module)
 	{
@@ -5397,7 +5402,7 @@ extern void ppu_initialize()
 	});
 
 	// Check preloaded libraries cache
-	if (!compile_fw)
+	if (allow_precompilation && !compile_fw)
 	{
 		for (auto ptr : module_list)
 		{
@@ -5419,7 +5424,7 @@ extern void ppu_initialize()
 
 	const std::string mount_point = vfs::get("/dev_flash/");
 
-	bool dev_flash_located = !Emu.GetCat().ends_with('P') && Emu.IsPathInsideDir(Emu.GetBoot(), mount_point) && g_cfg.core.llvm_precompilation;
+	bool dev_flash_located = !Emu.GetCat().ends_with('P') && Emu.IsPathInsideDir(Emu.GetBoot(), mount_point) && allow_precompilation;
 
 	if (compile_fw || dev_flash_located)
 	{
@@ -5439,7 +5444,7 @@ extern void ppu_initialize()
 	}
 
 	// Avoid compilation if main's cache exists or it is a standalone SELF with no PARAM.SFO
-	if (compile_main && g_cfg.core.llvm_precompilation && !Emu.GetTitleID().empty() && !Emu.IsChildProcess())
+	if (compile_main && allow_precompilation && !Emu.GetTitleID().empty() && !Emu.IsChildProcess())
 	{
 		// Try to add all related directories
 		const std::set<std::string> dirs = Emu.GetGameDirs();
@@ -5686,6 +5691,18 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 	// Info to load to main JIT instance (true - compiled)
 	std::vector<std::pair<std::string, bool>> link_workload;
 
+#ifdef ARMSX3_IOS
+	// The generated __resolve_symbols helper is not executed on iOS. Keep the small
+	// amount of partition metadata needed to install each compiled function into the
+	// PPU dispatch table from C++ after all object files have been linked.
+	struct ios_link_part_info
+	{
+		std::pair<u32, u32> local_bounds;
+		std::vector<u32> excluded_funcs;
+	};
+	std::vector<ios_link_part_info> ios_link_parts;
+#endif
+
 	bool compiled_new = false;
 
 	bool has_mfvscr = false;
@@ -5740,7 +5757,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 	// each additional split of JIT instance results in a downgraded version of around (100% / N-1th) - (100% / Nth) percent of instructions
 	// where N is the total amount of JIT instances
 	// Subject to change
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(ARMSX3_IOS)
 	// Lowered here, because the memory this trades away is the difference between booting
 	// a large title and being killed partway through compiling it.
 	//
@@ -5777,7 +5794,12 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 		if (!avail_mem)
 		{
 			// No reading to size against. Take the conservative group rather than assume.
+		#ifdef ARMSX3_IOS
+			ppu_log.warning("iOS PPU JIT resolver group: available memory unavailable; using 8 modules");
+			return 8;
+		#else
 			return 25;
+		#endif
 		}
 
 		// A quarter of what is free. The emulator still needs the rest for the PS3 address
@@ -5791,7 +5813,24 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 		const u64 budget = std::min<u64>(avail_mem / 4, c_full_group_cost);
 		const u64 by_memory = budget / c_resolver_bytes_per_func / c_funcs_per_module;
 
-		return static_cast<u32>(std::clamp<u64>(by_memory, 8, 100));
+		const u32 memory_group = static_cast<u32>(std::clamp<u64>(by_memory, 8, 100));
+
+	#ifdef ARMSX3_IOS
+		// iOS MCJIT can stall indefinitely while code-generating the symbol resolver for
+		// a group that is still technically within the process memory budget. On A15 the
+		// dynamic estimate selected roughly twenty EBOOT parts: the first nineteen parts
+		// compiled normally, then the resolver-carrying boundary part stopped inside
+		// generateCodeForModule(). Keep the resolver substantially smaller on iOS. Eight
+		// is already the conservative lower bound used by this memory model and reduces
+		// resolver complexity without changing the actual PPU LLVM backend.
+		constexpr u32 ios_resolver_group_cap = 8;
+		const u32 result = std::min(memory_group, ios_resolver_group_cap);
+		ppu_log.notice("iOS PPU JIT resolver group: %u modules (available memory: %u MiB, memory estimate: %u)",
+			result, static_cast<u32>(avail_mem / (1024 * 1024)), memory_group);
+		return result;
+	#else
+		return memory_group;
+	#endif
 	}();
 #else
 	constexpr u32 c_modules_per_jit = 100;
@@ -6014,8 +6053,11 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 #endif
 		}, runtime.get(), true);
 
-#ifdef __APPLE__
-		// Restore write-protection state (modified by build_function_asm)
+#if defined(__APPLE__) && !defined(ARMSX3_IOS)
+		// Desktop Apple keeps the surrounding compiler phase writable after the
+		// temporary build_function_asm guard. ARMSX3 iOS uses a process-wide Legacy
+		// W^X arena instead: forcing false here leaves every newly generated PPU
+		// trampoline RW and the first per-instruction thunk SIGBUSes on execution.
 		pthread_jit_write_protect_np(false);
 #endif
 
@@ -6353,6 +6395,9 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 		if (!check_only)
 		{
 			link_workload.emplace_back(obj_name, false);
+#ifdef ARMSX3_IOS
+			ios_link_parts.push_back({part.local_bounds, part.excluded_funcs});
+#endif
 		}
 
 		// Check object file
@@ -6362,6 +6407,9 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 			{
 				ppu_log.success("LLVM: Module exists: %s", obj_name);
 				link_workload.pop_back();
+#ifdef ARMSX3_IOS
+				ios_link_parts.pop_back();
+#endif
 			}
 
 			continue;
@@ -6404,7 +6452,28 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 
 		*progress_dialog = get_localized_string(localized_string_id::PROGRESS_DIALOG_COMPILING_PPU_MODULES);
 
-		const u32 thread_count = std::max<u32>(std::min<u32>(::size32(workload), rpcs3::utils::get_max_threads()), 1) - 1;
+		u32 compile_slots = std::max<u32>(std::min<u32>(::size32(workload), rpcs3::utils::get_max_threads()), 1);
+
+#ifdef ARMSX3_IOS
+		// jit_core_allocator already computed the iOS memory-safe LLVM concurrency and
+		// initialized its semaphore with that limit. Do not nevertheless create a larger
+		// named_thread_group and block its constructor on the semaphore one thread at a time.
+		//
+		// With a one-worker limit, small SPRX modules happened to use only the recycled
+		// current thread and compiled correctly. libmp4 is the first VSH module large enough
+		// to request four slots; the group constructor then tried to acquire the one-slot
+		// semaphore while creating helper threads and boot stopped before the first
+		// "LLVM: Compiling module" line. Size the group to the real limit instead.
+		compile_slots = std::min<u32>(compile_slots,
+			static_cast<u32>(std::max<s16>(g_fxo->get<jit_core_allocator>().thread_count, 1)));
+#endif
+
+		const u32 thread_count = compile_slots - 1;
+
+#ifdef ARMSX3_IOS
+		ppu_log.notice("iOS LLVM compile concurrency limit: %d (active compile slots: %u, workload modules: %u)",
+			g_fxo->get<jit_core_allocator>().thread_count, compile_slots, ::size32(workload));
+#endif
 
 		struct thread_index_allocator
 		{
@@ -6458,7 +6527,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 				// Set low priority
 				thread_ctrl::scoped_priority low_prio(-1);
 
-#ifdef __APPLE__
+#if defined(__APPLE__) && !defined(ARMSX3_IOS)
 				pthread_jit_write_protect_np(false);
 #endif
 				for (usz i = (*work_cv)++; i < workload.size(); i = (*work_cv)++, (*work_done)++, g_progr_pdone++)
@@ -6476,7 +6545,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 					bool compiled_this_module = false;
 
 					{
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(ARMSX3_IOS)
 						// Compile alone while memory is short. Checked per module rather
 						// than once at startup, because that is exactly the reading that
 						// goes stale: workers are sized before the game has loaded.
@@ -6826,7 +6895,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 	}
 
 	// Jit can be null if the loop doesn't ever enter.
-#ifdef __APPLE__
+#if defined(__APPLE__) && !defined(ARMSX3_IOS)
 	pthread_jit_write_protect_np(false);
 #endif
 	// Try to patch all single and unregistered BLRs with the same function (TODO: Maybe generalize it into PIC code detection and patching)
@@ -6847,16 +6916,94 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 
 	if (is_first)
 	{
+		usz jit_index = 0;
 		for (auto& jit : jits)
 		{
+		#ifdef ARMSX3_IOS
+			ppu_log.notice("iOS PPU apply: finalizing JIT group %u/%u begin",
+				static_cast<u32>(jit_index + 1), static_cast<u32>(jits.size()));
+		#endif
 			jit->fin();
+		#ifdef ARMSX3_IOS
+			ppu_log.notice("iOS PPU apply: finalizing JIT group %u/%u end",
+				static_cast<u32>(jit_index + 1), static_cast<u32>(jits.size()));
+		#endif
+			jit_index++;
 		}
 	}
 
+#ifdef ARMSX3_IOS
+	if (is_first)
+	{
+		// LLVM's generated __resolve_symbols function faults with SIGBUS on iOS as
+		// soon as the first resolver is executed. The helper only copies already-linked
+		// host function addresses into RPCS3's PPU dispatch table and writes the segment
+		// tag, so perform those two stores directly. This keeps the LLVM-compiled object
+		// files and their cache fully usable; only the tiny generated installer is bypassed.
+		ensure(ios_link_parts.size() == link_workload.size());
+		ppu_log.notice("iOS PPU apply: manual symbol install begin (%u modules, %u JIT groups)",
+			::size32(ios_link_parts), ::size32(jits));
+
+		u32 mapped = 0;
+		u32 missing = 0;
+		constexpr auto compare = [](const ppu_function& a, u32 addr) { return a.addr < addr; };
+
+		for (usz mod_index = 0; mod_index < ios_link_parts.size(); mod_index++)
+		{
+			if (cpu ? cpu->state.all_of(cpu_flag::exit) : Emu.IsStopped())
+			{
+				break;
+			}
+
+			const usz jit_index = mod_index / c_modules_per_jit;
+			if (jit_index >= jits.size())
+			{
+				ppu_log.error("iOS PPU apply: missing JIT group %u for module %u",
+					static_cast<u32>(jit_index), static_cast<u32>(mod_index));
+				break;
+			}
+
+			const auto& part = ios_link_parts[mod_index];
+			const auto start = std::lower_bound(info.funcs.begin(), info.funcs.end(), part.local_bounds.first, compare);
+			const auto end = std::lower_bound(start, info.funcs.end(), part.local_bounds.second, compare);
+
+			for (auto it = start; it != end; ++it)
+			{
+				const ppu_function& func = *it;
+				if (!func.size || std::count(part.excluded_funcs.begin(), part.excluded_funcs.end(), func.addr))
+				{
+					continue;
+				}
+
+				const u64 host = jits[jit_index]->get(fmt::format("__0x%x", func.addr - reloc));
+				if (!host)
+				{
+					missing++;
+					continue;
+				}
+
+				write_to_ptr_unsafe<uptr>(ppu_ptr(func.addr), static_cast<uptr>(host));
+				write_to_ptr_unsafe<u16>(ppu_seg_ptr(func.addr), static_cast<u16>(info.segs[0].addr >> 13));
+				mapped++;
+			}
+		}
+
+		ppu_log.notice("iOS PPU apply: manual symbol install end (mapped=%u missing=%u)", mapped, missing);
+
+		// symbols_cement may have generated per-instruction/far-jump asmjit thunks
+		// while the LLVM objects were linked. Synchronize the shared arena once more
+		// before PPU execution so every thunk allocated during this apply pass is RX.
+		if (!jit_runtime::prepare_execution())
+		{
+			fmt::throw_exception("iOS PPU apply: shared JIT arena could not be made executable");
+		}
+		ppu_log.notice("iOS PPU apply: shared JIT arena RX synchronized");
+	}
+#else
 	{
 		usz index = umax;
 
-#ifdef __APPLE__
+#if defined(__APPLE__)
 		named_thread sym_worker("PPU Symbol Resolver", [&]()
 		{
 			// jit_compiler::get() may write to executable memory (relocations)
@@ -6897,7 +7044,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 
 			ppu_log.notice("Executing %u symbol resolvers", jit_mod.symbol_resolvers.size());
 
-#ifdef __APPLE__
+#if defined(__APPLE__)
 			// Virtual memory mapped by MAP_JIT cannot be executed until pthread_jit_write_protect_np(true)
 			pthread_jit_write_protect_np(true);
 #endif
@@ -6929,6 +7076,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 		sym_worker();
 #endif
 	}
+#endif
 
 	// Find a BLR-only function in order to copy it to all BLRs (some games need it)
 	for (const auto& func : info.get_funcs())

@@ -68,19 +68,30 @@ namespace vk
 
 	void instance::enable_debugging()
 	{
+#ifndef ARMSX3_IOS
 		if (!g_cfg.video.debug_output) return;
+#endif
 
 		PFN_vkDebugReportCallbackEXT callback = vk::dbgFunc;
 
 		_vkCreateDebugReportCallback = reinterpret_cast<PFN_vkCreateDebugReportCallbackEXT>(vkGetInstanceProcAddr(m_instance, "vkCreateDebugReportCallbackEXT"));
 		_vkDestroyDebugReportCallback = reinterpret_cast<PFN_vkDestroyDebugReportCallbackEXT>(vkGetInstanceProcAddr(m_instance, "vkDestroyDebugReportCallbackEXT"));
+		if (!_vkCreateDebugReportCallback || !_vkDestroyDebugReportCallback)
+		{
+			rsx_log.warning("Vulkan debug report callbacks are unavailable; driver diagnostics will be limited");
+			return;
+		}
 
 		VkDebugReportCallbackCreateInfoEXT dbgCreateInfo = {};
 		dbgCreateInfo.sType = VK_STRUCTURE_TYPE_DEBUG_REPORT_CREATE_INFO_EXT;
 		dbgCreateInfo.pfnCallback = callback;
 		dbgCreateInfo.flags = VK_DEBUG_REPORT_ERROR_BIT_EXT | VK_DEBUG_REPORT_WARNING_BIT_EXT;
 
-		CHECK_RESULT(_vkCreateDebugReportCallback(m_instance, &dbgCreateInfo, NULL, &m_debugger));
+		CHECK_RESULT(_vkCreateDebugReportCallback(m_instance, &dbgCreateInfo, nullptr, &m_debugger));
+
+#ifdef ARMSX3_IOS
+		rsx_log.notice("Vulkan: iOS driver error callback enabled for MoltenVK diagnostics");
+#endif
 	}
 
 #ifdef __clang__
@@ -150,6 +161,7 @@ namespace vk
 		// Declare MVK variables here to ensure the lifetime within the entire scope
 		const VkBool32 setting_true = VK_TRUE;
 		const int32_t setting_fast_math = g_cfg.video.disable_msl_fast_math.get() ? MVK_CONFIG_FAST_MATH_NEVER : MVK_CONFIG_FAST_MATH_ON_DEMAND;
+		bool portability_enumeration_enabled = false;
 
 		std::vector<VkLayerSettingEXT> mvk_settings;
 		VkLayerSettingsCreateInfoEXT mvk_layer_settings_create_info{};
@@ -167,8 +179,24 @@ namespace vk
 			}
 
 #ifdef __APPLE__
-			extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
-			extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+			// Recent MoltenVK revisions no longer advertise
+			// VK_KHR_portability_enumeration. Requesting it unconditionally makes
+			// vkCreateInstance fail with VK_ERROR_EXTENSION_NOT_PRESENT on iOS,
+			// which RPCS3 previously surfaced as a generic "no Vulkan GPU" error.
+			if (support.is_supported(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME))
+			{
+				extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+				portability_enumeration_enabled = true;
+			}
+			else
+			{
+				rsx_log.notice("Vulkan: VK_KHR_portability_enumeration is not advertised by MoltenVK; continuing without it");
+			}
+
+			if (support.is_supported(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME))
+			{
+				extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+			}
 			if (support.is_supported(VK_EXT_LAYER_SETTINGS_EXTENSION_NAME))
 			{
 				extensions.push_back(VK_EXT_LAYER_SETTINGS_EXTENSION_NAME);
@@ -198,7 +226,15 @@ namespace vk
 #ifdef _WIN32
 			extensions.push_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
 #elif defined(__APPLE__)
-			extensions.push_back(VK_EXT_METAL_SURFACE_EXTENSION_NAME);
+			if (support.is_supported(VK_EXT_METAL_SURFACE_EXTENSION_NAME))
+			{
+				extensions.push_back(VK_EXT_METAL_SURFACE_EXTENSION_NAME);
+			}
+			else
+			{
+				rsx_log.fatal("Vulkan: MoltenVK does not advertise VK_EXT_metal_surface");
+				return false;
+			}
 #else
 			bool found_surface_ext = false;
 #ifdef HAVE_X11
@@ -278,8 +314,16 @@ namespace vk
 		else
 		{
 			extensions_loaded = true;
-			extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
-			extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+			supported_extensions support(supported_extensions::instance);
+			if (support.is_supported(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME))
+			{
+				extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+				portability_enumeration_enabled = true;
+			}
+			if (support.is_supported(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME))
+			{
+				extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+			}
 		}
 #endif
 
@@ -297,11 +341,15 @@ namespace vk
 #endif
 		instance_info.pNext = next_info;
 #ifdef __APPLE__
-		instance_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+		if (portability_enumeration_enabled)
+		{
+			instance_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+		}
 #endif
 
 		if (VkResult result = vkCreateInstance(&instance_info, nullptr, &m_instance); result != VK_SUCCESS)
 		{
+			rsx_log.fatal("Vulkan: vkCreateInstance failed with VkResult %d", static_cast<s32>(result));
 			if (result == VK_ERROR_LAYER_NOT_PRESENT)
 			{
 				rsx_log.fatal("Could not initialize layer VK_LAYER_KHRONOS_validation");

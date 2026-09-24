@@ -2336,6 +2336,41 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 				}
 			}
 
+#ifdef ARMSX3_IOS
+			// Eager PPU/SPU precompilation is a poor fit for iOS. It scans and compiles a
+			// large part of dev_flash before the title can present a frame, and each temporary
+			// MCJIT instance carries a large executable arena. On the 4 GB test device this
+			// produced a long black screen and eventually repeated WX commit failures while
+			// compiling firmware PRX modules that the game had not even requested yet.
+			// Keep the LLVM decoders for normal titles, but compile modules on demand instead.
+			g_cfg.core.llvm_precompilation.set(false);
+
+			// VSH is unusually large: on the iPhone 14,6 test device its main image is
+			// split into 64 PPU LLVM objects. Even with firmware-directory precompilation
+			// disabled, a one-worker mobile JIT spends minutes compiling the main image
+			// before the first XMB frame can run. That looks exactly like a boot hang.
+			//
+			// Use RPCS3's proper static interpreters for the firmware session. The dynamic
+			// SPU interpreter is not actually JIT-free: spu_cache::initialize() builds its
+			// interpreter body with the ARM64 LLVM backend. On iOS that generated body was
+			// observed taking host instruction-fetch SIGBUS faults in _mio_SPU and the QGL
+			// line SPURS kernel. Static SPU avoids that LLVM-built interpreter while keeping
+			// the regular interpreter path. The iOS frontend saves/restores both user decoder
+			// settings around firmware boot, so normal games still use their configured modes.
+			// Apply this only after all config sources have loaded, otherwise BootGame would
+			// overwrite the temporary values again.
+			if (m_path.ends_with("vsh.self"sv))
+			{
+				g_cfg.core.ppu_decoder.set(ppu_decoder_type::_static);
+				g_cfg.core.spu_decoder.set(spu_decoder_type::_static);
+				sys_log.notice("iOS firmware boot: static PPU + static SPU interpreters enabled and LLVM precompilation disabled after config load");
+			}
+			else
+			{
+				sys_log.notice("iOS title boot: LLVM precompilation disabled; modules will compile on demand");
+			}
+#endif
+
 			// Disable incompatible settings
 			fixup_settings(&_psf);
 

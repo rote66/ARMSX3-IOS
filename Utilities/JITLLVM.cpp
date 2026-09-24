@@ -14,6 +14,7 @@
 
 #if defined(__APPLE__)
 #include <pthread.h>
+#include <TargetConditionals.h>
 #elif defined(ANDROID)
 #include "util/cctype.hpp"
 #endif
@@ -66,24 +67,43 @@ namespace
 	{
 		error.clear();
 
+#ifdef ARMSX3_IOS
+		jit_log.notice("iOS LLVM recoverable helper: create");
+#endif
+
 		// Run LLVM codegen in a disposable thread. If LLVM invokes the fatal
 		// handler, only this helper thread exits.
 		named_thread worker("LLVM JIT", [&]()
 		{
-#if defined(__APPLE__)
+#ifdef ARMSX3_IOS
+			jit_log.notice("iOS LLVM recoverable helper: entered");
+#endif
+#if defined(__APPLE__) && !TARGET_OS_IPHONE
 			pthread_jit_write_protect_np(false);
 #endif
 			g_llvm_fatal_message = &error;
 
+#ifdef ARMSX3_IOS
+			jit_log.notice("iOS LLVM recoverable helper: codegen begin");
+#endif
 			std::forward<F>(func)();
+#ifdef ARMSX3_IOS
+			jit_log.notice("iOS LLVM recoverable helper: codegen returned");
+#endif
 
 			g_llvm_fatal_message = nullptr;
-#if defined(__APPLE__)
+#if defined(__APPLE__) && !TARGET_OS_IPHONE
 			pthread_jit_write_protect_np(true);
 #endif
 		});
 
+#ifdef ARMSX3_IOS
+		jit_log.notice("iOS LLVM recoverable helper: joining");
+#endif
 		worker();
+#ifdef ARMSX3_IOS
+		jit_log.notice("iOS LLVM recoverable helper: joined");
+#endif
 		const bool result = static_cast<thread_state>(worker) == thread_state::finished;
 
 		if (!result && error.empty())
@@ -268,9 +288,10 @@ struct MemoryManager1 : llvm::RTDyldMemoryManager
 		}
 
 #if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
-		// Keep the unified TrollStore/Dopamine build independent of MAP_JIT.
-		// Code pages are promoted to RWX on demand by allocate() using the
-		// allow-unsigned-executable-memory entitlement.
+		// Keep the unified TrollStore/Dopamine build independent of MAP_JIT and of
+		// the legacy allow-jit/allow-unsigned-executable-memory entitlements. The
+		// mapping starts writable for RuntimeDyld; finalizeMemory() converts the
+		// used code prefix to RX before it is published for execution (Legacy W^X).
 		auto ptr = reinterpret_cast<u8*>(utils::memory_reserve(c_max_size * 3, false));
 #else
 		auto ptr = reinterpret_cast<u8*>(utils::memory_reserve(c_max_size * 3, true));
@@ -309,7 +330,14 @@ struct MemoryManager1 : llvm::RTDyldMemoryManager
 		// utils::memory_decommit(m_data_ro_mems, how_much(data_ro_ptr));
 		// utils::memory_decommit(m_data_rw_mems, how_much(data_rw_ptr));
 #if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
-		utils::memory_decommit(m_code_mems, c_max_size * 3, false);
+		// On Darwin memory_decommit() intentionally unmaps and immediately re-reserves
+		// the same address with PROT_NONE. That is useful for desktop JIT symbol/address
+		// stability, but it permanently consumes 768 MiB of virtual address space for
+		// every temporary MCJIT instance. iOS PPU precompilation creates many short-lived
+		// instances; after a few dozen, later RWX mprotect() calls fail with ENOMEM even
+		// while process RSS is still modest. Mobile does not need the stale JIT address
+		// reservation once the engine is gone, so release it for real.
+		utils::memory_release(m_code_mems, c_max_size * 3);
 #else
 		utils::memory_decommit(m_code_mems, c_max_size * 3, true);
 #endif
@@ -413,7 +441,15 @@ struct MemoryManager1 : llvm::RTDyldMemoryManager
 
 	u8* allocateCodeSection(uptr size, uint align, uint /*sec_id*/, llvm::StringRef /*sec_name*/) override
 	{
+#ifdef ARMSX3_IOS
+		jit_log.notice("iOS LLVM MM1: code alloc begin size=0x%x align=0x%x", size, align);
+		u8* const p = allocate(code_ptr, m_code_mems, size, align, utils::protection::rw);
+#else
 		u8* const p = allocate(code_ptr, m_code_mems, size, align, utils::protection::wx);
+#endif
+#ifdef ARMSX3_IOS
+		jit_log.notice("iOS LLVM MM1: code alloc end ptr=0x%x code_ptr=0x%x", reinterpret_cast<uptr>(p), code_ptr);
+#endif
 
 #if defined(ARCH_ARM64)
 		// Track for instruction-cache maintenance in finalizeMemory()
@@ -428,17 +464,31 @@ struct MemoryManager1 : llvm::RTDyldMemoryManager
 
 	u8* allocateDataSection(uptr size, uint align, uint /*sec_id*/, llvm::StringRef /*sec_name*/, bool is_ro) override
 	{
+#ifdef ARMSX3_IOS
+		jit_log.notice("iOS LLVM MM1: data alloc begin size=0x%x align=0x%x ro=%d", size, align, is_ro);
+#endif
 		if (is_ro)
 		{
 			// Disabled
 			//return allocate(data_ro_ptr, m_data_ro_mems, size, align, utils::protection::rw);
 		}
 
-		return allocate(data_rw_ptr, m_data_rw_mems, size, align, utils::protection::rw);
+		u8* const p = allocate(data_rw_ptr, m_data_rw_mems, size, align, utils::protection::rw);
+#ifdef ARMSX3_IOS
+		jit_log.notice("iOS LLVM MM1: data alloc end ptr=0x%x data_ptr=0x%x", reinterpret_cast<uptr>(p), data_rw_ptr);
+#endif
+		return p;
 	}
 
 	bool finalizeMemory(std::string* = nullptr) override
 	{
+#ifdef ARMSX3_IOS
+		const bool has_new_code = !m_code_ranges.empty();
+		if (has_new_code)
+		{
+			jit_log.notice("iOS LLVM MM1: finalizeMemory begin ranges=%zu code=0x%x", m_code_ranges.size(), code_ptr);
+		}
+#endif
 #if defined(ARCH_ARM64)
 		// See MemoryManager2::finalizeMemory(): RuntimeDyld relies on this callback
 		// for instruction-cache maintenance of freshly written code sections.
@@ -448,6 +498,24 @@ struct MemoryManager1 : llvm::RTDyldMemoryManager
 		}
 
 		m_code_ranges.clear();
+#endif
+#ifdef ARMSX3_IOS
+		if (has_new_code)
+		{
+			// A normal anonymous RW mapping promoted straight to RWX is accepted by
+			// mprotect() on the tested TrollStore/Dopamine path but instruction fetches
+			// from it still SIGBUS. This is the same restriction ARMSX2's Legacy JIT
+			// handles with strict W^X. RuntimeDyld has finished all writes/relocations for
+			// this JIT group here, so make exactly the used code prefix RX now.
+			const usz executable_size = utils::align<usz>(code_ptr, utils::get_page_size());
+			if (!utils::try_memory_commit(m_code_mems, executable_size, utils::protection::rx))
+			{
+				fmt::throw_exception("Failed to make iOS LLVM code executable (size=0x%x)", executable_size);
+			}
+
+			jit_log.notice("iOS LLVM MM1: finalizeMemory RX ready base=0x%x size=0x%x",
+				reinterpret_cast<uptr>(m_code_mems), executable_size);
+		}
 #endif
 		return false;
 	}
@@ -528,13 +596,19 @@ struct MemoryManager2 : llvm::RTDyldMemoryManager
 	{
 #if defined(ARCH_ARM64)
 		// RuntimeDyld calls finalizeMemory() after writing code and relies on it for
-		// instruction-cache maintenance. This was a no-op: freshly emitted code was
-		// never flushed, so other cores could execute stale icache contents for it.
-		// x86 has a coherent instruction cache and never noticed. The asmjit helper
-		// performs the required DC CVAU / IC IVAU broadcast sequence.
+		// instruction-cache maintenance. On iOS Legacy JIT these allocations also
+		// live in the shared arena, but they are page-isolated after execution starts.
+		// Seal only the newly emitted pages RX here; never toggle the existing arena
+		// because PPU threads may be executing older trampolines concurrently while
+		// SPU RuntimeDyld is compiling a new block.
 		for (const auto& [p, size] : m_code_ranges)
 		{
 			asmjit::VirtMem::flushInstructionCache(p, size);
+			if (!jit_runtime::finalize_code(p, size))
+			{
+				fmt::throw_exception("Failed to finalize shared JIT code range (ptr=0x%x, size=0x%x)",
+					reinterpret_cast<uptr>(p), size);
+			}
 		}
 
 		m_code_ranges.clear();
@@ -568,6 +642,9 @@ public:
 
 	void notifyObjectCompiled(const llvm::Module* _module, llvm::MemoryBufferRef obj) override
 	{
+#ifdef ARMSX3_IOS
+		jit_log.notice("iOS LLVM ObjectCache: notify begin module=%s size=0x%x", _module->getName().data(), obj.getBufferSize());
+#endif
 		std::string name = m_path;
 
 		name.append(_module->getName());
@@ -589,6 +666,9 @@ public:
 			jit_log.error("LLVM: Failed to create module file: %s (%s)", name, fs::g_tls_error);
 			return;
 		}
+#ifdef ARMSX3_IOS
+		jit_log.notice("iOS LLVM ObjectCache: file opened %s", name);
+#endif
 
 		// Bold assumption about upper limit of space consumption
 		const usz max_size = obj.getBufferSize() * 4;
@@ -599,17 +679,26 @@ public:
 			return;
 		}
 
+#ifdef ARMSX3_IOS
+		jit_log.notice("iOS LLVM ObjectCache: zip begin size=0x%x", obj.getBufferSize());
+#endif
 		if (!zip(obj.getBufferStart(), obj.getBufferSize(), module_file.file))
 		{
 			jit_log.error("LLVM: Failed to compress module: %s", std::string(_module->getName()));
 			return;
 		}
+#ifdef ARMSX3_IOS
+		jit_log.notice("iOS LLVM ObjectCache: zip end compressed=0x%x", module_file.file.size());
+#endif
 
 		jit_log.trace("LLVM: Created module: %s", std::string(_module->getName()));
 
 		// Restore space that was overestimated
 		ensure(m_compiler->add_sub_disk_space(max_size - module_file.file.size()));
 		module_file.commit();
+#ifdef ARMSX3_IOS
+		jit_log.notice("iOS LLVM ObjectCache: commit end module=%s", _module->getName().data());
+#endif
 	}
 
 	static std::unique_ptr<llvm::MemoryBuffer> load(const std::string& path)
@@ -1034,11 +1123,20 @@ void jit_compiler::add(std::unique_ptr<llvm::Module> _module, const std::string&
 
 bool jit_compiler::try_add(std::unique_ptr<llvm::Module> _module, const std::string& path, std::string& error)
 {
+#ifdef ARMSX3_IOS
+	jit_log.notice("iOS LLVM try_add: begin module=%s", _module->getName().data());
+#endif
 	ObjectCache cache{path, this};
 	m_engine->setObjectCache(&cache);
+#ifdef ARMSX3_IOS
+	jit_log.notice("iOS LLVM try_add: object cache installed");
+#endif
 
 	const auto ptr = _module.get();
 	m_engine->addModule(std::move(_module));
+#ifdef ARMSX3_IOS
+	jit_log.notice("iOS LLVM try_add: module added");
+#endif
 
 	if (!run_recoverable_llvm([&]()
 	{
@@ -1049,13 +1147,22 @@ bool jit_compiler::try_add(std::unique_ptr<llvm::Module> _module, const std::str
 		return false;
 	}
 
+#ifdef ARMSX3_IOS
+	jit_log.notice("iOS LLVM try_add: codegen complete");
+#endif
 	m_engine->setObjectCache(nullptr);
+#ifdef ARMSX3_IOS
+	jit_log.notice("iOS LLVM try_add: object cache detached");
+#endif
 
 	for (auto& func : ptr->functions())
 	{
 		// Delete IR to lower memory consumption
 		func.deleteBody();
 	}
+#ifdef ARMSX3_IOS
+	jit_log.notice("iOS LLVM try_add: done");
+#endif
 
 	return true;
 }

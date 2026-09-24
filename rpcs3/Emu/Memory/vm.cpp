@@ -89,6 +89,14 @@ namespace vm
 	// Memory locations
 	alignas(64) std::vector<std::shared_ptr<block_t>> g_locations;
 
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+	// vm::close() eventually resets the complete PPU dispatch/stat apertures. Do
+	// not redundantly decommit every executable subrange first on iOS; those
+	// repeated mprotect+madvise calls are expensive enough to push shutdown past
+	// the frontend timeout on large titles.
+	atomic_t<bool> g_ios_vm_closing{false};
+#endif
+
 	// Memory mutex acknowledgement
 	thread_local atomic_t<cpu_thread*>* g_tls_locked = nullptr;
 
@@ -1182,12 +1190,24 @@ namespace vm
 
 		if (is_exec && !is_noop)
 		{
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+			if (!g_ios_vm_closing.load())
+			{
+				utils::memory_decommit(g_exec_addr + addr * 2, size * 2);
+
+				if (g_cfg.core.ppu_debug)
+				{
+					utils::memory_decommit(g_stat_addr + addr, size);
+				}
+			}
+#else
 			utils::memory_decommit(g_exec_addr + addr * 2, size * 2);
 
 			if (g_cfg.core.ppu_debug)
 			{
 				utils::memory_decommit(g_stat_addr + addr, size);
 			}
+#endif
 		}
 
 		range_lock->release(0);
@@ -2485,23 +2505,88 @@ namespace vm
 
 	void close()
 	{
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+		g_ios_vm_closing.store(true);
+		armsx3_ios_diagnostic_log("vm close: begin");
+		vm_log.notice("iOS vm close: begin");
+
+		// close() is reached only after all CPU threads have stopped and g_fxo has
+		// been reset. No live emulation code can own a range lock at this point. A
+		// thread terminated by an iOS JIT fault can nevertheless strand one of the
+		// bookkeeping bits because the signal/fatal exit does not necessarily unwind
+		// the guest operation that acquired it. The exclusive writer_lock below then
+		// waits forever for an owner which no longer exists. Discard only these stale
+		// shutdown-time registrations before taking the final VM lock.
+		const u64 stale_ranges = get_range_lock_bits(false).load();
+		const u64 stale_exclusive = get_range_lock_bits(true).load();
+		if (stale_ranges || stale_exclusive)
+		{
+			armsx3_ios_diagnostic_log(fmt::format("vm close: clearing stale range locks normal=0x%016x exclusive=0x%016x",
+				stale_ranges, stale_exclusive).c_str());
+			vm_log.notice("iOS vm close: clearing stale range locks normal=0x%016x exclusive=0x%016x",
+				stale_ranges, stale_exclusive);
+		}
+		get_range_lock_bits(false).release(0);
+		get_range_lock_bits(true).release(0);
+		std::memset(g_range_lock_set, 0, sizeof(g_range_lock_set));
+		armsx3_ios_diagnostic_log("vm close: writer lock begin");
+		vm_log.notice("iOS vm close: writer lock begin");
+#endif
 		{
 			vm::writer_lock lock;
+
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+			armsx3_ios_diagnostic_log(fmt::format("vm close: writer lock acquired blocks=%u",
+				static_cast<u32>(g_locations.size())).c_str());
+			vm_log.notice("iOS vm close: writer lock acquired blocks=%u", static_cast<u32>(g_locations.size()));
+			u32 block_index = 0;
+#endif
 
 			for (auto& block : g_locations)
 			{
 				if (block)
 				{
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+					armsx3_ios_diagnostic_log(fmt::format("vm close: unmap block %u begin addr=0x%08x size=0x%08x",
+						block_index, block->addr, block->size).c_str());
+					vm_log.notice("iOS vm close: unmap block %u begin addr=0x%08x size=0x%08x",
+						block_index, block->addr, block->size);
+#endif
 					_unmap_block(block);
 					ensure(block.use_count() == 1);
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+					armsx3_ios_diagnostic_log(fmt::format("vm close: unmap block %u end", block_index).c_str());
+					vm_log.notice("iOS vm close: unmap block %u end", block_index);
+#endif
 				}
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+				block_index++;
+#endif
 			}
 
 			g_locations.clear();
 		}
 
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+		armsx3_ios_diagnostic_log("vm close: blocks cleared");
+		vm_log.notice("iOS vm close: blocks cleared");
+#endif
+
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+		armsx3_ios_diagnostic_log("vm close: exec decommit begin");
+		vm_log.notice("iOS vm close: exec decommit begin");
+#endif
 		utils::memory_decommit(g_exec_addr, 0x200000000);
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+		armsx3_ios_diagnostic_log("vm close: exec decommit end; stat decommit begin");
+		vm_log.notice("iOS vm close: exec decommit end; stat decommit begin");
+#endif
 		utils::memory_decommit(g_stat_addr, 0x100000000);
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+		armsx3_ios_diagnostic_log("vm close: stat decommit end");
+		vm_log.notice("iOS vm close: stat decommit end");
+		g_ios_vm_closing.store(false);
+#endif
 
 #ifdef _WIN32
 		s_hook.unmap(g_hook_addr);

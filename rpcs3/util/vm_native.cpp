@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <cstdlib>
 #endif
 
 #if defined(__FreeBSD__)
@@ -49,6 +50,50 @@ static int memfd_create_(const char *name, uint flags)
 
 namespace utils
 {
+#if defined(ARMSX3_IOS) && defined(__APPLE__)
+	static int create_ios_file_backed_shm(u64 size, std::string_view tag)
+	{
+		const char* tmpdir = std::getenv("TMPDIR");
+		std::string base = tmpdir && *tmpdir ? tmpdir : fs::get_cache_dir();
+		if (!base.empty() && base.back() == '/')
+			base.pop_back();
+
+		for (u32 attempt = 0; attempt < 32; attempt++)
+		{
+			const std::string path = fmt::format("%s/armsx3_%s_%u_%llx_%u.mem",
+				base, tag, static_cast<unsigned>(::getpid()),
+				static_cast<unsigned long long>(reinterpret_cast<uptr>(&size)), attempt);
+
+			const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, S_IWUSR | S_IRUSR);
+			if (fd < 0)
+			{
+				if (errno == EEXIST)
+					continue;
+				return -1;
+			}
+
+			(void)::fcntl(fd, F_SETFD, FD_CLOEXEC);
+			if (::ftruncate(fd, static_cast<off_t>(size)) < 0)
+			{
+				const int saved_errno = errno;
+				::unlink(path.c_str());
+				::close(fd);
+				errno = saved_errno;
+				return -1;
+			}
+
+			// The descriptor remains valid after unlink and can be mapped repeatedly
+			// with MAP_SHARED. iOS denies POSIX shm_open() to sandboxed apps, while
+			// this file-backed form is the same proven fallback used by ARMSX2.
+			::unlink(path.c_str());
+			return fd;
+		}
+
+		errno = EEXIST;
+		return -1;
+	}
+#endif
+
 #ifdef MAP_NORESERVE
 	constexpr int c_map_noreserve = MAP_NORESERVE;
 #else
@@ -381,7 +426,16 @@ namespace utils
 		ensure(::VirtualFree(pointer, size, MEM_DECOMMIT));
 #else
 		const u64 ptr64 = reinterpret_cast<u64>(pointer);
-#if defined(__APPLE__) && defined(ARCH_ARM64)
+#if defined(ARMSX3_IOS) && defined(__APPLE__)
+		// ARMSX3 iOS never uses MAP_JIT for these VM reservations. Keep the original
+		// reservation in place and decommit it with protection/advice instead of the
+		// macOS MAP_JIT workaround below. Unmapping and re-reserving the 8 GiB PPU
+		// dispatch aperture during vm::close() could stall indefinitely and leave the
+		// emulator stuck in system_state::stopping.
+		void* const base = reinterpret_cast<void*>(ptr64 & -get_page_size());
+		const usz len = size + (ptr64 & (get_page_size() - 1));
+		ensure(::mprotect(base, len, PROT_NONE) != -1);
+#elif defined(__APPLE__) && defined(ARCH_ARM64)
 		// Hack: on macOS, Apple explicitly fails mmap if you combine MAP_FIXED and MAP_JIT.
 		// So we unmap the space and just hope it maps to the same address we got before instead.
 		// The Xcode manpage says the pointer is a hint and the OS will try to map at the hint location
@@ -548,6 +602,9 @@ namespace utils
 #ifdef _WIN32
 		const ULARGE_INTEGER max_size{ .QuadPart = m_size };
 		m_handle = ensure(::CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, max_size.HighPart, max_size.LowPart, nullptr));
+#elif defined(ARMSX3_IOS) && defined(__APPLE__)
+		m_file = create_ios_file_backed_shm(m_size, "vm");
+		ensure(m_file >= 0);
 #elif defined(__linux__) || defined(__FreeBSD__)
 		m_file = -1;
 
@@ -754,6 +811,9 @@ namespace utils
 		{
 			m_storage = std::move(storage1);
 		}
+#elif defined(ARMSX3_IOS) && defined(__APPLE__)
+		m_file = create_ios_file_backed_shm(m_size, "vm_sparse");
+		ensure(m_file >= 0);
 #else
 
 #ifdef __linux__

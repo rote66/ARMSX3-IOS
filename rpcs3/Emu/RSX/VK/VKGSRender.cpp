@@ -549,7 +549,24 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 
 	m_flushable_data_heaps = vk::data_heap_manager::to_list().filter(FN(x->has_shadow()));
 
-	const auto shadermode = g_cfg.video.shadermode.get();
+	auto shadermode = g_cfg.video.shadermode.get();
+
+#ifdef ARMSX3_IOS
+	// The Vulkan shader interpreter is an ubershader that declares four arrays of
+	// 16 combined image samplers (1D/2D/3D/Cube). MoltenVK lowers those to Metal
+	// sampler slots 0, 16, 32 and 48, while Apple A-series fragment shaders expose
+	// only sampler indices 0..15. The resulting MSL cannot compile at all.
+	//
+	// Use the normal asynchronous recompiler on iOS instead. It emits only the
+	// samplers actually referenced by the RSX program and therefore stays within
+	// the native Metal sampler limit.
+	if (shadermode == shader_mode::async_with_interpreter || shadermode == shader_mode::interpreter_only)
+	{
+		rsx_log.warning("Vulkan shader interpreter is unsupported on iOS/MoltenVK due to the 16-sampler Metal fragment limit; using Async Recompiler instead.");
+		g_cfg.video.shadermode.set(shader_mode::async_recompiler);
+		shadermode = shader_mode::async_recompiler;
+	}
+#endif
 
 	if (shadermode == shader_mode::async_with_interpreter || shadermode == shader_mode::interpreter_only)
 	{

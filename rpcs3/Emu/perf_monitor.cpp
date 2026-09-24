@@ -12,7 +12,13 @@ LOG_CHANNEL(perf_log, "PERF");
 void perf_monitor::operator()()
 {
 	constexpr u64 update_interval_us = 500000; // Update every half second
+#ifdef ARMSX3_IOS
+	// A jetsam kill cannot run a signal handler. Keep the last memory snapshot close to
+	// the kill so device logs can distinguish memory pressure from an ordinary crash.
+	constexpr u64 log_interval_us_max = 2000000; // Log at minimum every 2 seconds on iOS
+#else
 	constexpr u64 log_interval_us_max = 10000000; // Log at minimum every 10 seconds
+#endif
 	constexpr u64 log_interval_us_min = 500000;  // Log at maximum every half a second (catching possible memory leak)
 	constexpr u64 log_mem_increase = 50 * (1024 * 1024);  // Log when memory usage increased by this amount
 
@@ -46,6 +52,7 @@ void perf_monitor::operator()()
 		// also the figure Android's low-memory killer actually decides on.
 		const u64 current_mem_use = utils::get_process_memory_usage();
 		const u64 mem_use_increase = current_mem_use >= max_memory_usage ? current_mem_use - max_memory_usage : 0;
+		const u64 process_headroom = utils::get_avail_memory();
 
 		const auto [system_total, system_used] = utils::get_memory_usage();
 
@@ -65,6 +72,13 @@ void perf_monitor::operator()()
 				logged_pause = 0;
 				last_pause_time = pause_time;
 			}
+
+#ifdef ARMSX3_IOS
+			if (process_headroom)
+			{
+				fmt::append(msg, ", iOS Headroom: %dMB", process_headroom / (1024 * 1024));
+			}
+#endif
 
 			if (is_paused)
 			{

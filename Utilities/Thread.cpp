@@ -3496,14 +3496,14 @@ static void signal_handler(int sig, siginfo_t* info, void* uct) noexcept
 #endif
 
 
-	// SIGBUS arrives here too now (see the sigaction block below), and never takes a recovery
-	// path. The recovery below is for pages this process protected itself, and a write to an
-	// mprotect'd page raises SIGSEGV/SEGV_ACCERR, never SIGBUS. A bus error means the page behind
-	// an otherwise valid address could not be produced at all -- unbacked, past the backing size,
-	// or an operand the instruction cannot address at that alignment. Nothing here changes any of
-	// those, so handling one and returning would re-execute the same instruction and fault again
-	// immediately: a livelock in place of a crash report.
+	// SIGBUS is not portable enough to classify solely by the signal number. Linux/Android use it
+	// for genuinely unbacked/misaligned accesses, but Darwin also delivers memory-permission
+	// violations as SIGBUS. In particular, writes to guest pages protected by RPCS3 can arrive as
+	// SIGBUS on iOS and must be offered to handle_access_violation() exactly like SIGSEGV. Keep the
+	// Keep the signal-number gate only on platforms where SIGBUS itself excludes recovery.
+#ifndef __APPLE__
 	const bool is_bus_error = sig == SIGBUS;
+#endif
 
 #if defined(ARCH_X64)
 #ifdef __APPLE__
@@ -3587,8 +3587,15 @@ static void signal_handler(int sig, siginfo_t* info, void* uct) noexcept
 	const u64 seg_off = (reinterpret_cast<u64>(info->si_addr) - reinterpret_cast<u64>(vm::g_exec_addr)) - vm::g_exec_addr_seg_offset;
 	const auto cause = is_executing ? "executing" : is_writing ? "writing" : "reading";
 
-	// Gated on more than "not an instruction fetch" now: see is_bus_error above.
+	// Darwin may report mprotect permission faults as SIGBUS. Do not suppress RPCS3's normal guest
+	// page-fault recovery there; the address checks below still limit recovery to guest/exec maps.
+	// Other platforms retain the stricter SIGBUS policy because retrying a genuinely unbacked or
+	// misaligned access would simply fault forever.
+#ifdef __APPLE__
+	const bool try_recovery = !is_executing;
+#else
 	const bool try_recovery = !is_executing && !is_bus_error;
+#endif
 
 	if (auto [addr, ok] = vm::try_get_addr(info->si_addr); ok && try_recovery)
 	{

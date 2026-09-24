@@ -67,6 +67,15 @@ void progress_dialog_server::operator()()
 
 	const auto create_native_dialog = [&native_dlg](const std::string& text, bool* show_overlay_message)
 	{
+#ifdef ARMSX3_IOS
+		// Before the guest has produced frames an RSX overlay can exist but still be invisible
+		// on the UIKit/Metal surface. Let the iOS MsgDialog callback present system progress in
+		// UIKit instead, so long PPU/SPU compilation never looks like an unexplained black screen.
+		(void)native_dlg;
+		(void)text;
+		(void)show_overlay_message;
+		return;
+#else
 		if (const auto renderer = rsx::get_current_renderer())
 		{
 			// Some backends like OpenGL actually initialize a lot of driver objects in the "on_init" method.
@@ -98,6 +107,7 @@ void progress_dialog_server::operator()()
 				native_dlg->progress_bar_set_message(0, get_localized_string(localized_string_id::PROGRESS_DIALOG_PLEASE_WAIT));
 			}
 		}
+#endif
 	};
 
 	while (!g_system_progress_stopping && thread_ctrl::state() != thread_state::aborting)
