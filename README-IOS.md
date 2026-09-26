@@ -222,6 +222,12 @@ host `llvm-tblgen` from LLVM 22.
 使用 macOS 和完整 Xcode/iPhoneOS SDK。当前源码已用 Xcode 27.0 验证。CMake 工程要求
 CMake 3.28 或更新版本；iOS LLVM 交叉编译还需要主机端 LLVM 22 的 `llvm-tblgen`。
 
+The build scripts locate CMake from `PATH` first and also recognize the usual Apple Silicon and
+Intel Homebrew locations. If CMake is installed elsewhere, set `ARMSX3_CMAKE` to its executable.
+
+构建脚本会优先从 `PATH` 查找 CMake，并兼容 Apple Silicon / Intel Homebrew 的常见安装位置。
+如果 CMake 安装在其它位置，可通过 `ARMSX3_CMAKE` 指定其可执行文件。
+
 With Homebrew, a typical setup is:
 
 使用 Homebrew 时可安装：
@@ -261,17 +267,22 @@ export ARMSX3_LLVM_TABLEGEN="$(brew --prefix llvm@22)/bin/llvm-tblgen"
 ./ios/build-dependencies.sh all
 ```
 
-The script builds/fetches the iOS static dependencies used by this port, including FFmpeg, MoltenVK
-and a cross-compiled AArch64 LLVM. By default they are stored below `build/ios-device/`.
+The script builds/fetches the iOS dependencies used by this port, including the pinned Abseil source
+required by protobuf, FFmpeg, MoltenVK and a cross-compiled AArch64 LLVM. By default they are stored
+below `build/ios-device/`. Abseil is populated explicitly so the main CMake configure can remain
+`FETCHCONTENT_FULLY_DISCONNECTED` and will not unexpectedly download dependencies.
 
-脚本会准备本移植所需的 iOS 静态依赖，包括 FFmpeg、MoltenVK 和交叉编译的 AArch64 LLVM；
-默认存放在 `build/ios-device/` 下。
+脚本会准备本移植所需的 iOS 依赖，包括 protobuf 所需的固定版本 Abseil 源码、FFmpeg、
+MoltenVK 和交叉编译的 AArch64 LLVM；默认存放在 `build/ios-device/` 下。Abseil 会在依赖阶段
+显式准备，因此主工程 CMake 可以继续使用 `FETCHCONTENT_FULLY_DISCONNECTED`，不会在配置阶段
+偷偷下载依赖。
 
 Individual dependency targets are also available:
 
 也可以单独构建：
 
 ```sh
+./ios/build-dependencies.sh absl
 ./ios/build-dependencies.sh ffmpeg
 ./ios/build-dependencies.sh moltenvk
 ./ios/build-dependencies.sh llvm
@@ -304,6 +315,9 @@ export ARMSX3_JOBS=8
 
 # Alternate build root / 自定义构建目录
 export ARMSX3_IOS_BUILD_DIR="$PWD/build/ios-device"
+
+# CMake installed outside PATH/Homebrew defaults / CMake 位于其它目录时
+export ARMSX3_CMAKE="/path/to/cmake"
 
 # Debug instead of the default Release / 改为 Debug（默认 Release）
 export ARMSX3_CONFIGURATION=Debug

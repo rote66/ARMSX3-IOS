@@ -9,7 +9,36 @@ OUTPUT_DIR=${SOURCE_DIR}/build/ios-output
 CONFIGURATION=${ARMSX3_CONFIGURATION:-Release}
 BUILD_JOBS=${ARMSX3_IOS_BUILD_JOBS:-2}
 
+resolve_cmake() {
+    if [[ -n ${ARMSX3_CMAKE:-} ]]; then
+        if [[ ! -x ${ARMSX3_CMAKE} ]]; then
+            print -u2 "ARMSX3_CMAKE is not executable: ${ARMSX3_CMAKE}"
+            return 1
+        fi
+        print -r -- ${ARMSX3_CMAKE}
+        return
+    fi
+
+    if (( $+commands[cmake] )); then
+        print -r -- ${commands[cmake]}
+        return
+    fi
+
+    for candidate in /opt/homebrew/bin/cmake /usr/local/bin/cmake; do
+        if [[ -x ${candidate} ]]; then
+            print -r -- ${candidate}
+            return
+        fi
+    done
+
+    print -u2 "CMake 3.28 or newer is required; install it or set ARMSX3_CMAKE"
+    return 1
+}
+
+CMAKE_BIN=$(resolve_cmake)
+
 for dependency in \
+    ${BUILD_DIR}/_deps/absl-src/CMakeLists.txt \
     ${DEPS_DIR}/ffmpeg/lib/libavcodec.a \
     ${DEPS_DIR}/moltenvk/lib/libMoltenVK.a \
     ${DEPS_DIR}/llvm/lib/cmake/llvm/LLVMConfig.cmake; do
@@ -20,7 +49,7 @@ for dependency in \
     fi
 done
 
-cmake -S ${SOURCE_DIR} -B ${BUILD_DIR} -G Xcode \
+"${CMAKE_BIN}" -S ${SOURCE_DIR} -B ${BUILD_DIR} -G Xcode \
     -DCMAKE_SYSTEM_NAME=iOS \
     -DCMAKE_OSX_SYSROOT=iphoneos \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
@@ -43,7 +72,7 @@ cmake -S ${SOURCE_DIR} -B ${BUILD_DIR} -G Xcode \
     -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
     -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED=NO
 
-cmake --build ${BUILD_DIR} --config ${CONFIGURATION} --target ARMSX3 -- \
+"${CMAKE_BIN}" --build ${BUILD_DIR} --config ${CONFIGURATION} --target ARMSX3 -- \
     -sdk iphoneos -jobs ${BUILD_JOBS} -quiet
 
 APP=${BUILD_DIR}/bin/ARMSX3.app

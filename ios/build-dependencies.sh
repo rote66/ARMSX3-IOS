@@ -14,8 +14,53 @@ AR=$(xcrun --sdk iphoneos --find ar)
 RANLIB=$(xcrun --sdk iphoneos --find ranlib)
 STRIP=$(xcrun --sdk iphoneos --find strip)
 MIN_IOS=15.0
+ABSEIL_VERSION=20250512.1
+
+resolve_cmake() {
+    if [[ -n ${ARMSX3_CMAKE:-} ]]; then
+        if [[ ! -x ${ARMSX3_CMAKE} ]]; then
+            print -u2 "ARMSX3_CMAKE is not executable: ${ARMSX3_CMAKE}"
+            return 1
+        fi
+        print -r -- ${ARMSX3_CMAKE}
+        return
+    fi
+
+    if (( $+commands[cmake] )); then
+        print -r -- ${commands[cmake]}
+        return
+    fi
+
+    for candidate in /opt/homebrew/bin/cmake /usr/local/bin/cmake; do
+        if [[ -x ${candidate} ]]; then
+            print -r -- ${candidate}
+            return
+        fi
+    done
+
+    print -u2 "CMake 3.28 or newer is required; install it or set ARMSX3_CMAKE"
+    return 1
+}
+
+CMAKE_BIN=$(resolve_cmake)
 
 mkdir -p ${DEPS_DIR} ${SRC_DIR}
+
+prepare_abseil() {
+    # RPCS3 builds protobuf from its submodule. Current protobuf needs Abseil,
+    # while the app configure intentionally uses FETCHCONTENT_FULLY_DISCONNECTED
+    # so it never performs surprise network downloads. Populate the exact
+    # FetchContent source directory here, alongside the other explicit iOS deps.
+    local source=${BUILD_DIR}/_deps/absl-src
+    if [[ -f ${source}/CMakeLists.txt ]]; then
+        print "Abseil source already prepared"
+        return
+    fi
+    rm -rf ${source}
+    mkdir -p ${BUILD_DIR}/_deps
+    git clone --depth 1 --branch ${ABSEIL_VERSION} \
+        https://github.com/abseil/abseil-cpp.git ${source}
+}
 
 build_ffmpeg() {
     local version=8.1.1
@@ -153,7 +198,7 @@ build_llvm() {
         trap "${restore_llvm_patch}" EXIT INT TERM
     fi
 
-    cmake -S ${source} -B ${build} -G "Unix Makefiles" \
+    "${CMAKE_BIN}" -S ${source} -B ${build} -G "Unix Makefiles" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_SYSTEM_NAME=iOS \
         -DCMAKE_OSX_SYSROOT=iphoneos \
@@ -186,8 +231,8 @@ build_llvm() {
         -DLLVM_ENABLE_CURL=OFF \
         -DLLVM_ENABLE_RTTI=OFF \
         -DLLVM_ENABLE_EH=OFF
-    cmake --build ${build} -j${JOBS}
-    cmake --install ${build}
+    "${CMAKE_BIN}" --build ${build} -j${JOBS}
+    "${CMAKE_BIN}" --install ${build}
     touch ${ios_patch_stamp}
 
     if (( llvm_patch_applied )); then
@@ -197,13 +242,15 @@ build_llvm() {
 }
 
 case ${1:-all} in
+    absl) prepare_abseil ;;
     ffmpeg) build_ffmpeg ;;
     moltenvk) build_moltenvk ;;
     llvm) build_llvm ;;
     all)
+        prepare_abseil
         build_ffmpeg
         build_moltenvk
         build_llvm
         ;;
-    *) print -u2 "usage: $0 [all|ffmpeg|moltenvk|llvm]"; exit 2 ;;
+    *) print -u2 "usage: $0 [all|absl|ffmpeg|moltenvk|llvm]"; exit 2 ;;
 esac
