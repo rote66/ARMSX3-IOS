@@ -328,6 +328,9 @@ public:
 	// Retire finished work so the data heaps can reclaim. Narrow public entry point for
 	// vk::reclaim_ring_memory(); flush_command_queue itself stays private.
 	void retire_completed_work();
+	// Submit the current CB and poll already-completed CB fences without waiting. This lets
+	// streaming rings recycle asynchronously before the allocator falls back to a hard sync.
+	void submit_ring_memory_work();
 
 	// External callback to handle out of video memory problems
 	bool on_vram_exhausted(rsx::problem_severity severity);

@@ -17,9 +17,40 @@ namespace vk
 {
 	data_heap g_upload_heap;
 
+	void data_heap::prepare_alloc(usz size)
+	{
+#ifdef ARMSX3_IOS
+		// The 64M attrib/upload rings can fill in ~50-70ms during BLJM60028 gameplay. Waiting
+		// until grow() means the first useful fence is created exactly when the ring is already
+		// out of space, so the memory-pressure fallback has no choice but to hard-sync. Submit
+		// about halfway through instead. The snapshot is taken BEFORE the current allocation,
+		// giving the GPU another ~30ms to finish old ranges while CPU/RSX recording continues.
+		//
+		// Limit this to large streaming heaps. Small 16M UBO/index rings submit naturally often
+		// enough and would otherwise multiply command-buffer traffic for no memory benefit.
+		if ((m_flags & heap_pool_fixed_size) || m_size < 64 * 0x100000)
+		{
+			return;
+		}
+
+		m_ios_bytes_since_submit += size;
+		constexpr usz ios_async_submit_interval = 32 * 0x100000;
+		if (m_ios_bytes_since_submit >= ios_async_submit_interval)
+		{
+			if (vk::try_reclaim_ring_memory())
+			{
+				m_ios_bytes_since_submit = 0;
+			}
+		}
+#else
+		(void)size;
+#endif
+	}
+
 	void data_heap::create(VkBufferUsageFlags usage, usz size, rsx::flags32_t flags, const char* name, usz guard, VkBool32 notify)
 	{
 		rsx::data_heap::init(size, name, guard);
+		m_ios_bytes_since_submit = 0;
 
 		const auto& memory_map = g_render_device->get_memory_mapping();
 
@@ -119,7 +150,21 @@ namespace vk
 		// the ceiling by free memory so that decision gets made before the fatal allocation
 		// rather than after it. A quarter of what is free leaves room for the copy, since the
 		// old heap is still resident while the new one is created.
-#if defined(__ANDROID__) || defined(ARMSX3_IOS)
+#if defined(ARMSX3_IOS)
+		// iOS has a per-process dirty-memory ceiling that is much lower than the unified-memory
+		// figure exposed by MoltenVK. The old 256M mobile ceiling still allowed one streaming
+		// ring to walk 64 -> 128 -> 192 -> 256M before reclaiming. In the supplied BLJM60028
+		// gameplay-entry log on a 4GB A15 device, process RSS jumped from ~1.2GB to
+		// 2.25GB and iOS killed the process immediately after the attrib ring reached 256M.
+		//
+		// Requests in that run were only 16-17K. 128M therefore leaves orders of magnitude of
+		// working room while forcing a command-buffer retirement before a loading screen can
+		// accumulate hundreds of megabytes of transient vertex/upload data.
+		if (!(m_flags & heap_pool_fixed_size))
+		{
+			size_limit = std::min<usz>(size_limit, 128 * 0x100000);
+		}
+#elif defined(__ANDROID__)
 		// A hard ceiling, because free memory is not the constraint that matters.
 		//
 		// The first attempt bounded this by utils::get_avail_memory()/4 and did nothing: that
@@ -145,6 +190,51 @@ namespace vk
 #endif
 
 		usz aligned_new_size = utils::align(m_size + size, 64 * 0x100000);
+		bool hard_synced_for_growth = false;
+
+#ifdef ARMSX3_IOS
+		// First try to solve ring exhaustion without waiting. The first iOS memory-limit fix
+		// hard-synced here whenever headroom was low; on BLJM60028 that happened every 50-70ms
+		// once gameplay started, keeping RSS safe but turning the renderer into a slideshow.
+		// Submitting the current CB and polling completed fences lets the existing heap snapshots
+		// advance m_get_pos asynchronously. Only if that still leaves no room do we use the
+		// hard-sync pressure path below.
+		if (!(m_flags & heap_pool_fixed_size) && vk::try_reclaim_ring_memory())
+		{
+			if (can_alloc_impl(utils::align(m_put_pos, 4096), size + 4096))
+			{
+				return true;
+			}
+		}
+
+		// A grow temporarily needs the NEW allocation in addition to the old heap: dispose()
+		// normally attaches the old VkBuffer to event GC so the two coexist until that event is
+		// retired. That transient overlap, not merely the final heap size, is what crossed the
+		// iOS memorystatus limit in the gameplay-entry log.
+		//
+		// os_proc_available_memory() is surfaced by utils::get_avail_memory() on iOS, so unlike
+		// Linux MemAvailable it is exactly the remaining allowance for this process. Keep 192M
+		// spare for Metal/Vulkan allocations that happen around the same draw and force retirement
+		// before a reallocation would consume that reserve.
+		if (!(m_flags & heap_pool_fixed_size))
+		{
+			constexpr u64 ios_growth_reserve = 192ull * 0x100000;
+			const u64 headroom = utils::get_avail_memory();
+			if (headroom && headroom <= aligned_new_size + ios_growth_reserve)
+			{
+				rsx_log.warning("[%s] iOS memory pressure before heap growth: %lluM headroom, %uM -> %uM. Retiring GPU work first.",
+					m_name, headroom / 0x100000,
+					static_cast<u32>(m_size / 0x100000), static_cast<u32>(aligned_new_size / 0x100000));
+				hard_synced_for_growth = vk::reclaim_ring_memory();
+				if (hard_synced_for_growth && can_alloc_impl(utils::align(m_put_pos, 4096), size + 4096))
+				{
+					rsx_log.notice("[%s] iOS pressure reclaim avoided heap growth (%uM, requested %uK).",
+						m_name, static_cast<u32>(m_size / 0x100000), static_cast<u32>(size / 1024));
+					return true;
+				}
+			}
+		}
+#endif
 
 		// At the ceiling, reclaim rather than swap or die.
 		//
@@ -163,11 +253,16 @@ namespace vk
 		// that down the reclaim path instead of letting the ring take its last allowed step. The
 		// heap then sat at 192M hard-syncing twice a second while 64M of its own budget went
 		// unused.
-		if (aligned_new_size > size_limit && vk::reclaim_ring_memory())
+		if (aligned_new_size > size_limit)
 		{
+			if (!hard_synced_for_growth)
+			{
+				hard_synced_for_growth = vk::reclaim_ring_memory();
+			}
+
 			// Conservative: grow() cannot see the alignment its caller will apply, so claim
 			// success only with a 4K margin. Being wrong hands out memory still in flight.
-			if (can_alloc_impl(utils::align(m_put_pos, 4096), size + 4096))
+			if (hard_synced_for_growth && can_alloc_impl(utils::align(m_put_pos, 4096), size + 4096))
 			{
 				rsx_log.notice("[%s] Reclaimed at the ceiling instead of swapping (heap %uM, requested %uK).",
 					m_name, static_cast<u32>(m_size / 0x100000), static_cast<u32>(size / 1024));
@@ -264,14 +359,26 @@ namespace vk
 			ensure(!m_prefer_writethrough);
 			rsx_log.warning("Buffer usage %u is not heap-compatible using this driver, explicit staging buffer in use", usage);
 
-			gc->dispose(shadow);
+			// After retire_completed_work() the device has completed every command that could
+			// reference this heap. On iOS, destroy it synchronously so the replacement does not
+			// overlap the old allocation and trip the process memory ceiling. Without a hard sync
+			// keep the normal event-GC lifetime rules.
+#ifdef ARMSX3_IOS
+			if (hard_synced_for_growth) shadow.reset();
+			else
+#endif
+				gc->dispose(shadow);
 			shadow = std::make_unique<buffer>(*g_render_device, aligned_new_size, memory_index, memory_flags, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0, VMM_ALLOCATION_POOL_SYSTEM);
 			usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 			memory_flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 			memory_index = memory_map.device_local;
 		}
 
-		gc->dispose(heap);
+#ifdef ARMSX3_IOS
+		if (hard_synced_for_growth) heap.reset();
+		else
+#endif
+			gc->dispose(heap);
 
 		VkFlags create_flags = 0;
 		if (m_prefer_writethrough)

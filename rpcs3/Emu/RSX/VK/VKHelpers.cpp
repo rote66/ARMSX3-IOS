@@ -365,6 +365,19 @@ namespace vk
 		return true;
 	}
 
+	bool try_reclaim_ring_memory()
+	{
+		auto renderer = dynamic_cast<VKGSRender*>(rsx::get_current_renderer());
+
+		if (!renderer || is_uninterruptible())
+		{
+			return false;
+		}
+
+		renderer->submit_ring_memory_work();
+		return true;
+	}
+
 	void advance_completed_frame_counter()
 	{
 		g_num_processed_frames++;

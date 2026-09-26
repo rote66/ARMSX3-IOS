@@ -25,18 +25,24 @@
 #include "Emu/RSX/Overlays/overlay_save_dialog.h"
 #include "Emu/RSX/Overlays/overlay_trophy_notification.h"
 #include "Emu/RSX/RSXThread.h"
+#include "Emu/RSX/Utils/rsx_utils.h"
 #include "Emu/RSX/VK/VKGSRender.h"
 #include "Emu/System.h"
 #include "Emu/savestate_utils.hpp"
 #include "Emu/localized_string_id.h"
 #include "Emu/VFS.h"
 #include "Emu/system_config.h"
+#include "Emu/NP/rpcn_client.h"
+#include "Emu/NP/rpcn_config.h"
 #include "Emu/system_utils.hpp"
 #include "Emu/vfs_config.h"
 #include "Input/pad_thread.h"
 #include "Input/virtual_pad_handler.h"
 #include "Loader/PUP.h"
+#include "Loader/PSF.h"
 #include "Loader/TAR.h"
+#include "Loader/ISO.h"
+#include "rpcs3_version.h"
 #include "Utilities/File.h"
 #include "Utilities/Config.h"
 #include "Utilities/bin_patch.h"
@@ -76,6 +82,7 @@ extern std::string g_android_executable_dir;
 extern std::string g_android_config_dir;
 extern std::string g_android_cache_dir;
 extern atomic_t<bool> g_user_asked_for_screenshot;
+extern atomic_t<bool> g_user_asked_for_frame_capture;
 
 std::string g_input_config_override;
 cfg_input_configurations g_cfg_input_configs;
@@ -90,12 +97,19 @@ std::atomic<void*> g_metal_view{nullptr};
 std::atomic<int> g_surface_width{0};
 std::atomic<int> g_surface_height{0};
 std::atomic<double> g_refresh_rate{60.0};
+std::atomic<double> g_live_fps{0.0};
+std::atomic<u64> g_live_fps_frames{0};
+std::atomic<u64> g_live_fps_window_start{0};
 std::atomic<u64> g_surface_epoch{0};
 std::atomic<armsx3_ios_event_callback> g_event_callback{nullptr};
 std::array<std::shared_ptr<Pad>, CELL_PAD_MAX_PORT_NUM> g_virtual_pads;
 std::mutex g_pad_mutex;
 std::mutex g_lifecycle_mutex;
 std::string g_settings_json;
+std::string g_game_info_json;
+std::string g_game_config_text;
+thread_local std::string g_rpcn_json;
+thread_local std::string g_rpcn_result;
 std::string g_log_path;
 std::string g_boot_log_path;
 std::string g_firmware_version;
@@ -124,6 +138,273 @@ std::string json_quote(std::string_view v)
 		}
 	}
 	return out + "\"";
+}
+
+std::string rpcn_json_escape_ios(std::string_view in)
+{
+	std::string out;
+	out.reserve(in.size());
+	for (const char c : in)
+	{
+		switch (c)
+		{
+		case '"': out += "\\\""; break;
+		case '\\': out += "\\\\"; break;
+		case '\n': out += "\\n"; break;
+		case '\r': out += "\\r"; break;
+		case '\t': out += "\\t"; break;
+		default: if (static_cast<unsigned char>(c) >= 0x20) out += c; break;
+		}
+	}
+	return out;
+}
+
+const char* rpcn_ok_ios()
+{
+	g_rpcn_result.clear();
+	return g_rpcn_result.c_str();
+}
+
+const char* rpcn_fail_ios(std::string message)
+{
+	g_rpcn_result = std::move(message);
+	armsx3_ios_log.error("RPCN: %s", g_rpcn_result);
+	return g_rpcn_result.c_str();
+}
+
+std::string rpcn_describe_ios(rpcn::ErrorType error)
+{
+	switch (error)
+	{
+	case rpcn::ErrorType::NoError: return {};
+	case rpcn::ErrorType::CreationExistingUsername: return "An account with that username already exists.";
+	case rpcn::ErrorType::CreationExistingEmail: return "An account with that email address already exists.";
+	case rpcn::ErrorType::CreationBannedEmailProvider: return "That email provider is not accepted by the server.";
+	case rpcn::ErrorType::CreationError: return "The server refused to create the account.";
+	case rpcn::ErrorType::InvalidInput: return "The server rejected those details. Usernames are 3-16 characters, letters, numbers, - and _ only.";
+	case rpcn::ErrorType::TooSoon: return "Too soon since the last attempt. Wait a few minutes and try again.";
+	case rpcn::ErrorType::LoginInvalidUsername: return "Unknown username.";
+	case rpcn::ErrorType::LoginInvalidPassword: return "Wrong password.";
+	case rpcn::ErrorType::LoginInvalidToken: return "That token is not valid. Check the email, or send a new token.";
+	case rpcn::ErrorType::LoginAlreadyLoggedIn: return "That account is already logged in somewhere else.";
+	case rpcn::ErrorType::LoginError: return "The server refused the login.";
+	case rpcn::ErrorType::Malformed: return "The request was incomplete -- a required field was empty.";
+	case rpcn::ErrorType::Invalid: return "The server rejected that request as out of order. Try Test sign-in first.";
+	default: return fmt::format("Unexpected server error %d.", static_cast<int>(error));
+	}
+}
+
+const char* rpcn_with_connection_ios(const std::function<rpcn::ErrorType(rpcn::rpcn_client&)>& op)
+{
+	const auto client = rpcn::rpcn_client::get_instance(0);
+	if (!client) return rpcn_fail_ios("Could not create the RPCN client.");
+	if (const auto state = client->wait_for_connection(); state != rpcn::rpcn_state::failure_no_failure)
+		return rpcn_fail_ios(fmt::format("Could not reach the RPCN server: %s", rpcn::rpcn_state_to_string(state)));
+	if (auto message = rpcn_describe_ios(op(*client)); !message.empty()) return rpcn_fail_ios(std::move(message));
+	return rpcn_ok_ios();
+}
+
+const char* rpcn_with_auth_ios(const std::function<bool(rpcn::rpcn_client&)>& op)
+{
+	const auto client = rpcn::rpcn_client::get_instance(0);
+	if (!client) return rpcn_fail_ios("Could not create the RPCN client.");
+	if (const auto state = client->wait_for_connection(); state != rpcn::rpcn_state::failure_no_failure)
+		return rpcn_fail_ios(fmt::format("Could not reach the RPCN server: %s", rpcn::rpcn_state_to_string(state)));
+	if (!client->is_authentified())
+	{
+		g_cfg_rpcn.load();
+		if (g_cfg_rpcn.get_npid().empty() || g_cfg_rpcn.get_password().empty()) return rpcn_fail_ios("Sign in to RPCN first.");
+		if (const auto state = client->wait_for_authentified(); state != rpcn::rpcn_state::failure_no_failure)
+			return rpcn_fail_ios(fmt::format("RPCN sign-in failed: %s", rpcn::rpcn_state_to_string(state)));
+	}
+	if (!op(*client)) return rpcn_fail_ios("The server rejected that request.");
+	return rpcn_ok_ios();
+}
+
+extern "C" const char* armsx3_ios_core_version(void)
+{
+	static const std::string version = rpcs3::get_verbose_version();
+	return version.c_str();
+}
+
+cfg::_base* find_cfg_node_ios(cfg::_base* root, std::string_view path);
+bool cfg_is_editable_ios(const cfg::_base* node);
+std::string decode_setting_json_value(std::string_view value);
+std::string ios_slot_dir(std::string_view title);
+std::string ios_slot_find(std::string_view title, unsigned int slot);
+
+bool apply_setting_value_ios(cfg_root& config, std::string_view path, const char* json_value, bool dynamic = false)
+{
+	if (path.empty() || !json_value) return false;
+	cfg::_base* node = find_cfg_node_ios(&config, path);
+	if (!node || !cfg_is_editable_ios(node) || node->get_type() == cfg::type::node) return false;
+	const std::string decoded = decode_setting_json_value(json_value);
+#if defined(ARCH_ARM64)
+	if (path == "Core@@SPU Decoder" && decoded == "Recompiler (ASMJIT)") return false;
+#endif
+	if (path == "Video@@Shader Mode" &&
+		(decoded == "Async Recompiler with Shader Interpreter" || decoded == "Shader Interpreter only"))
+	{
+		return node->from_string("Async Recompiler (multi-threaded)", dynamic);
+	}
+	return node->from_string(decoded, dynamic);
+}
+
+bool load_game_settings_ios(std::string_view serial, cfg_root& config)
+{
+	if (serial.empty()) return false;
+	config.from_default();
+	const std::string global_path = fs::get_config_dir(true) + "config.yml";
+	if (fs::file global{global_path}; global && !config.from_string(global.to_string()))
+	{
+		armsx3_ios_log.error("Failed to load global settings for per-game editor: %s", global_path);
+		return false;
+	}
+	const std::string custom_path = rpcs3::utils::get_custom_config_path(std::string(serial));
+	if (fs::file custom{custom_path}; custom && !config.from_string(custom.to_string()))
+	{
+		armsx3_ios_log.error("Failed to load custom settings: %s", custom_path);
+		return false;
+	}
+	return true;
+}
+
+extern "C" uint16_t armsx3_ios_pad_rumble(int port)
+{
+	if (port < 0 || static_cast<usz>(port) >= g_virtual_pads.size()) return 0;
+	std::shared_ptr<Pad> pad;
+	{
+		std::lock_guard lock(g_pad_mutex);
+		pad = g_virtual_pads[port];
+	}
+	if (!pad || pad->m_vibrate_motors.size() < 2) return 0;
+	const uint16_t large = pad->m_vibrate_motors[0].value;
+	const uint16_t small = pad->m_vibrate_motors[1].value;
+	return static_cast<uint16_t>((large << 8) | small);
+}
+
+extern "C" void armsx3_ios_set_render_position(bool portrait_top, uint32_t top_inset_px)
+{
+	rsx::g_render_top_portrait = portrait_top ? 1u : 0u;
+	rsx::g_render_top_inset = portrait_top ? top_inset_px : 0u;
+}
+
+extern "C" bool armsx3_ios_portrait_render_top()
+{
+	return rsx::g_render_top_portrait.load() != 0;
+}
+
+extern "C" bool armsx3_ios_extract_package_to(const char* path, const char* destination)
+{
+	if (!path || !*path || !destination || !*destination || !g_initialized.load(std::memory_order_acquire)) return false;
+	std::lock_guard lock(g_lifecycle_mutex);
+	if (!Emu.IsStopped(true))
+	{
+		armsx3_ios_log.error("Stop emulation before importing a PKG mod");
+		return false;
+	}
+
+	fs::file file(path);
+	if (!file) return false;
+	std::deque<package_reader> readers;
+	readers.emplace_back(path, std::move(file));
+	if (!readers.front().is_valid()) return false;
+
+	package_reader::set_install_root_override(destination);
+	std::deque<std::string> bootable_paths;
+	const package_install_result result = package_reader::extract_data(readers, bootable_paths, false);
+	package_reader::set_install_root_override({});
+	return result.error == package_install_result::error_type::no_error;
+}
+
+int import_state_to_free_slot_ios(const char* path_raw)
+{
+	if (!path_raw || !*path_raw || (!Emu.IsRunning() && !Emu.IsPaused())) return -1;
+	const std::string source = path_raw;
+	if (!fs::is_file(source)) return -1;
+	const std::string title = Emu.GetTitleID();
+	if (title.empty()) return -1;
+
+	unsigned int slot = 0;
+	for (; slot < 10; slot++)
+		if (ios_slot_find(title, slot).empty()) break;
+	if (slot >= 10) return -1;
+
+	const std::string dir = ios_slot_dir(title);
+	if (!fs::create_path(dir) && fs::g_tls_error != fs::error::exist) return -1;
+
+	std::string suffix;
+	std::string lower = source;
+	std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+	if (lower.ends_with(".savestat.zst")) suffix = ".zst";
+	else if (lower.ends_with(".savestat.gz")) suffix = ".gz";
+	const std::string destination = dir + "slot" + std::to_string(slot) + ".SAVESTAT" + suffix;
+	if (!fs::copy_file(source, destination, true))
+	{
+		armsx3_ios_log.error("savestate import: copy '%s' -> '%s' failed: %s", source, destination, fs::g_tls_error);
+		return -1;
+	}
+	armsx3_ios_log.success("savestate import: slot %u <- '%s'", slot, source);
+	return static_cast<int>(slot);
+}
+
+bool looks_like_title_id_ios(std::string_view value)
+{
+	if (value.size() != 9) return false;
+	for (usz i = 0; i < 4; i++)
+		if (value[i] < 'A' || value[i] > 'Z') return false;
+	for (usz i = 4; i < value.size(); i++)
+		if (value[i] < '0' || value[i] > '9') return false;
+	return true;
+}
+
+std::string locate_eboot_path_ios(std::string_view root)
+{
+	if (root.empty()) return {};
+	std::error_code ec;
+	const std::filesystem::path input = std::filesystem::path(std::string(root));
+	if (std::filesystem::is_regular_file(input, ec)) return input.string();
+	for (const char* suffix : {"EBOOT.BIN", "USRDIR/EBOOT.BIN", "USRDIR/ISO.BIN.EDAT", "PS3_GAME/USRDIR/EBOOT.BIN"})
+	{
+		const auto candidate = input / suffix;
+		if (std::filesystem::is_regular_file(candidate, ec)) return candidate.string();
+	}
+	return {};
+}
+
+void merge_legacy_vfs_tree_ios(const std::filesystem::path& source, const std::filesystem::path& target)
+{
+	std::error_code ec;
+	if (!std::filesystem::exists(source, ec) || !std::filesystem::is_directory(source, ec)) return;
+	std::filesystem::create_directories(target, ec);
+	if (ec) return;
+
+	for (const auto& entry : std::filesystem::directory_iterator(source, ec))
+	{
+		if (ec) break;
+		const auto destination = target / entry.path().filename();
+		std::error_code exists_ec;
+		const bool destination_exists = std::filesystem::exists(destination, exists_ec);
+		if (!destination_exists)
+		{
+			std::error_code move_ec;
+			std::filesystem::rename(entry.path(), destination, move_ec);
+			if (!move_ec)
+			{
+				armsx3_ios_diagnostic_log(fmt::format("vfs migrate moved %s -> %s",
+					entry.path().string(), destination.string()).c_str());
+				continue;
+			}
+		}
+
+		if (entry.is_directory(ec) && std::filesystem::is_directory(destination, ec))
+		{
+			merge_legacy_vfs_tree_ios(entry.path(), destination);
+		}
+	}
+
+	std::error_code remove_ec;
+	std::filesystem::remove(source, remove_ec); // only removes now-empty legacy directories
 }
 
 std::string ios_slot_dir(std::string_view title)
@@ -302,52 +583,187 @@ int boot_path_locked(const std::string& path)
 
 extern "C" bool armsx3_ios_install_package(const char* path)
 {
-	if (!path || !*path || !g_initialized.load(std::memory_order_acquire)) return false;
+	if (!path || !*path) return false;
+	const char* paths[] = {path};
+	return armsx3_ios_install_packages(paths, 1);
+}
+
+extern "C" bool armsx3_ios_install_packages(const char* const* paths, size_t count)
+{
+	if (!paths || count == 0 || !g_initialized.load(std::memory_order_acquire)) return false;
 	std::lock_guard lock(g_lifecycle_mutex);
 	if (!Emu.IsStopped(true))
 	{
-		emit_event(ARMSX3_IOS_EVENT_ERROR, "Stop emulation before installing a PKG");
+		emit_event(ARMSX3_IOS_EVENT_ERROR, "Stop emulation before installing packages or licences");
 		return false;
 	}
 
-	fs::file file(path);
-	if (!file)
+	std::vector<std::string> package_paths;
+	std::vector<std::string> licence_paths;
+	for (size_t i = 0; i < count; ++i)
 	{
-		emit_event(ARMSX3_IOS_EVENT_ERROR, "Unable to open PKG");
+		if (!paths[i] || !*paths[i]) continue;
+		std::string path = paths[i];
+		std::string lower = path;
+		std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+		if (lower.ends_with(".rap") || lower.ends_with(".edat")) licence_paths.emplace_back(std::move(path));
+		else if (lower.find(".pkg") != std::string::npos) package_paths.emplace_back(std::move(path));
+	}
+
+	if (package_paths.empty() && licence_paths.empty())
+	{
+		emit_event(ARMSX3_IOS_EVENT_ERROR, "Select .pkg, .rap, or .edat files");
 		return false;
 	}
 
-	std::deque<package_reader> readers;
-	readers.emplace_back(path, std::move(file));
-	if (!readers.front().is_valid())
+	if (!package_paths.empty())
 	{
-		emit_event(ARMSX3_IOS_EVENT_ERROR, "Invalid PKG");
+		std::deque<package_reader> readers;
+		for (const std::string& path : package_paths)
+		{
+			fs::file file(path);
+			if (!file)
+			{
+				emit_event(ARMSX3_IOS_EVENT_ERROR, fmt::format("Unable to open PKG part: {}", path));
+				return false;
+			}
+			readers.emplace_back(path, std::move(file));
+		}
+
+		emit_event(ARMSX3_IOS_EVENT_STATUS, package_paths.size() > 1 ? "Installing split PKG..." : "Installing PKG...");
+		std::deque<std::string> bootable_paths;
+		const package_install_result result = package_reader::extract_data(readers, bootable_paths, false);
+		if (result.error != package_install_result::error_type::no_error)
+		{
+			if (result.error == package_install_result::error_type::app_version)
+			{
+				std::string message = "PKG update rejected";
+				if (!result.version.expected.empty())
+					message += fmt::format(": expected {}, installed {}", result.version.expected,
+						result.version.installed.empty() ? "none" : result.version.installed);
+				else
+					message += ": base game is not installed";
+				emit_event(ARMSX3_IOS_EVENT_ERROR, message);
+			}
+			else
+				emit_event(ARMSX3_IOS_EVENT_ERROR, "PKG installation failed");
+			return false;
+		}
+	}
+
+	for (const std::string& path : licence_paths)
+	{
+		const std::filesystem::path source_path(path);
+		std::string extension = source_path.extension().string();
+		std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+		if (!extension.empty() && extension.front() == '.') extension.erase(extension.begin());
+		if (extension != "rap" && extension != "edat") continue;
+
+		const std::string user = Emu.GetUsr().empty() ? "00000001" : Emu.GetUsr();
+		const std::string exdata = rpcs3::utils::get_hdd0_dir() + "home/" + user + "/exdata/";
+		if (!fs::create_path(exdata) && fs::g_tls_error != fs::error::exist)
+		{
+			emit_event(ARMSX3_IOS_EVENT_ERROR, "Unable to create PS3 exdata directory");
+			return false;
+		}
+
+		const std::string filename = source_path.filename().string();
+		const std::string stem = source_path.stem().string();
+		fs::pending_file to(exdata + stem + "." + extension);
+		fs::file from(path);
+		if (!to.file || !from)
+		{
+			emit_event(ARMSX3_IOS_EVENT_ERROR, fmt::format("Unable to install licence: {}", filename));
+			return false;
+		}
+		to.file.write(from.to_vector<u8>());
+		from.close();
+		if (to.file.size() < 0x10 || !to.commit())
+		{
+			emit_event(ARMSX3_IOS_EVENT_ERROR, fmt::format("Invalid licence file: {}", filename));
+			return false;
+		}
+	}
+
+	emit_event(ARMSX3_IOS_EVENT_STATUS, package_paths.empty() ? "Licence installed" : (licence_paths.empty() ? "PKG installed" : "Package and licence installed"));
+	return true;
+}
+
+extern "C" bool armsx3_ios_game_locked(const char* game_path)
+{
+	if (!game_path || !*game_path) return false;
+	const std::string eboot_path = locate_eboot_path_ios(game_path);
+	if (eboot_path.empty()) return false;
+	fs::file eboot(eboot_path);
+	if (!eboot || eboot.size() < 4) return false;
+	const u32 magic = eboot.read<u32>();
+	if (magic != "SCE\0"_u32) return false;
+	eboot.seek(0);
+	return !decrypt_self(eboot);
+}
+
+extern "C" bool armsx3_ios_install_rap_for_game(const char* rap_path, const char* game_path)
+{
+	if (!rap_path || !*rap_path || !game_path || !*game_path || !g_initialized.load(std::memory_order_acquire)) return false;
+	std::lock_guard lock(g_lifecycle_mutex);
+	if (!Emu.IsStopped(true))
+	{
+		emit_event(ARMSX3_IOS_EVENT_ERROR, "Stop emulation before installing a game licence");
 		return false;
 	}
 
-	emit_event(ARMSX3_IOS_EVENT_STATUS, "Installing PKG...");
-	std::deque<std::string> bootable_paths;
-	const package_install_result result = package_reader::extract_data(readers, bootable_paths, false);
-	if (result.error == package_install_result::error_type::no_error)
+	const std::string eboot_path = locate_eboot_path_ios(game_path);
+	if (eboot_path.empty())
 	{
-		emit_event(ARMSX3_IOS_EVENT_STATUS, "PKG installed");
-		return true;
+		emit_event(ARMSX3_IOS_EVENT_ERROR, "Could not locate this game's EBOOT.BIN");
+		return false;
 	}
-
-	if (result.error == package_install_result::error_type::app_version)
+	fs::file rap(rap_path);
+	std::vector<u8> key;
+	if (!rap || !rap.read(key, 16))
 	{
-		std::string message = "PKG update rejected";
-		if (!result.version.expected.empty())
-			message += fmt::format(": expected {}, installed {}", result.version.expected,
-				result.version.installed.empty() ? "none" : result.version.installed);
-		else
-			message += ": base game is not installed";
-		emit_event(ARMSX3_IOS_EVENT_ERROR, message);
+		emit_event(ARMSX3_IOS_EVENT_ERROR, "Failed to read RAP key");
 		return false;
 	}
 
-	emit_event(ARMSX3_IOS_EVENT_ERROR, "PKG installation failed");
-	return false;
+	SelfAdditionalInfo info;
+	decrypt_self(fs::file(eboot_path), nullptr, &info);
+	NPD_HEADER* npd = nullptr;
+	for (auto& supplemental : info.supplemental_hdr)
+	{
+		if (supplemental.type == 3)
+		{
+			npd = &supplemental.PS3_npdrm_header.npd;
+			break;
+		}
+	}
+	if (!npd || !npd->content_id[0])
+	{
+		emit_event(ARMSX3_IOS_EVENT_ERROR, "Failed to read this game's NPDRM content ID");
+		return false;
+	}
+
+	const std::string user = Emu.GetUsr().empty() ? "00000001" : Emu.GetUsr();
+	const std::string exdata = rpcs3::utils::get_hdd0_dir() + "home/" + user + "/exdata/";
+	if (!fs::create_path(exdata) && fs::g_tls_error != fs::error::exist)
+	{
+		emit_event(ARMSX3_IOS_EVENT_ERROR, "Unable to create PS3 exdata directory");
+		return false;
+	}
+	const std::string destination = fmt::format("{}{}.rap", exdata, npd->content_id);
+	if (!fs::write_file(destination, fs::open_mode::create + fs::open_mode::trunc, key))
+	{
+		emit_event(ARMSX3_IOS_EVENT_ERROR, "Unable to write RAP licence");
+		return false;
+	}
+	if (!decrypt_self(fs::file(eboot_path)))
+	{
+		fs::remove_file(destination);
+		emit_event(ARMSX3_IOS_EVENT_ERROR, "That RAP key is not valid for the selected game");
+		return false;
+	}
+	emit_event(ARMSX3_IOS_EVENT_STATUS, "Licence installed for selected game");
+	return true;
 }
 
 cfg::_base* find_cfg_node_ios(cfg::_base* root, std::string_view path)
@@ -564,7 +980,255 @@ extern "C" bool armsx3_ios_set_performance_overlay_enabled(bool enabled)
 	return true;
 }
 
+extern "C" bool armsx3_ios_set_performance_overlay_live(bool enabled)
+{
+	if (!g_initialized.load(std::memory_order_acquire)) return false;
+	const bool running = !Emu.IsStopped();
+	{
+		std::lock_guard lock(g_lifecycle_mutex);
+		if (!g_cfg.video.perf_overlay.enabled.from_string(enabled ? "true" : "false", running))
+			return false;
+	}
+	if (running)
+		rsx::overlays::reset_performance_overlay();
+	return true;
+}
+
+extern "C" int armsx3_ios_performance_overlay_detail(void)
+{
+	return g_initialized.load(std::memory_order_acquire) ? static_cast<int>(g_cfg.video.perf_overlay.level.get()) : 0;
+}
+
+extern "C" bool armsx3_ios_set_performance_overlay_detail_live(int detail)
+{
+	if (!g_initialized.load(std::memory_order_acquire) || detail < static_cast<int>(detail_level::none) || detail > static_cast<int>(detail_level::high)) return false;
+	const bool running = !Emu.IsStopped();
+	{
+		std::lock_guard lock(g_lifecycle_mutex);
+		g_cfg.video.perf_overlay.level.set(static_cast<detail_level>(detail));
+		g_cfg.video.perf_overlay.enabled.set(detail != static_cast<int>(detail_level::none));
+	}
+	if (running) rsx::overlays::reset_performance_overlay();
+	return true;
+}
+
+extern "C" int armsx3_ios_performance_overlay_position(void)
+{
+	return g_initialized.load(std::memory_order_acquire) ? static_cast<int>(g_cfg.video.perf_overlay.position.get()) : 0;
+}
+
+extern "C" bool armsx3_ios_set_performance_overlay_position(int position)
+{
+	if (!g_initialized.load(std::memory_order_acquire) || position < static_cast<int>(screen_quadrant::top_left) || position > static_cast<int>(screen_quadrant::bottom_right)) return false;
+	const bool running = !Emu.IsStopped();
+	{
+		std::lock_guard lock(g_lifecycle_mutex);
+		g_cfg.video.perf_overlay.position.set(static_cast<screen_quadrant>(position));
+		Emulator::SaveSettings(g_cfg.to_string(), {});
+	}
+	if (running) rsx::overlays::reset_performance_overlay();
+	return true;
+}
+
+extern "C" const char* armsx3_ios_performance_overlay_color(void)
+{
+	static thread_local std::string color;
+	color = g_initialized.load(std::memory_order_acquire) ? g_cfg.video.perf_overlay.color_body.get() : std::string{};
+	return color.c_str();
+}
+
+extern "C" bool armsx3_ios_set_performance_overlay_color(const char* rgba_hex)
+{
+	if (!g_initialized.load(std::memory_order_acquire) || !rgba_hex || rgba_hex[0] != '#' || std::strlen(rgba_hex) != 9) return false;
+	for (const char* p = rgba_hex + 1; *p; ++p) if (!std::isxdigit(static_cast<unsigned char>(*p))) return false;
+	const bool running = !Emu.IsStopped();
+	{
+		std::lock_guard lock(g_lifecycle_mutex);
+		g_cfg.video.perf_overlay.color_body.set(rgba_hex);
+		Emulator::SaveSettings(g_cfg.to_string(), {});
+	}
+	if (running) rsx::overlays::reset_performance_overlay();
+	return true;
+}
+
 } // namespace
+
+extern "C" const char* armsx3_ios_rpcn_get_config(void)
+{
+	g_cfg_rpcn.load();
+	std::string hosts;
+	for (const auto& [desc, addr] : g_cfg_rpcn.get_hosts())
+	{
+		if (!hosts.empty()) hosts += ',';
+		fmt::append(hosts, R"({"desc":"%s","host":"%s"})", rpcn_json_escape_ios(desc), rpcn_json_escape_ios(addr));
+	}
+	g_rpcn_json = fmt::format(
+		R"({"host":"%s","npid":"%s","hasPassword":%s,"hasToken":%s,"ipv6":%s,"hosts":[%s]})",
+		rpcn_json_escape_ios(g_cfg_rpcn.get_host()), rpcn_json_escape_ios(g_cfg_rpcn.get_npid()),
+		g_cfg_rpcn.get_password().empty() ? "false" : "true",
+		g_cfg_rpcn.get_token().empty() ? "false" : "true",
+		g_cfg_rpcn.get_ipv6_support() ? "true" : "false", hosts);
+	return g_rpcn_json.c_str();
+}
+
+extern "C" void armsx3_ios_rpcn_set_config(const char* host, const char* npid, const char* password, const char* token)
+{
+	g_cfg_rpcn.load();
+	if (host && *host) g_cfg_rpcn.set_host(host);
+	if (npid && *npid) g_cfg_rpcn.set_npid(npid);
+	if (password && *password) g_cfg_rpcn.set_password(password);
+	if (token && *token) g_cfg_rpcn.set_token(token);
+	g_cfg_rpcn.save();
+}
+
+extern "C" const char* armsx3_ios_rpcn_status(void)
+{
+	g_cfg_rpcn.load();
+	const std::string npid = g_cfg_rpcn.get_npid();
+	const bool configured = !npid.empty() && !g_cfg_rpcn.get_password().empty();
+	bool connected = false, authenticated = false;
+	std::string online_name;
+	if (const auto client = rpcn::rpcn_client::peek_instance())
+	{
+		connected = client->is_connected();
+		authenticated = client->is_authentified();
+		if (authenticated) online_name = client->get_online_name();
+	}
+	g_rpcn_json = fmt::format(R"({"configured":%s,"npid":"%s","connected":%s,"authentified":%s,"onlineName":"%s"})",
+		configured ? "true" : "false", rpcn_json_escape_ios(npid), connected ? "true" : "false",
+		authenticated ? "true" : "false", rpcn_json_escape_ios(online_name));
+	return g_rpcn_json.c_str();
+}
+
+extern "C" const char* armsx3_ios_rpcn_add_host(const char* desc, const char* host)
+{
+	g_cfg_rpcn.load();
+	const std::string s_desc = desc ? desc : "", s_host = host ? host : "";
+	if (s_desc.empty() || s_host.empty()) return rpcn_fail_ios("A saved server needs both a name and an address.");
+	if (!g_cfg_rpcn.add_host(s_desc, s_host)) return rpcn_fail_ios("That server is already saved.");
+	g_cfg_rpcn.save();
+	return rpcn_ok_ios();
+}
+
+extern "C" const char* armsx3_ios_rpcn_del_host(const char* desc, const char* host)
+{
+	g_cfg_rpcn.load();
+	const std::string s_desc = desc ? desc : "", s_host = host ? host : "";
+	if (s_desc == "Official RPCN Server" && s_host == "np.rpcs3.net") return rpcn_fail_ios("The official server cannot be removed.");
+	if (!g_cfg_rpcn.del_host(s_desc, s_host)) return rpcn_fail_ios("That server is not in the list.");
+	g_cfg_rpcn.save();
+	return rpcn_ok_ios();
+}
+
+extern "C" void armsx3_ios_rpcn_reset_hosts(void)
+{
+	g_cfg_rpcn.load();
+	g_cfg_rpcn.hosts.from_default();
+	g_cfg_rpcn.set_host("np.rpcs3.net");
+	g_cfg_rpcn.save();
+}
+
+extern "C" void armsx3_ios_rpcn_set_ipv6(bool enabled)
+{
+	g_cfg_rpcn.load();
+	g_cfg_rpcn.set_ipv6_support(enabled);
+	g_cfg_rpcn.save();
+}
+
+extern "C" const char* armsx3_ios_rpcn_create_account(const char* npid, const char* password, const char* online_name, const char* email)
+{
+	static constexpr std::string_view avatar = "https://rpcs3.net/cdn/netplay/DefaultAvatar.png";
+	const std::string s_npid = npid ? npid : "", s_pass = password ? password : "", s_name = online_name ? online_name : "", s_email = email ? email : "";
+	return rpcn_with_connection_ios([&](rpcn::rpcn_client& client)
+	{
+		const auto err = client.create_user(s_npid, s_pass, s_name, avatar, s_email);
+		if (err == rpcn::ErrorType::NoError)
+		{
+			g_cfg_rpcn.load(); g_cfg_rpcn.set_npid(s_npid); g_cfg_rpcn.set_password(s_pass); g_cfg_rpcn.save();
+		}
+		return err;
+	});
+}
+
+extern "C" const char* armsx3_ios_rpcn_resend_token(const char* npid, const char* password)
+{
+	const std::string s_npid = npid ? npid : "", s_pass = password ? password : "";
+	return rpcn_with_connection_ios([&](rpcn::rpcn_client& client) { return client.resend_token(s_npid, s_pass); });
+}
+
+extern "C" const char* armsx3_ios_rpcn_send_reset_token(const char* npid, const char* email)
+{
+	const std::string s_npid = npid ? npid : "", s_email = email ? email : "";
+	return rpcn_with_connection_ios([&](rpcn::rpcn_client& client) { return client.send_reset_token(s_npid, s_email); });
+}
+
+extern "C" const char* armsx3_ios_rpcn_reset_password(const char* npid, const char* token, const char* password)
+{
+	const std::string s_npid = npid ? npid : "", s_token = token ? token : "", s_pass = password ? password : "";
+	return rpcn_with_connection_ios([&](rpcn::rpcn_client& client)
+	{
+		const auto err = client.reset_password(s_npid, s_token, s_pass);
+		if (err == rpcn::ErrorType::NoError) { g_cfg_rpcn.load(); g_cfg_rpcn.set_password(s_pass); g_cfg_rpcn.save(); }
+		return err;
+	});
+}
+
+extern "C" const char* armsx3_ios_rpcn_test_login(void)
+{
+	g_cfg_rpcn.load();
+	if (g_cfg_rpcn.get_npid().empty() || g_cfg_rpcn.get_password().empty()) return rpcn_fail_ios("No account set up yet.");
+	const auto client = rpcn::rpcn_client::get_instance(0);
+	if (!client) return rpcn_fail_ios("Could not create the RPCN client.");
+	if (const auto state = client->wait_for_connection(); state != rpcn::rpcn_state::failure_no_failure)
+		return rpcn_fail_ios(fmt::format("Could not reach the RPCN server: %s", rpcn::rpcn_state_to_string(state)));
+	if (const auto state = client->wait_for_authentified(); state != rpcn::rpcn_state::failure_no_failure)
+		return rpcn_fail_ios(fmt::format("Sign-in failed: %s", rpcn::rpcn_state_to_string(state)));
+	return rpcn_ok_ios();
+}
+
+extern "C" const char* armsx3_ios_rpcn_add_friend(const char* npid)
+{
+	const std::string name = npid ? npid : "";
+	if (name.empty()) return rpcn_fail_ios("Enter a username to add.");
+	return rpcn_with_auth_ios([&](rpcn::rpcn_client& client)
+	{
+		const auto err = client.add_friend(name);
+		return !err || *err == rpcn::ErrorType::NoError;
+	});
+}
+
+extern "C" const char* armsx3_ios_rpcn_remove_friend(const char* npid)
+{
+	const std::string name = npid ? npid : "";
+	if (name.empty()) return rpcn_fail_ios("Enter a username to remove.");
+	return rpcn_with_auth_ios([&](rpcn::rpcn_client& client) { return client.remove_friend(name); });
+}
+
+extern "C" const char* armsx3_ios_rpcn_get_friends(void)
+{
+	const auto client = rpcn::rpcn_client::peek_instance();
+	if (!client || !client->is_authentified()) { g_rpcn_json = "[]"; return g_rpcn_json.c_str(); }
+	std::string entries;
+	for (u32 i = 0, count = client->get_num_friends(); i < count; ++i)
+	{
+		const auto presence = client->get_friend_presence_by_index(i);
+		if (!presence) continue;
+		if (!entries.empty()) entries += ',';
+		fmt::append(entries, R"({"npid":"%s","online":%s})", rpcn_json_escape_ios(presence->first), presence->second.online ? "true" : "false");
+	}
+	g_rpcn_json = fmt::format("[%s]", entries);
+	return g_rpcn_json.c_str();
+}
+
+extern "C" const char* armsx3_ios_rpcn_delete_trophies(void)
+{
+	return rpcn_with_connection_ios([&](rpcn::rpcn_client& client) { return client.delete_trophies(); });
+}
+
+extern "C" int armsx3_ios_import_state_to_free_slot(const char* path)
+{
+	return import_state_to_free_slot_ios(path);
+}
 
 extern "C" bool armsx3_ios_settings_editable()
 {
@@ -588,24 +1252,306 @@ extern "C" bool armsx3_ios_set_setting_json(const char* path, const char* json_v
 	if (!path || !*path || !json_value) return false;
 	std::lock_guard lock(g_lifecycle_mutex);
 	if (!g_initialized.load(std::memory_order_acquire) || !Emu.IsStopped(true)) return false;
-
-	cfg::_base* node = find_cfg_node_ios(&g_cfg, path);
-	if (!node || !cfg_is_editable_ios(node) || node->get_type() == cfg::type::node) return false;
-	const std::string decoded = decode_setting_json_value(json_value);
-#if defined(ARCH_ARM64)
-	if (std::string_view(path) == "Core@@SPU Decoder" && decoded == "Recompiler (ASMJIT)") return false;
-#endif
-	if (std::string_view(path) == "Video@@Shader Mode" &&
-		(decoded == "Async Recompiler with Shader Interpreter" || decoded == "Shader Interpreter only"))
-	{
-		// The interpreter requires 64 combined fragment samplers. Apple A-series
-		// Metal exposes only 16 fragment sampler slots, so MoltenVK cannot compile
-		// that ubershader. Keep the iOS configuration on the regular async recompiler.
-		if (!node->from_string("Async Recompiler (multi-threaded)", false)) return false;
-		return save_global_settings_locked();
-	}
-	if (!node->from_string(decoded, false)) return false;
+	if (!apply_setting_value_ios(g_cfg, path, json_value)) return false;
 	return save_global_settings_locked();
+}
+
+extern "C" bool armsx3_ios_set_setting_json_live(const char* path, const char* json_value)
+{
+	if (!path || !*path || !json_value) return false;
+	std::lock_guard lock(g_lifecycle_mutex);
+	if (!g_initialized.load(std::memory_order_acquire) || Emu.IsStopped(true)) return false;
+	if (!apply_setting_value_ios(g_cfg, path, json_value, true)) return false;
+	const bool saved = save_global_settings_locked();
+	if (std::string_view(path).starts_with("Video@@Performance Overlay"))
+		rsx::overlays::reset_performance_overlay();
+	return saved;
+}
+
+extern "C" void armsx3_ios_capture_frame(void)
+{
+	if (g_initialized.load(std::memory_order_acquire) && !Emu.IsStopped(true))
+		g_user_asked_for_frame_capture = true;
+}
+
+extern "C" const char* armsx3_ios_game_info_json(const char* path_raw)
+{
+	const std::string path = path_raw ? path_raw : "";
+	const bool core_ready = g_initialized.load(std::memory_order_acquire);
+	std::string sfo_path;
+	psf::registry archive_sfo;
+	std::string archive_cover_path;
+	if (!path.empty())
+	{
+		for (const std::string& candidate : {path + "/PS3_GAME/PARAM.SFO", path + "/PARAM.SFO"})
+		{
+			if (fs::is_file(candidate))
+			{
+				sfo_path = candidate;
+				break;
+			}
+		}
+
+		// Library entries may be PS3 ISO images. The old iOS frontend only inspected folders,
+		// which left ISO games with an empty serial and no ICON0.PNG. That also disabled the
+		// per-game Settings / Categories / cache actions because those correctly require a
+		// title ID. Read the same PARAM.SFO and ICON0.PNG that RPCS3 boots from the ISO instead
+		// of guessing metadata from the filename.
+		if (sfo_path.empty() && fs::is_file(path))
+		{
+			std::string lower = path;
+			std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+			if (lower.ends_with(".iso"))
+			{
+				iso_archive archive(path);
+				if (archive.is_valid())
+				{
+					archive_sfo = archive.open_psf("PS3_GAME/PARAM.SFO");
+					if (!archive_sfo.empty())
+					{
+						const std::string iso_serial = std::string(psf::get_string(archive_sfo, "TITLE_ID"));
+						if (!iso_serial.empty())
+						{
+							// This function is called by the launcher before the RPCS3 core has necessarily
+							// initialized g_android_cache_dir. Never derive an iOS library-cache path from that
+							// global here: an empty value becomes "/library_icons" and iOS sandbox denial can
+							// trip RPCS3's fs verification path into SIGABRT during app startup.
+							NSArray<NSString *> *cache_dirs = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+							NSString *cache_base = cache_dirs.firstObject;
+							NSString *icon_dir = cache_base.length ? [cache_base stringByAppendingPathComponent:@"ARMSX3/library_icons"] : nil;
+							NSError *mkdir_error = nil;
+							const BOOL cache_ready = icon_dir.length && [[NSFileManager defaultManager] createDirectoryAtPath:icon_dir
+								withIntermediateDirectories:YES attributes:nil error:&mkdir_error];
+							if (cache_ready)
+							{
+								NSString *cover_path = [icon_dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%s.png", iso_serial.c_str()]];
+								archive_cover_path = cover_path.fileSystemRepresentation;
+								if (![[NSFileManager defaultManager] fileExistsAtPath:cover_path])
+								{
+									auto icon = archive.open("PS3_GAME/ICON0.PNG");
+									if (icon && icon->size() > 0 && icon->size() <= 24 * 1024 * 1024)
+									{
+										std::vector<u8> bytes(icon->size());
+										if (icon->read(bytes.data(), bytes.size()) == bytes.size())
+										{
+											NSData *image_data = [NSData dataWithBytes:bytes.data() length:bytes.size()];
+											if (![image_data writeToFile:cover_path options:NSDataWritingAtomic error:nil]) archive_cover_path.clear();
+										}
+									}
+								}
+								if (![[NSFileManager defaultManager] fileExistsAtPath:cover_path]) archive_cover_path.clear();
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	std::string serial;
+	std::string title;
+	std::string title_en;
+	std::string version;
+	std::string category;
+	if (!archive_sfo.empty())
+	{
+		serial = std::string(psf::get_string(archive_sfo, "TITLE_ID"));
+		title = std::string(psf::get_string(archive_sfo, "TITLE"));
+		title_en = std::string(psf::get_string(archive_sfo, "TITLE_01"));
+		version = std::string(psf::get_string(archive_sfo, "APP_VER"));
+		category = std::string(psf::get_string(archive_sfo, "CATEGORY"));
+	}
+	else if (!sfo_path.empty())
+	{
+		if (auto loaded = psf::load(sfo_path); loaded)
+		{
+			serial = std::string(psf::get_string(loaded.sfo, "TITLE_ID"));
+			title = std::string(psf::get_string(loaded.sfo, "TITLE"));
+			title_en = std::string(psf::get_string(loaded.sfo, "TITLE_01"));
+			version = std::string(psf::get_string(loaded.sfo, "APP_VER"));
+			category = std::string(psf::get_string(loaded.sfo, "CATEGORY"));
+		}
+	}
+	if (serial.empty() && !path.empty())
+	{
+		std::string leaf = path;
+		while (!leaf.empty() && (leaf.back() == '/' || leaf.back() == '\\')) leaf.pop_back();
+		const auto slash = leaf.find_last_of("/\\");
+		if (slash != std::string::npos) leaf.erase(0, slash + 1);
+		if (looks_like_title_id_ios(leaf)) serial = leaf;
+	}
+
+	std::string installed_version;
+	u32 dlc_count = 0;
+	if (!serial.empty() && core_ready)
+	{
+		const std::string hdd0 = rpcs3::utils::get_hdd0_dir();
+		const std::string installed_sfo = hdd0 + "game/" + serial + "/PARAM.SFO";
+		if (auto loaded = psf::load(installed_sfo); loaded)
+		{
+			const std::string installed_category = std::string(psf::get_string(loaded.sfo, "CATEGORY"));
+			if (installed_category == "GD") installed_version = std::string(psf::get_string(loaded.sfo, "APP_VER"));
+		}
+
+		std::error_code ec;
+		const std::filesystem::path home(hdd0 + "home");
+		if (std::filesystem::is_directory(home, ec))
+		{
+			for (const auto& user : std::filesystem::directory_iterator(home, ec))
+			{
+				if (ec) break;
+				if (!user.is_directory(ec)) continue;
+				const auto exdata = user.path() / "exdata";
+				if (!std::filesystem::is_directory(exdata, ec)) continue;
+				for (const auto& file : std::filesystem::directory_iterator(exdata, ec))
+				{
+					if (ec) break;
+					if (!file.is_regular_file(ec)) continue;
+					std::string name = file.path().filename().string();
+					std::string lower = name;
+					std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+					std::string serial_lower = serial;
+					std::transform(serial_lower.begin(), serial_lower.end(), serial_lower.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+					if ((lower.ends_with(".rap") || lower.ends_with(".edat")) && lower.find(serial_lower) != std::string::npos) dlc_count++;
+				}
+			}
+		}
+
+		const std::filesystem::path games(hdd0 + "game");
+		if (std::filesystem::is_directory(games, ec))
+		{
+			for (const auto& dir : std::filesystem::directory_iterator(games, ec))
+			{
+				if (ec) break;
+				if (!dir.is_directory(ec) || dir.path().filename().string() == serial) continue;
+				if (auto loaded = psf::load((dir.path() / "PARAM.SFO").string()); loaded)
+				{
+					const std::string id = std::string(psf::get_string(loaded.sfo, "TITLE_ID"));
+					if (id == serial) dlc_count++;
+				}
+			}
+		}
+	}
+
+	g_game_info_json = "{\"serial\":";
+	json_append_escaped_ios(g_game_info_json, serial);
+	g_game_info_json += ",\"title\":";
+	json_append_escaped_ios(g_game_info_json, title);
+	g_game_info_json += ",\"titleEn\":";
+	json_append_escaped_ios(g_game_info_json, title_en);
+	g_game_info_json += ",\"version\":";
+	json_append_escaped_ios(g_game_info_json, version);
+	g_game_info_json += ",\"category\":";
+	json_append_escaped_ios(g_game_info_json, category);
+	g_game_info_json += ",\"coverPath\":";
+	json_append_escaped_ios(g_game_info_json, archive_cover_path);
+	g_game_info_json += ",\"installedVersion\":";
+	json_append_escaped_ios(g_game_info_json, installed_version);
+	g_game_info_json += fmt::format(",\"dlcCount\":{}", dlc_count);
+	g_game_info_json += '}';
+	return g_game_info_json.c_str();
+}
+
+extern "C" const char* armsx3_ios_game_settings_json(const char* serial_raw, const char* path)
+{
+	if (!g_initialized.load(std::memory_order_acquire) || !serial_raw || !*serial_raw) return "";
+	std::lock_guard lock(g_lifecycle_mutex);
+	cfg_root config;
+	if (!load_game_settings_ios(serial_raw, config)) return "";
+	cfg::_base* root = find_cfg_node_ios(&config, path ? std::string_view(path) : std::string_view{});
+	if (!root) return "";
+	g_settings_json.clear();
+	g_settings_json.reserve(64 * 1024);
+	emit_cfg_json_ios(root, g_settings_json);
+	return g_settings_json.c_str();
+}
+
+extern "C" bool armsx3_ios_set_game_setting_json(const char* serial_raw, const char* path, const char* json_value)
+{
+	if (!serial_raw || !*serial_raw || !path || !*path || !json_value) return false;
+	std::lock_guard lock(g_lifecycle_mutex);
+	if (!g_initialized.load(std::memory_order_acquire) || !Emu.IsStopped(true)) return false;
+	cfg_root config;
+	if (!load_game_settings_ios(serial_raw, config)) return false;
+	if (!apply_setting_value_ios(config, path, json_value)) return false;
+	fs::create_path(rpcs3::utils::get_custom_config_dir());
+	Emulator::SaveSettings(config.to_string(), serial_raw);
+	emit_event(ARMSX3_IOS_EVENT_STATUS, "Per-game settings saved");
+	return true;
+}
+
+extern "C" bool armsx3_ios_set_game_setting_json_live(const char* serial_raw, const char* path, const char* json_value)
+{
+	if (!serial_raw || !*serial_raw || !path || !*path || !json_value) return false;
+	std::lock_guard lock(g_lifecycle_mutex);
+	if (!g_initialized.load(std::memory_order_acquire) || Emu.IsStopped(true)) return false;
+	if (!Emu.GetTitleID().empty() && Emu.GetTitleID() != serial_raw) return false;
+
+	cfg_root persisted;
+	if (!load_game_settings_ios(serial_raw, persisted)) return false;
+	if (!apply_setting_value_ios(persisted, path, json_value, false)) return false;
+	fs::create_path(rpcs3::utils::get_custom_config_dir());
+	Emulator::SaveSettings(persisted.to_string(), serial_raw);
+
+	// Dynamic nodes take effect immediately. Restart-only nodes are still persisted to the
+	// current title and intentionally keep their current runtime value until the VM restarts.
+	const bool live_applied = apply_setting_value_ios(g_cfg, path, json_value, true);
+	if (live_applied && std::string_view(path).starts_with("Video@@Performance Overlay"))
+		rsx::overlays::reset_performance_overlay();
+	emit_event(ARMSX3_IOS_EVENT_STATUS, live_applied ? "Per-game setting applied" : "Per-game setting saved; restart required");
+	return true;
+}
+
+extern "C" bool armsx3_ios_reset_game_settings(const char* serial_raw)
+{
+	if (!serial_raw || !*serial_raw) return false;
+	std::lock_guard lock(g_lifecycle_mutex);
+	if (!g_initialized.load(std::memory_order_acquire) || !Emu.IsStopped(true)) return false;
+	const std::string path = rpcs3::utils::get_custom_config_path(serial_raw);
+	if (!fs::is_file(path)) return true;
+	const bool removed = fs::remove_file(path);
+	if (removed) emit_event(ARMSX3_IOS_EVENT_STATUS, "Per-game settings reset");
+	return removed;
+}
+
+extern "C" bool armsx3_ios_reset_global_settings(void)
+{
+	std::lock_guard lock(g_lifecycle_mutex);
+	if (!g_initialized.load(std::memory_order_acquire) || !Emu.IsStopped(true)) return false;
+	g_cfg.from_default();
+#if defined(ARCH_ARM64)
+	// Keep the mobile-safe default used elsewhere in this port rather than exposing
+	// the unsupported ASMJIT SPU backend after a factory reset.
+	if (g_cfg.core.spu_decoder.to_string() == "Recompiler (ASMJIT)")
+		g_cfg.core.spu_decoder.from_string("Recompiler (LLVM)", false);
+#endif
+	return save_global_settings_locked();
+}
+
+extern "C" const char* armsx3_ios_game_config_text(const char* serial_raw)
+{
+	if (!serial_raw || !*serial_raw) return "";
+	std::lock_guard lock(g_lifecycle_mutex);
+	const std::string path = rpcs3::utils::get_custom_config_path(serial_raw);
+	if (fs::file file{path}; file) g_game_config_text = file.to_string();
+	else g_game_config_text.clear();
+	return g_game_config_text.c_str();
+}
+
+extern "C" bool armsx3_ios_import_game_config_text(const char* serial_raw, const char* text_raw)
+{
+	if (!serial_raw || !*serial_raw || !text_raw || !*text_raw) return false;
+	std::lock_guard lock(g_lifecycle_mutex);
+	if (!g_initialized.load(std::memory_order_acquire) || !Emu.IsStopped(true)) return false;
+	cfg_root config;
+	config.from_default();
+	const std::string global_path = fs::get_config_dir(true) + "config.yml";
+	if (fs::file global{global_path}; global && !config.from_string(global.to_string())) return false;
+	if (!config.from_string(text_raw)) return false;
+	fs::create_path(rpcs3::utils::get_custom_config_dir());
+	Emulator::SaveSettings(config.to_string(), serial_raw);
+	emit_event(ARMSX3_IOS_EVENT_STATUS, "Per-game configuration imported");
+	return true;
 }
 
 namespace
@@ -640,7 +1586,24 @@ public:
 	void delete_context(draw_context_t) override {}
 	draw_context_t make_context() override { return nullptr; }
 	void set_current(draw_context_t) override {}
-	void flip(draw_context_t, bool) override {}
+	void flip(draw_context_t, bool) override
+	{
+		const u64 now = get_system_time();
+		u64 start = g_live_fps_window_start.load(std::memory_order_relaxed);
+		if (!start)
+		{
+			g_live_fps_window_start.compare_exchange_strong(start, now, std::memory_order_relaxed);
+			start = g_live_fps_window_start.load(std::memory_order_relaxed);
+		}
+		const u64 frames = g_live_fps_frames.fetch_add(1, std::memory_order_relaxed) + 1;
+		const u64 elapsed = now > start ? now - start : 0;
+		if (elapsed >= 500'000)
+		{
+			g_live_fps.store(static_cast<double>(frames) * 1'000'000.0 / static_cast<double>(elapsed), std::memory_order_relaxed);
+			g_live_fps_frames.store(0, std::memory_order_relaxed);
+			g_live_fps_window_start.store(now, std::memory_order_relaxed);
+		}
+	}
 	int client_width() override { return std::max(1, g_surface_width.load()); }
 	int client_height() override { return std::max(1, g_surface_height.load()); }
 	f64 client_display_rate() override { return g_refresh_rate.load(); }
@@ -664,8 +1627,10 @@ public:
 		}
 		CGColorSpaceRef color_space = CGColorSpaceCreateDeviceRGB();
 		CGDataProviderRef provider = CGDataProviderCreateWithCFData((__bridge CFDataRef)rgba);
+		const CGBitmapInfo bitmap_info = static_cast<CGBitmapInfo>(static_cast<uint32_t>(kCGImageAlphaLast) |
+			static_cast<uint32_t>(kCGBitmapByteOrder32Big));
 		CGImageRef cg = CGImageCreate(width, height, 8, 32, width * 4, color_space,
-			static_cast<CGBitmapInfo>(kCGImageAlphaLast | kCGBitmapByteOrder32Big), provider, nullptr, false, kCGRenderingIntentDefault);
+			bitmap_info, provider, nullptr, false, kCGRenderingIntentDefault);
 		UIImage *image = cg ? [UIImage imageWithCGImage:cg] : nil;
 		NSData *png = image ? UIImagePNGRepresentation(image) : nil;
 		if (cg) CGImageRelease(cg);
@@ -955,7 +1920,19 @@ void set_callbacks()
 	callbacks.check_microphone_permissions = [] {};
 	callbacks.make_video_source = [] { return std::unique_ptr<video_source>{}; };
 	callbacks.enable_gamemode = [](bool) {};
-	callbacks.get_database_config = [](const std::string&) { return std::string{}; };
+	callbacks.get_database_config = [](const std::string& serial)
+	{
+		if (serial.empty()) return std::string{};
+		const std::string path = g_android_config_dir + "config_db/" + serial + ".yml";
+		if (fs::file file{path}; file) return file.to_string();
+		std::string upper = serial;
+		std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
+		if (upper != serial)
+		{
+			if (fs::file file{g_android_config_dir + "config_db/" + upper + ".yml"}; file) return file.to_string();
+		}
+		return std::string{};
+	};
 	Emu.SetCallbacks(std::move(callbacks));
 }
 } // namespace
@@ -1002,6 +1979,21 @@ extern "C" bool armsx3_ios_initialize(const char* root_dir, void* metal_view,
 	g_android_cache_dir = root + "cache/";
 	std::filesystem::create_directories(g_android_config_dir);
 	std::filesystem::create_directories(g_android_cache_dir);
+
+	// Keep RPCS3 configuration files under <root>/config/, but dev_hdd0 itself belongs beside
+	// that directory. The first iOS frontend used <root>/dev_hdd0 while RPCS3's default VFS
+	// silently expanded $(EmulatorDir) from fs::get_config_dir() to <root>/config/dev_hdd0.
+	// That split made PKG-installed launchers invisible to the library and made manually copied
+	// HDD content visible to the UI but absent from the emulated /dev_hdd0. Merge any content
+	// created by those builds, then persist an explicit absolute dev_hdd0 mapping BEFORE Emu.Init
+	// loads/mounts the VFS table.
+	const std::string hdd0_root = root + "dev_hdd0/";
+	merge_legacy_vfs_tree_ios(std::filesystem::path(g_android_config_dir) / "dev_hdd0",
+		std::filesystem::path(hdd0_root));
+	g_cfg_vfs.load();
+	g_cfg_vfs.dev_hdd0.set(hdd0_root);
+	g_cfg_vfs.save();
+	armsx3_ios_diagnostic_log(fmt::format("iOS VFS dev_hdd0=%s", hdd0_root).c_str());
 
 	std::string logs_dir = root + "logs/";
 	if (const char* documents = std::getenv("ARMSX3_DOCUMENTS_DIR"); documents && *documents)
@@ -1246,6 +2238,36 @@ extern "C" bool armsx3_ios_stop()
 	return stopped;
 }
 extern "C" int armsx3_ios_state() { return static_cast<int>(Emu.GetStatus(false)); }
+extern "C" bool armsx3_ios_game_active() { return Emu.IsRunning() || Emu.IsPaused(); }
+extern "C" bool armsx3_ios_is_paused() { return Emu.IsPaused(); }
+extern "C" const char* armsx3_ios_current_title()
+{
+	static thread_local std::string title;
+	title = Emu.GetTitle();
+	if (title.empty()) title = Emu.GetTitleID();
+	return title.c_str();
+}
+extern "C" const char* armsx3_ios_current_title_id()
+{
+	static thread_local std::string title_id;
+	title_id = Emu.GetTitleID();
+	return title_id.c_str();
+}
+extern "C" const char* armsx3_ios_current_trophy_name()
+{
+	static thread_local std::string trophy_name;
+	trophy_name.clear();
+	if (auto* current = g_fxo->try_get<current_trophy_name>())
+	{
+		std::lock_guard lock(current->mtx);
+		trophy_name = current->name;
+	}
+	return trophy_name.c_str();
+}
+extern "C" double armsx3_ios_current_fps()
+{
+	return armsx3_ios_game_active() ? g_live_fps.load(std::memory_order_relaxed) : 0.0;
+}
 
 extern "C" bool armsx3_ios_save_state_slot(unsigned int slot, bool resume_after_save)
 {
@@ -1309,6 +2331,24 @@ extern "C" bool armsx3_ios_restart()
 		Emu.SetContinuousMode(true);
 		Emu.Restart(true);
 	});
+	return true;
+}
+
+extern "C" bool armsx3_ios_swap_disc(const char* path)
+{
+	if (!path || !*path || (!Emu.IsRunning() && !Emu.IsPaused())) return false;
+	const std::string disc_path(path);
+	const bool was_paused = Emu.IsPaused();
+	if (was_paused) Emu.Resume();
+	Emu.EjectDisc();
+	const game_boot_result result = Emu.InsertDisc(disc_path);
+	if (was_paused) Emu.Pause(false, false);
+	if (result != game_boot_result::no_errors)
+	{
+		emit_event(ARMSX3_IOS_EVENT_ERROR, fmt::format("Disc swap failed ({})", static_cast<int>(result)));
+		return false;
+	}
+	emit_event(ARMSX3_IOS_EVENT_STATUS, "Disc changed");
 	return true;
 }
 

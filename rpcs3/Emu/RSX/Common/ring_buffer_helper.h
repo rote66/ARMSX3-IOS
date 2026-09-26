@@ -66,6 +66,12 @@ namespace rsx
 			return false;
 		}
 
+		// Optional backend hook that runs BEFORE a range is reserved. A backend may use this to
+		// submit work that references older ring ranges. It must run before m_put_pos advances:
+		// snapshots taken after allocation would incorrectly treat the newly reserved (but not
+		// yet recorded) range as GPU-complete.
+		virtual void prepare_alloc(usz /*size*/) {}
+
 		usz m_size;
 		usz m_put_pos;                 // Start of free space
 		usz m_get_pos;                 // End of free space
@@ -94,6 +100,7 @@ namespace rsx
 		usz alloc(usz size)
 		{
 			const usz alloc_size = utils::align(size, Alignment);
+			prepare_alloc(alloc_size);
 			const usz aligned_put_pos = utils::align(m_put_pos, Alignment);
 
 			if (!can_alloc<Alignment>(size) && !grow(alloc_size))
@@ -121,6 +128,7 @@ namespace rsx
 		{
 			static_assert((Size & (Alignment - 1)) == 0);
 			ensure((m_put_pos & (Alignment - 1)) == 0);
+			prepare_alloc(Size);
 
 			if (!can_alloc_impl(m_put_pos, Size) && !grow(Size))
 			{
@@ -158,7 +166,8 @@ namespace rsx
 			m_get_pos = get_current_put_pos_minus_one();
 		}
 
-		// Updates the current_allocated_size metrics
+		// Existing heap-manager notification hook. Keep this no-op API separate from
+		// prepare_alloc(), which runs before a range is reserved for iOS async submission.
 		inline void notify()
 		{
 			// @unused

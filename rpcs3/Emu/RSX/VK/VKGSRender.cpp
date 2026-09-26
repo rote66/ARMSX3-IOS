@@ -1758,6 +1758,16 @@ void VKGSRender::retire_completed_work()
 	flush_command_queue(true);
 }
 
+void VKGSRender::submit_ring_memory_work()
+{
+	// Do not wait here. A full streaming ring is usually a submission/back-pressure problem,
+	// not a reason to stop the GPU. Submit what we have, switch to the next CB, then poll every
+	// previously submitted fence with timeout=0. command_buffer_chunk::poke() restores that
+	// CB's heap snapshot as soon as its fence is signalled.
+	flush_command_queue(false);
+	m_primary_cb_list.poke_all();
+}
+
 void VKGSRender::flush_command_queue(bool hard_sync, bool do_not_switch)
 {
 	if (rsx::prof::enabled()) [[unlikely]] rsx::prof::g_flush_sites[4]++; close_and_submit_command_buffer();

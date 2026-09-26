@@ -36,9 +36,11 @@ namespace vk
 		std::vector<VkBufferCopy> dirty_ranges;
 
 		mutable utils::address_range64 m_cached_buffer_range{};
+		usz m_ios_bytes_since_submit = 0;
 
 	protected:
 		bool grow(usz size) override;
+		void prepare_alloc(usz size) override;
 		bool can_allocate_heap(const vk::memory_type_info& target_heap, usz size, int max_usage_percent);
 
 		void* map_impl(usz offset, usz size);
