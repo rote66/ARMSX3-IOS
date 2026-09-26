@@ -1,12 +1,23 @@
 #import "ARMSX3FrontendViewController.h"
 #import "ARMSX3LibraryManagers.h"
+#import "ARMSX3ControllerMappings.h"
 #import "ARMSX3Localization.h"
+#import "ARMSX3NewsViewController.h"
+#import "ARMSX3AboutViewController.h"
+#import "ARMSX3FirmwareViewController.h"
+#import "ARMSX3TrophiesViewController.h"
+#import "ARMSX3LibraryMetadata.h"
+#import "ARMSX3AppPreferences.h"
 
 #import <GameController/GameController.h>
+#import <ImageIO/ImageIO.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 #include <unistd.h>
 
 #include "armsx3_ios_core.h"
+
+static NSString *const ARMSX3LibraryCategoriesKey = @"library.categories";
 
 static UIColor *ARMSX3Color(uint32_t rgb)
 {
@@ -15,14 +26,84 @@ static UIColor *ARMSX3Color(uint32_t rgb)
                             blue:(rgb & 0xff) / 255.0 alpha:1.0];
 }
 
-static UIColor *ARMSX3BackgroundColor(void) { return ARMSX3Color(0x120E1B); }
-static UIColor *ARMSX3SurfaceColor(void) { return ARMSX3Color(0x171223); }
-static UIColor *ARMSX3RaisedColor(void) { return ARMSX3Color(0x221A33); }
-static UIColor *ARMSX3OutlineColor(void) { return ARMSX3Color(0x3A3050); }
-static UIColor *ARMSX3AccentColor(void) { return ARMSX3Color(0xC7A6FF); }
-static UIColor *ARMSX3AccentContainerColor(void) { return ARMSX3Color(0x3A2A63); }
-static UIColor *ARMSX3TextColor(void) { return ARMSX3Color(0xF2ECFF); }
-static UIColor *ARMSX3MutedTextColor(void) { return ARMSX3Color(0xB9ACC9); }
+static NSMutableDictionary<NSString *, NSMutableArray<NSString *> *> *ARMSX3LoadCategories(void)
+{
+    NSDictionary *stored = [NSUserDefaults.standardUserDefaults dictionaryForKey:ARMSX3LibraryCategoriesKey];
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    for (NSString *name in stored)
+    {
+        NSArray *members = [stored[name] isKindOfClass:NSArray.class] ? stored[name] : @[];
+        result[name] = [members mutableCopy];
+    }
+    return result;
+}
+
+static void ARMSX3SaveCategories(NSDictionary *categories)
+{
+    [NSUserDefaults.standardUserDefaults setObject:categories forKey:ARMSX3LibraryCategoriesKey];
+}
+
+static UIImage *ARMSX3AnimatedImageAtURL(NSURL *url)
+{
+    if (!url) return nil;
+    CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)url, nullptr);
+    if (!source) return [UIImage imageWithContentsOfFile:url.path];
+    const size_t count = CGImageSourceGetCount(source);
+    if (count <= 1)
+    {
+        CGImageRef cg = CGImageSourceCreateImageAtIndex(source, 0, nullptr);
+        UIImage *image = cg ? [UIImage imageWithCGImage:cg] : nil;
+        if (cg) CGImageRelease(cg);
+        CFRelease(source);
+        return image;
+    }
+    NSMutableArray<UIImage *> *frames = [NSMutableArray arrayWithCapacity:count];
+    NSTimeInterval duration = 0;
+    for (size_t i = 0; i < count; ++i)
+    {
+        CGImageRef cg = CGImageSourceCreateImageAtIndex(source, i, nullptr);
+        if (cg) { [frames addObject:[UIImage imageWithCGImage:cg]]; CGImageRelease(cg); }
+        NSDictionary *properties = CFBridgingRelease(CGImageSourceCopyPropertiesAtIndex(source, i, nullptr));
+        NSDictionary *gif = properties[(NSString *)kCGImagePropertyGIFDictionary];
+        NSDictionary *webp = properties[@"{WebP}"];
+        NSNumber *delay = gif[(NSString *)kCGImagePropertyGIFUnclampedDelayTime] ?: gif[(NSString *)kCGImagePropertyGIFDelayTime] ?: webp[@"DelayTime"];
+        duration += MAX(0.02, delay.doubleValue ?: 0.10);
+    }
+    CFRelease(source);
+    return frames.count ? [UIImage animatedImageWithImages:frames duration:MAX(duration, frames.count * 0.02)] : nil;
+}
+
+static UIColor *ARMSX3BackgroundColor(void) { return ARMSX3AppBackgroundColor(); }
+static UIColor *ARMSX3SurfaceColor(void) { return ARMSX3AppSurfaceColor(); }
+static UIColor *ARMSX3RaisedColor(void) { return ARMSX3AppRaisedColor(); }
+static UIColor *ARMSX3OutlineColor(void) { return ARMSX3AppOutlineColor(); }
+static UIColor *ARMSX3AccentColor(void) { return ARMSX3AppAccentColor(); }
+static UIColor *ARMSX3AccentContainerColor(void) { return ARMSX3AppAccentContainerColor(); }
+static UIColor *ARMSX3TextColor(void) { return ARMSX3AppTextColor(); }
+static UIColor *ARMSX3MutedTextColor(void) { return ARMSX3AppMutedTextColor(); }
+
+static NSString *const ARMSX3LibraryAppearanceDidChangeNotification = @"ARMSX3LibraryAppearanceDidChangeNotification";
+static NSString *const ARMSX3LibraryShowSearchKey = @"ARMSX3.Library.ShowSearch";
+static NSString *const ARMSX3LibraryShowRecentsKey = @"ARMSX3.Library.ShowRecents";
+static NSString *const ARMSX3LibraryShowGridNamesKey = @"ARMSX3.Library.ShowGridNames";
+static NSString *const ARMSX3LibraryCoverScaleKey = @"ARMSX3.Library.CoverScalePercent";
+static NSString *const ARMSX3LibraryOpacityKey = @"ARMSX3.Library.OpacityPercent";
+static NSString *const ARMSX3LibrarySortKey = @"ARMSX3.Library.Sort";
+static NSString *const ARMSX3LibraryCustomNamesEnabledKey = @"library.customNames";
+static NSString *const ARMSX3LibraryEnglishTitlesKey = @"library.englishTitles";
+static NSString *const ARMSX3LibraryCategoryFilterKey = @"library.categoryFilter";
+
+static BOOL ARMSX3LibraryBool(NSString *key, BOOL fallback)
+{
+    id value = [NSUserDefaults.standardUserDefaults objectForKey:key];
+    return value ? [value boolValue] : fallback;
+}
+
+static NSInteger ARMSX3LibraryInteger(NSString *key, NSInteger fallback)
+{
+    id value = [NSUserDefaults.standardUserDefaults objectForKey:key];
+    return value ? [value integerValue] : fallback;
+}
 
 typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
 {
@@ -102,7 +183,7 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
 }
 @end
 
-@interface ARMSX3FrontendViewController () <UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchBarDelegate>
+@interface ARMSX3FrontendViewController () <UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchBarDelegate, UIDocumentPickerDelegate>
 @end
 
 @implementation ARMSX3FrontendViewController
@@ -116,18 +197,36 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
     UICollectionView *_collectionView;
     UIScrollView *_recentScroll;
     UIStackView *_recentStack;
+    UILabel *_recentTitle;
     UILabel *_subtitleLabel;
     UILabel *_emptyLabel;
     UISearchBar *_searchBar;
     NSLayoutConstraint *_searchHeightConstraint;
     UIButton *_layoutButton;
+    UIButton *_searchButton;
+    NSLayoutConstraint *_recentHeightConstraint;
     UIView *_drawerScrim;
     UIView *_drawerPanel;
     UIStackView *_drawerStack;
     CAGradientLayer *_backgroundGradient;
+    UIImageView *_customBackgroundView;
+    UIView *_backgroundGlow;
+    UIView *_topBar;
+    NSLayoutConstraint *_topBarTopConstraint;
+    NSLayoutConstraint *_topBarBottomConstraint;
+    NSLayoutConstraint *_searchTopFromBarConstraint;
+    NSLayoutConstraint *_searchTopFromSafeConstraint;
+    NSLayoutConstraint *_collectionBottomViewConstraint;
+    NSLayoutConstraint *_collectionBottomBarConstraint;
     ARMSX3LibraryLayout _layoutMode;
     BOOL _showHidden;
     BOOL _coreReady;
+    id _appearanceObserver;
+    id _metadataObserver;
+    id _gameFoldersObserver;
+    NSTimer *_rgbAppearanceTimer;
+    BOOL _pickingLibraryBackground;
+    NSDictionary *_licenceGame;
 }
 
 - (instancetype)initWithHost:(id<ARMSX3FrontendHost>)host documentsPath:(NSString *)documentsPath
@@ -150,6 +249,14 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
     return self;
 }
 
+- (void)dealloc
+{
+    if (_appearanceObserver) [NSNotificationCenter.defaultCenter removeObserver:_appearanceObserver];
+    if (_metadataObserver) [NSNotificationCenter.defaultCenter removeObserver:_metadataObserver];
+    if (_gameFoldersObserver) [NSNotificationCenter.defaultCenter removeObserver:_gameFoldersObserver];
+    [_rgbAppearanceTimer invalidate];
+}
+
 - (void)viewDidLoad
 {
     [super viewDidLoad];
@@ -157,6 +264,20 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
     [self buildBackground];
     [self buildLibrary];
     [self buildDrawer];
+    __weak typeof(self) weakSelf = self;
+    _appearanceObserver = [NSNotificationCenter.defaultCenter addObserverForName:ARMSX3LibraryAppearanceDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
+        [weakSelf applyLibraryAppearance];
+    }];
+    _metadataObserver = [NSNotificationCenter.defaultCenter addObserverForName:ARMSX3LibraryMetadataDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
+        [weakSelf reloadLibrary];
+    }];
+    _gameFoldersObserver = [NSNotificationCenter.defaultCenter addObserverForName:ARMSX3GameFoldersDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
+        [weakSelf reloadLibrary];
+    }];
+    _rgbAppearanceTimer = [NSTimer scheduledTimerWithTimeInterval:0.35 repeats:YES block:^(__unused NSTimer *timer) {
+        if ([ARMSX3CurrentThemeName().lowercaseString isEqualToString:@"rgb"] || ARMSX3LibraryBackgroundRGBCycle()) [weakSelf applyLibraryAppearance];
+    }];
+    [self applyLibraryAppearance];
     [self reloadLibrary];
 }
 
@@ -171,29 +292,113 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
 - (void)buildBackground
 {
     _backgroundGradient = [CAGradientLayer layer];
-    _backgroundGradient.colors = @[
-        (id)ARMSX3Color(0x0B0712).CGColor,
-        (id)ARMSX3Color(0x1C1130).CGColor,
-        (id)ARMSX3Color(0x271741).CGColor,
-        (id)ARMSX3Color(0x120E1B).CGColor,
-    ];
-    _backgroundGradient.locations = @[@0.0, @0.34, @0.72, @1.0];
+    NSMutableArray *gradientColors = [NSMutableArray array];
+    for (UIColor *color in ARMSX3LibraryGradientColors()) [gradientColors addObject:(id)color.CGColor];
+    _backgroundGradient.colors = gradientColors;
+    _backgroundGradient.locations = gradientColors.count == 2 ? @[@0.0, @1.0] : @[@0.0, @0.34, @0.72, @1.0];
     _backgroundGradient.startPoint = CGPointMake(0.05, 0.0);
     _backgroundGradient.endPoint = CGPointMake(0.95, 1.0);
     [self.view.layer addSublayer:_backgroundGradient];
 
-    UIView *glow = [[UIView alloc] init];
-    glow.translatesAutoresizingMaskIntoConstraints = NO;
-    glow.userInteractionEnabled = NO;
-    glow.backgroundColor = [ARMSX3AccentColor() colorWithAlphaComponent:0.055];
-    glow.layer.cornerRadius = 180;
-    [self.view addSubview:glow];
+    _customBackgroundView = [[UIImageView alloc] init];
+    _customBackgroundView.translatesAutoresizingMaskIntoConstraints = NO;
+    _customBackgroundView.userInteractionEnabled = NO;
+    _customBackgroundView.contentMode = UIViewContentModeScaleAspectFill;
+    _customBackgroundView.clipsToBounds = YES;
+    [self.view addSubview:_customBackgroundView];
     [NSLayoutConstraint activateConstraints:@[
-        [glow.widthAnchor constraintEqualToConstant:360],
-        [glow.heightAnchor constraintEqualToConstant:360],
-        [glow.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:120],
-        [glow.topAnchor constraintEqualToAnchor:self.view.topAnchor constant:80],
+        [_customBackgroundView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [_customBackgroundView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [_customBackgroundView.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [_customBackgroundView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
     ]];
+
+    _backgroundGlow = [[UIView alloc] init];
+    _backgroundGlow.translatesAutoresizingMaskIntoConstraints = NO;
+    _backgroundGlow.userInteractionEnabled = NO;
+    _backgroundGlow.backgroundColor = [ARMSX3AccentColor() colorWithAlphaComponent:0.055];
+    _backgroundGlow.layer.cornerRadius = 180;
+    [self.view addSubview:_backgroundGlow];
+    [NSLayoutConstraint activateConstraints:@[
+        [_backgroundGlow.widthAnchor constraintEqualToConstant:360],
+        [_backgroundGlow.heightAnchor constraintEqualToConstant:360],
+        [_backgroundGlow.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:120],
+        [_backgroundGlow.topAnchor constraintEqualToAnchor:self.view.topAnchor constant:80],
+    ]];
+}
+
+- (void)applyLibraryAppearance
+{
+    self.view.backgroundColor = ARMSX3BackgroundColor();
+    NSURL *customBackground = ARMSX3LibraryCustomBackgroundURL();
+    _customBackgroundView.image = ARMSX3AnimatedImageAtURL(customBackground);
+    _customBackgroundView.hidden = customBackground == nil;
+    _backgroundGradient.hidden = customBackground != nil;
+    _backgroundGlow.hidden = customBackground != nil;
+    NSMutableArray *gradientColors = [NSMutableArray array];
+    for (UIColor *color in ARMSX3LibraryGradientColors()) [gradientColors addObject:(id)color.CGColor];
+    _backgroundGradient.colors = gradientColors;
+    _backgroundGradient.locations = gradientColors.count == 2 ? @[@0.0, @1.0] : @[@0.0, @0.34, @0.72, @1.0];
+    [_backgroundGradient removeAnimationForKey:@"ARMSX3Saver"];
+    if (ARMSX3LibrarySaverEnabled())
+    {
+        NSInteger kind = ARMSX3LibrarySaverKind();
+        NSArray<NSNumber *> *durations = @[@8.0, @5.2, @3.8, @6.4, @2.8, @4.6, @7.2];
+        CABasicAnimation *animation = [CABasicAnimation animationWithKeyPath:@"endPoint"];
+        animation.fromValue = [NSValue valueWithCGPoint:CGPointMake(0.15 + kind * 0.03, 0.1)];
+        animation.toValue = [NSValue valueWithCGPoint:CGPointMake(0.85 - kind * 0.025, 0.95)];
+        animation.duration = durations[MIN(6, MAX(0, kind))].doubleValue;
+        animation.autoreverses = YES;
+        animation.repeatCount = HUGE_VALF;
+        [_backgroundGradient addAnimation:animation forKey:@"ARMSX3Saver"];
+    }
+    _backgroundGlow.backgroundColor = [ARMSX3AccentColor() colorWithAlphaComponent:0.055];
+    _topBar.backgroundColor = [ARMSX3LibraryBarColor() colorWithAlphaComponent:0.96];
+    _topBar.layer.borderColor = [ARMSX3OutlineColor() colorWithAlphaComponent:0.72].CGColor;
+    for (UIView *view in _topBar.subviews)
+    {
+        if ([view isKindOfClass:UIButton.class])
+        {
+            UIButton *button = (UIButton *)view;
+            button.tintColor = ARMSX3TextColor();
+            button.backgroundColor = [ARMSX3RaisedColor() colorWithAlphaComponent:0.78];
+            button.layer.borderColor = [ARMSX3OutlineColor() colorWithAlphaComponent:0.6].CGColor;
+        }
+        else if ([view isKindOfClass:UILabel.class]) ((UILabel *)view).textColor = view == _subtitleLabel ? ARMSX3MutedTextColor() : ARMSX3TextColor();
+    }
+    _searchBar.tintColor = ARMSX3AccentColor();
+    _searchBar.searchTextField.textColor = ARMSX3TextColor();
+    _searchBar.searchTextField.backgroundColor = [ARMSX3RaisedColor() colorWithAlphaComponent:0.92];
+    _recentTitle.textColor = ARMSX3TextColor();
+    _emptyLabel.textColor = ARMSX3MutedTextColor();
+    _drawerPanel.backgroundColor = ARMSX3SurfaceColor();
+    _drawerPanel.layer.borderColor = [ARMSX3OutlineColor() colorWithAlphaComponent:0.72].CGColor;
+
+    BOOL bottom = ARMSX3ToolbarAtBottom();
+    _topBarTopConstraint.active = !bottom;
+    _topBarBottomConstraint.active = bottom;
+    _searchTopFromBarConstraint.active = !bottom;
+    _searchTopFromSafeConstraint.active = bottom;
+    _collectionBottomViewConstraint.active = !bottom;
+    _collectionBottomBarConstraint.active = bottom;
+
+    BOOL showSearch = ARMSX3LibraryBool(ARMSX3LibraryShowSearchKey, YES);
+    BOOL showRecents = ARMSX3LibraryBool(ARMSX3LibraryShowRecentsKey, YES);
+    _searchButton.hidden = !showSearch;
+    if (!showSearch && _searchHeightConstraint.constant > 0)
+    {
+        _searchHeightConstraint.constant = 0;
+        _searchBar.alpha = 0;
+        _searchBar.text = @"";
+        [_searchBar resignFirstResponder];
+        [self applyLibraryFilter];
+    }
+    _recentTitle.hidden = !showRecents;
+    _recentHeightConstraint.constant = showRecents ? 128 : 0;
+    [self reloadRecents];
+    [_collectionView.collectionViewLayout invalidateLayout];
+    [_collectionView reloadData];
+    [UIView animateWithDuration:0.18 animations:^{ [self.view layoutIfNeeded]; }];
 }
 
 - (UIButton *)roundButton:(NSString *)symbol accessibility:(NSString *)accessibility action:(SEL)action
@@ -219,7 +424,7 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
 
 - (void)buildLibrary
 {
-    UIView *topBar = [[UIView alloc] init];
+    UIView *topBar = _topBar = [[UIView alloc] init];
     topBar.translatesAutoresizingMaskIntoConstraints = NO;
     topBar.backgroundColor = [ARMSX3SurfaceColor() colorWithAlphaComponent:0.96];
     topBar.layer.cornerRadius = 26;
@@ -232,12 +437,12 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
     [self.view addSubview:topBar];
 
     UIButton *menu = [self roundButton:@"line.3.horizontal" accessibility:@"Navigation" action:@selector(showDrawer)];
-    UIButton *search = [self roundButton:@"magnifyingglass" accessibility:@"Search library" action:@selector(toggleSearch)];
+    _searchButton = [self roundButton:@"magnifyingglass" accessibility:@"Search library" action:@selector(toggleSearch)];
     UIButton *refresh = [self roundButton:@"arrow.clockwise" accessibility:@"Refresh library" action:@selector(reloadLibrary)];
     _layoutButton = [self roundButton:@"rectangle.grid.2x2" accessibility:@"Change library layout" action:@selector(toggleLayout)];
     UIButton *more = [self roundButton:@"ellipsis" accessibility:@"More" action:@selector(showMoreMenu:)];
     [topBar addSubview:menu];
-    [topBar addSubview:search];
+    [topBar addSubview:_searchButton];
     [topBar addSubview:refresh];
     [topBar addSubview:_layoutButton];
     [topBar addSubview:more];
@@ -270,12 +475,12 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
     _searchHeightConstraint = [_searchBar.heightAnchor constraintEqualToConstant:0];
     _searchHeightConstraint.active = YES;
 
-    UILabel *recentTitle = [[UILabel alloc] init];
-    recentTitle.translatesAutoresizingMaskIntoConstraints = NO;
-    recentTitle.text = ARMSX3L(@"games.section.recentlyPlayed", @"Recently Played");
-    recentTitle.textColor = ARMSX3TextColor();
-    recentTitle.font = [UIFont systemFontOfSize:20 weight:UIFontWeightSemibold];
-    [self.view addSubview:recentTitle];
+    _recentTitle = [[UILabel alloc] init];
+    _recentTitle.translatesAutoresizingMaskIntoConstraints = NO;
+    _recentTitle.text = ARMSX3L(@"games.section.recentlyPlayed", @"Recently Played");
+    _recentTitle.textColor = ARMSX3TextColor();
+    _recentTitle.font = [UIFont systemFontOfSize:20 weight:UIFontWeightSemibold];
+    [self.view addSubview:_recentTitle];
 
     _recentScroll = [[UIScrollView alloc] init];
     _recentScroll.translatesAutoresizingMaskIntoConstraints = NO;
@@ -287,6 +492,8 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
     _recentStack.spacing = 10;
     _recentStack.alignment = UIStackViewAlignmentTop;
     [_recentScroll addSubview:_recentStack];
+    _recentHeightConstraint = [_recentScroll.heightAnchor constraintEqualToConstant:128];
+    _recentHeightConstraint.active = YES;
 
     UILabel *allTitle = [[UILabel alloc] init];
     allTitle.translatesAutoresizingMaskIntoConstraints = NO;
@@ -318,10 +525,15 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
     [self.view addSubview:_emptyLabel];
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+    _topBarTopConstraint = [topBar.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8];
+    _topBarBottomConstraint = [topBar.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-8];
+    _searchTopFromBarConstraint = [_searchBar.topAnchor constraintEqualToAnchor:topBar.bottomAnchor constant:2];
+    _searchTopFromSafeConstraint = [_searchBar.topAnchor constraintEqualToAnchor:safe.topAnchor constant:4];
+    _collectionBottomViewConstraint = [_collectionView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor];
+    _collectionBottomBarConstraint = [_collectionView.bottomAnchor constraintEqualToAnchor:topBar.topAnchor constant:-8];
     [NSLayoutConstraint activateConstraints:@[
         [topBar.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:8],
         [topBar.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-8],
-        [topBar.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8],
         [topBar.heightAnchor constraintEqualToConstant:76],
         [menu.leadingAnchor constraintEqualToAnchor:topBar.leadingAnchor constant:10],
         [menu.centerYAnchor constraintEqualToAnchor:topBar.centerYAnchor],
@@ -335,17 +547,15 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
         [_layoutButton.centerYAnchor constraintEqualToAnchor:topBar.centerYAnchor],
         [refresh.trailingAnchor constraintEqualToAnchor:_layoutButton.leadingAnchor constant:-8],
         [refresh.centerYAnchor constraintEqualToAnchor:topBar.centerYAnchor],
-        [search.trailingAnchor constraintEqualToAnchor:refresh.leadingAnchor constant:-8],
-        [search.centerYAnchor constraintEqualToAnchor:topBar.centerYAnchor],
+        [_searchButton.trailingAnchor constraintEqualToAnchor:refresh.leadingAnchor constant:-8],
+        [_searchButton.centerYAnchor constraintEqualToAnchor:topBar.centerYAnchor],
         [_searchBar.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:8],
         [_searchBar.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-8],
-        [_searchBar.topAnchor constraintEqualToAnchor:topBar.bottomAnchor constant:2],
-        [recentTitle.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-        [recentTitle.topAnchor constraintEqualToAnchor:_searchBar.bottomAnchor constant:12],
+        [_recentTitle.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+        [_recentTitle.topAnchor constraintEqualToAnchor:_searchBar.bottomAnchor constant:12],
         [_recentScroll.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
         [_recentScroll.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
-        [_recentScroll.topAnchor constraintEqualToAnchor:recentTitle.bottomAnchor constant:8],
-        [_recentScroll.heightAnchor constraintEqualToConstant:128],
+        [_recentScroll.topAnchor constraintEqualToAnchor:_recentTitle.bottomAnchor constant:8],
         [_recentStack.leadingAnchor constraintEqualToAnchor:_recentScroll.contentLayoutGuide.leadingAnchor constant:12],
         [_recentStack.trailingAnchor constraintEqualToAnchor:_recentScroll.contentLayoutGuide.trailingAnchor constant:-12],
         [_recentStack.topAnchor constraintEqualToAnchor:_recentScroll.contentLayoutGuide.topAnchor],
@@ -356,11 +566,17 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
         [_collectionView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:10],
         [_collectionView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-10],
         [_collectionView.topAnchor constraintEqualToAnchor:allTitle.bottomAnchor constant:10],
-        [_collectionView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
         [_emptyLabel.centerXAnchor constraintEqualToAnchor:_collectionView.centerXAnchor],
         [_emptyLabel.centerYAnchor constraintEqualToAnchor:_collectionView.centerYAnchor],
         [_emptyLabel.widthAnchor constraintLessThanOrEqualToAnchor:_collectionView.widthAnchor constant:-60],
     ]];
+    BOOL bottom = ARMSX3ToolbarAtBottom();
+    _topBarTopConstraint.active = !bottom;
+    _topBarBottomConstraint.active = bottom;
+    _searchTopFromBarConstraint.active = !bottom;
+    _searchTopFromSafeConstraint.active = bottom;
+    _collectionBottomViewConstraint.active = !bottom;
+    _collectionBottomBarConstraint.active = bottom;
 }
 
 - (void)buildDrawer
@@ -431,6 +647,7 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
     ]];
     [self addDrawerDivider];
     [self addDrawerSection:ARMSX3L(@"ios.drawer.manage", @"Manage") rows:@[
+        @[@"🧭", ARMSX3L(@"setup.reopen", @"Reopen Setup"), @"drawerSetup"],
         @[@"📂", ARMSX3L(@"app.gameFolders", @"Game Folders"), @"drawerOpenGame"],
         @[@"📀", ARMSX3L(@"ios.drawer.firmware", @"System Software"), @"drawerFirmware"],
         @[@"📦", ARMSX3L(@"ios.drawer.packages", @"PKG Installer"), @"drawerPackages"],
@@ -555,6 +772,23 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
         NSNumber *isDir = nil;
         [url getResourceValue:&isDir forKey:NSURLIsDirectoryKey error:nil];
         if (!isDir.boolValue && ![fileExtensions containsObject:url.pathExtension.lowercaseString]) continue;
+        if (installed && isDir.boolValue)
+        {
+            // dev_hdd0/game also contains data-only/update/helper directories. Only executable
+            // titles belong on the launcher. Otherwise tapping a perfectly valid PARAM.SFO-only
+            // directory reaches RPCS3 as game_boot_result::nothing_to_boot (2), which previously
+            // looked like a dead home-screen item.
+            BOOL bootable = NO;
+            for (NSString *relative in @[@"EBOOT.BIN", @"USRDIR/EBOOT.BIN", @"USRDIR/ISO.BIN.EDAT", @"PS3_GAME/USRDIR/EBOOT.BIN"])
+            {
+                if ([fm fileExistsAtPath:[url URLByAppendingPathComponent:relative].path])
+                {
+                    bootable = YES;
+                    break;
+                }
+            }
+            if (!bootable) continue;
+        }
 
         NSURL *cover = nil;
         if (isDir.boolValue)
@@ -567,12 +801,49 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
             for (NSURL *candidate in candidates)
                 if ([fm fileExistsAtPath:candidate.path]) { cover = candidate; break; }
         }
-
         NSString *title = url.lastPathComponent.stringByDeletingPathExtension;
-        NSString *detail = installed ? @"已安装" : (isDir.boolValue ? @"PS3" : url.pathExtension.uppercaseString);
+        NSString *serial = @"";
+        NSString *version = @"";
+        NSString *titleEn = @"";
+        if (isDir.boolValue || [url.pathExtension.lowercaseString isEqualToString:@"iso"])
+        {
+            const char *raw = armsx3_ios_game_info_json(url.fileSystemRepresentation);
+            NSData *data = raw && *raw ? [[NSString stringWithUTF8String:raw] dataUsingEncoding:NSUTF8StringEncoding] : nil;
+            NSDictionary *info = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+            if ([info isKindOfClass:NSDictionary.class])
+            {
+                NSString *metadataTitle = [info[@"title"] isKindOfClass:NSString.class] ? info[@"title"] : @"";
+                if (metadataTitle.length) title = metadataTitle;
+                serial = [info[@"serial"] isKindOfClass:NSString.class] ? info[@"serial"] : @"";
+                version = [info[@"version"] isKindOfClass:NSString.class] ? info[@"version"] : @"";
+                titleEn = [info[@"titleEn"] isKindOfClass:NSString.class] ? info[@"titleEn"] : @"";
+                NSString *coverPath = [info[@"coverPath"] isKindOfClass:NSString.class] ? info[@"coverPath"] : @"";
+                if (coverPath.length) cover = [NSURL fileURLWithPath:coverPath];
+            }
+        }
+        NSString *rawTitle = title.length ? title : @"Untitled";
+        BOOL customNames = ARMSX3LibraryBool(ARMSX3LibraryCustomNamesEnabledKey, YES);
+        BOOL englishTitles = ARMSX3LibraryBool(ARMSX3LibraryEnglishTitlesKey, NO);
+        NSString *customName = customNames ? ARMSX3CustomGameName(serial) : nil;
+        if (customName.length) title = customName;
+        else if (englishTitles && titleEn.length) title = titleEn;
+        NSURL *customCover = ARMSX3CustomCoverURL(serial);
+        if (customCover) cover = customCover;
+
+        BOOL locked = installed && isDir.boolValue && armsx3_ios_game_locked(url.fileSystemRepresentation);
+        NSString *kind = installed ? @"已安装" : (isDir.boolValue ? @"PS3" : url.pathExtension.uppercaseString);
+        NSString *detail = serial.length
+            ? [NSString stringWithFormat:@"%@ · %@%@", kind, serial, version.length ? [NSString stringWithFormat:@" · v%@", version] : @""]
+            : kind;
+        if (locked) detail = [detail stringByAppendingString:@" · 🔒 需要许可证"];
         [result addObject:@{
             @"title": title.length ? title : @"Untitled",
             @"detail": detail ?: @"PS3",
+            @"serial": serial ?: @"",
+            @"version": version ?: @"",
+            @"rawTitle": rawTitle,
+            @"titleEn": titleEn ?: @"",
+            @"locked": @(locked),
             @"url": url,
             @"cover": cover ?: NSNull.null,
         }];
@@ -587,12 +858,23 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
         : nil;
     NSMutableArray *items = [[self scanGamesAtURL:gamesURL installed:NO] mutableCopy];
 
+    for (NSURL *folder in ARMSX3AdditionalGameFolders())
+        [items addObjectsFromArray:[self scanGamesAtURL:folder installed:NO]];
+
     NSURL *support = [NSFileManager.defaultManager URLForDirectory:NSApplicationSupportDirectory
         inDomain:NSUserDomainMask appropriateForURL:nil create:NO error:nil];
     NSURL *installed = [[[support URLByAppendingPathComponent:@"ARMSX3" isDirectory:YES]
         URLByAppendingPathComponent:@"dev_hdd0/game" isDirectory:YES] copy];
     [items addObjectsFromArray:[self scanGamesAtURL:installed installed:YES]];
+    NSInteger sortMode = ARMSX3LibraryInteger(ARMSX3LibrarySortKey, 0);
     [items sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        if (sortMode == 1)
+        {
+            NSDate *ad = ARMSX3LastPlayedDate(a[@"serial"] ?: @"") ?: NSDate.distantPast;
+            NSDate *bd = ARMSX3LastPlayedDate(b[@"serial"] ?: @"") ?: NSDate.distantPast;
+            NSComparisonResult recent = [bd compare:ad];
+            if (recent != NSOrderedSame) return recent;
+        }
         return [a[@"title"] localizedCaseInsensitiveCompare:b[@"title"]];
     }];
     _games = items;
@@ -610,18 +892,27 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
         NSURL *url = game[@"url"];
         NSString *path = url.path ?: @"";
         if (!_showHidden && [_hiddenPaths containsObject:path]) continue;
+        NSString *category = [NSUserDefaults.standardUserDefaults stringForKey:ARMSX3LibraryCategoryFilterKey];
+        if (category.length)
+        {
+            NSArray *members = ARMSX3LoadCategories()[category] ?: @[];
+            NSString *serial = game[@"serial"] ?: @"";
+            if (!serial.length || ![members containsObject:serial]) continue;
+        }
         if (query.length)
         {
             NSString *haystack = [NSString stringWithFormat:@"%@ %@ %@",
-                game[@"title"] ?: @"", game[@"detail"] ?: @"", url.lastPathComponent ?: @""];
+                game[@"title"] ?: @"", game[@"serial"] ?: @"", game[@"detail"] ?: @""];
             if ([haystack rangeOfString:query options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
         }
         [visible addObject:game];
     }
     _visibleGames = visible;
-    NSString *countText = query.length || _showHidden
+    NSString *activeCategory = [NSUserDefaults.standardUserDefaults stringForKey:ARMSX3LibraryCategoryFilterKey];
+    NSString *countText = query.length || _showHidden || activeCategory.length
         ? [NSString stringWithFormat:@"显示 %lu / %lu", (unsigned long)_visibleGames.count, (unsigned long)_games.count]
         : [NSString stringWithFormat:@"总游戏数：%lu", (unsigned long)_games.count];
+    if (activeCategory.length) countText = [NSString stringWithFormat:@"%@ · %@", activeCategory, countText];
     _subtitleLabel.text = [countText stringByAppendingString:_coreReady ? @" · Core 已就绪" : @" · Core 启动中"];
     _emptyLabel.hidden = _visibleGames.count != 0;
     _emptyLabel.text = _games.count == 0
@@ -682,7 +973,8 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
         if (!game) continue;
         UIButton *card = [UIButton buttonWithType:UIButtonTypeSystem];
         card.translatesAutoresizingMaskIntoConstraints = NO;
-        card.backgroundColor = [ARMSX3SurfaceColor() colorWithAlphaComponent:0.92];
+        CGFloat opacity = MIN(1.0, MAX(0.2, ARMSX3LibraryInteger(ARMSX3LibraryOpacityKey, 100) / 100.0));
+        card.backgroundColor = [ARMSX3SurfaceColor() colorWithAlphaComponent:0.92 * opacity];
         card.layer.cornerRadius = 18;
         card.layer.borderWidth = 1;
         card.layer.borderColor = [ARMSX3OutlineColor() colorWithAlphaComponent:0.7].CGColor;
@@ -699,7 +991,10 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
         [_recentStack addArrangedSubview:card];
         if (++shown == 8) break;
     }
-    _recentScroll.hidden = shown == 0;
+    BOOL showRecents = ARMSX3LibraryBool(ARMSX3LibraryShowRecentsKey, YES);
+    _recentScroll.hidden = !showRecents || shown == 0;
+    _recentTitle.hidden = !showRecents || shown == 0;
+    _recentHeightConstraint.constant = showRecents && shown > 0 ? 128 : 0;
 }
 
 - (void)recentTapped:(UIButton *)sender
@@ -716,11 +1011,63 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
 {
     NSURL *url = game[@"url"];
     if (!url) return;
+    if ([url.pathExtension.lowercaseString isEqualToString:@"pkg"])
+    {
+        [self promptInstallPackage:url title:game[@"title"] ?: url.lastPathComponent];
+        return;
+    }
+    if ([game[@"locked"] boolValue])
+    {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"需要许可证"
+            message:[NSString stringWithFormat:@"%@ 的 EBOOT 无法解密。为这个游戏选择对应的 .rap key 后才能启动。", game[@"title"] ?: @"这个游戏"]
+            preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"选择 .rap" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            [self chooseLicenceForGame:game];
+        }]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
     [_recentPaths removeObject:url.path];
     [_recentPaths insertObject:url.path atIndex:0];
     while (_recentPaths.count > 16) [_recentPaths removeLastObject];
     [NSUserDefaults.standardUserDefaults setObject:_recentPaths forKey:@"armsx3.library.recents"];
     [_host bootGameAtURL:url];
+}
+
+- (void)promptInstallPackage:(NSURL *)url title:(NSString *)title
+{
+    if (!armsx3_ios_settings_editable()) { [self showLibraryMessage:@"请先停止当前游戏，再安装 PKG。"]; return; }
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"安装 PKG？"
+        message:[NSString stringWithFormat:@"将安装 %@。源 PKG 默认保留；也可以在安装成功后删除它。", title ?: url.lastPathComponent]
+        preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    __weak ARMSX3FrontendViewController *weakSelf = self;
+    void (^install)(BOOL) = ^(BOOL deleteSource) {
+        ARMSX3FrontendViewController *self = weakSelf; if (!self) return;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            BOOL ok = armsx3_ios_install_package(url.fileSystemRepresentation);
+            if (ok && deleteSource) [NSFileManager.defaultManager removeItemAtURL:url error:nil];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                ARMSX3FrontendViewController *self = weakSelf; if (!self) return;
+                [self reloadLibrary];
+                [self showLibraryMessage:ok ? (deleteSource ? @"PKG 安装完成，源文件已删除。" : @"PKG 安装完成，源文件已保留。") : @"PKG 安装失败，请查看运行日志了解具体原因。"];
+            });
+        });
+    };
+    [alert addAction:[UIAlertAction actionWithTitle:@"安装并保留源文件" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) { install(NO); }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"安装后删除源文件" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) { install(YES); }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)chooseLicenceForGame:(NSDictionary *)game
+{
+    _licenceGame = game;
+    _pickingLibraryBackground = NO;
+    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeData] asCopy:YES];
+    picker.delegate = self;
+    picker.allowsMultipleSelection = NO;
+    [self presentViewController:picker animated:YES completion:nil];
 }
 
 - (NSInteger)collectionView:(UICollectionView *)collectionView numberOfItemsInSection:(NSInteger)section
@@ -740,6 +1087,11 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
     cell.coverView.image = image ?: [UIImage systemImageNamed:@"gamecontroller.fill"];
     cell.coverView.tintColor = [ARMSX3AccentColor() colorWithAlphaComponent:0.8];
     cell.coverView.contentMode = image ? UIViewContentModeScaleAspectFill : UIViewContentModeScaleAspectFit;
+    BOOL showNames = ARMSX3LibraryBool(ARMSX3LibraryShowGridNamesKey, YES) || _layoutMode == ARMSX3LibraryLayoutList;
+    cell.titleLabel.hidden = !showNames;
+    cell.detailLabel.hidden = !showNames;
+    CGFloat opacity = MIN(1.0, MAX(0.2, ARMSX3LibraryInteger(ARMSX3LibraryOpacityKey, 100) / 100.0));
+    cell.contentView.backgroundColor = [ARMSX3SurfaceColor() colorWithAlphaComponent:opacity];
     return cell;
 }
 
@@ -767,8 +1119,28 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
         }];
         UIAction *settings = [UIAction actionWithTitle:@"游戏设置"
             image:[UIImage systemImageNamed:@"gearshape"] identifier:nil handler:^(__kindof UIAction *action) {
-            [self->_host showSettings];
+            NSString *serial = game[@"serial"] ?: @"";
+            if (serial.length) [self->_host showGameSettingsForSerial:serial title:game[@"title"] ?: serial path:[(NSURL *)game[@"url"] path] ?: @""];
         }];
+        if (![game[@"serial"] length]) settings.attributes = UIMenuElementAttributesDisabled;
+        UIAction *categories = [UIAction actionWithTitle:@"分类"
+            image:[UIImage systemImageNamed:@"tag"] identifier:nil handler:^(__kindof UIAction *action) {
+            [self showCategoryMembershipForGame:game];
+        }];
+        if (![game[@"serial"] length]) categories.attributes = UIMenuElementAttributesDisabled;
+        UIAction *clearCache = [UIAction actionWithTitle:@"清理 PPU/SPU/Shader 缓存"
+            image:[UIImage systemImageNamed:@"trash"] identifier:nil handler:^(__kindof UIAction *action) {
+            [self clearCacheForGame:game];
+        }];
+        if (![game[@"serial"] length]) clearCache.attributes = UIMenuElementAttributesDisabled;
+        UIAction *licence = nil;
+        if ([game[@"locked"] boolValue])
+        {
+            licence = [UIAction actionWithTitle:@"安装许可证 (.rap)"
+                image:[UIImage systemImageNamed:@"key.fill"] identifier:nil handler:^(__kindof UIAction *action) {
+                [self chooseLicenceForGame:game];
+            }];
+        }
         UIAction *hide = [UIAction actionWithTitle:hidden ? @"取消隐藏" : @"隐藏游戏"
             image:[UIImage systemImageNamed:hidden ? @"eye" : @"eye.slash"] identifier:nil handler:^(__kindof UIAction *action) {
             if (hidden) [self->_hiddenPaths removeObject:path]; else [self->_hiddenPaths addObject:path];
@@ -781,7 +1153,11 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
             [NSUserDefaults.standardUserDefaults setObject:self->_recentPaths forKey:@"armsx3.library.recents"];
             [self reloadRecents];
         }];
-        return [UIMenu menuWithTitle:game[@"title"] ?: @"游戏" children:@[play, settings, hide, removeRecent]];
+        NSMutableArray<UIMenuElement *> *children = [NSMutableArray arrayWithObjects:play, settings, categories, clearCache, nil];
+        if (licence) [children addObject:licence];
+        [children addObject:hide];
+        if ([self->_recentPaths containsObject:path]) [children addObject:removeRecent];
+        return [UIMenu menuWithTitle:game[@"title"] ?: @"游戏" children:children];
     }];
 }
 
@@ -791,6 +1167,8 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
     if (_layoutMode == ARMSX3LibraryLayoutList) return CGSizeMake(width, 94);
     CGFloat target = UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad ? 180 : 150;
     if (_layoutMode == ARMSX3LibraryLayoutShelf) target = UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad ? 160 : 126;
+    CGFloat coverScale = MIN(2.5, MAX(0.75, ARMSX3LibraryInteger(ARMSX3LibraryCoverScaleKey, 100) / 100.0));
+    target *= coverScale;
     NSInteger columns = MAX(2, floor((width + 10) / (target + 10)));
     CGFloat itemWidth = floor((width - (columns - 1) * 10) / columns);
     CGFloat coverRatio = _layoutMode == ARMSX3LibraryLayoutShelf ? 1.10 : 0.72;
@@ -806,10 +1184,236 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
     [_collectionView.collectionViewLayout invalidateLayout];
 }
 
+- (void)showLibraryMessage:(NSString *)message
+{
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"游戏库" message:message preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)showSortMenuFrom:(UIView *)source
+{
+    NSInteger current = ARMSX3LibraryInteger(ARMSX3LibrarySortKey, 0);
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"排序" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    NSArray *names = @[@"标题 A–Z", @"最近游玩"];
+    for (NSInteger index = 0; index < names.count; ++index)
+    {
+        NSString *title = [NSString stringWithFormat:@"%@%@", index == current ? @"✓ " : @"", names[index]];
+        [menu addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            [NSUserDefaults.standardUserDefaults setInteger:index forKey:ARMSX3LibrarySortKey];
+            [self reloadLibrary];
+        }]];
+    }
+    [menu addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    menu.popoverPresentationController.sourceView = source ?: self.view;
+    [self presentViewController:menu animated:YES completion:nil];
+}
+
+- (void)showCreateCategoryWithCompletion:(void (^ _Nullable)(NSString *name))completion
+{
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"新建分类" message:@"分类只影响游戏库分组，不会移动或删除游戏文件。" preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) { field.placeholder = @"分类名称"; }];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"添加" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        NSString *name = [alert.textFields.firstObject.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (!name.length) return;
+        NSMutableDictionary *categories = ARMSX3LoadCategories();
+        if (!categories[name]) categories[name] = [NSMutableArray array];
+        ARMSX3SaveCategories(categories);
+        if (completion) completion(name);
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)showCategoryManagerFrom:(UIView *)source
+{
+    NSMutableDictionary *categories = ARMSX3LoadCategories();
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"管理分类" message:@"选择一个分类进行重命名或删除。删除分类不会删除游戏。" preferredStyle:UIAlertControllerStyleActionSheet];
+    for (NSString *name in categories.allKeys)
+    {
+        [menu addAction:[UIAlertAction actionWithTitle:name style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            UIAlertController *edit = [UIAlertController alertControllerWithTitle:name message:nil preferredStyle:UIAlertControllerStyleAlert];
+            [edit addTextFieldWithConfigurationHandler:^(UITextField *field) { field.text = name; }];
+            [edit addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+            [edit addAction:[UIAlertAction actionWithTitle:@"删除分类" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *a) {
+                NSMutableDictionary *next = ARMSX3LoadCategories();
+                [next removeObjectForKey:name];
+                ARMSX3SaveCategories(next);
+                if ([[NSUserDefaults.standardUserDefaults stringForKey:ARMSX3LibraryCategoryFilterKey] isEqualToString:name])
+                    [NSUserDefaults.standardUserDefaults removeObjectForKey:ARMSX3LibraryCategoryFilterKey];
+                [self applyLibraryFilter];
+            }]];
+            [edit addAction:[UIAlertAction actionWithTitle:@"重命名" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+                NSString *to = [edit.textFields.firstObject.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+                if (!to.length || [to isEqualToString:name]) return;
+                NSMutableDictionary *next = ARMSX3LoadCategories();
+                NSMutableArray *members = next[name] ?: [NSMutableArray array];
+                [next removeObjectForKey:name];
+                NSMutableArray *target = next[to] ?: [NSMutableArray array];
+                for (NSString *serial in members) if (![target containsObject:serial]) [target addObject:serial];
+                next[to] = target;
+                ARMSX3SaveCategories(next);
+                if ([[NSUserDefaults.standardUserDefaults stringForKey:ARMSX3LibraryCategoryFilterKey] isEqualToString:name])
+                    [NSUserDefaults.standardUserDefaults setObject:to forKey:ARMSX3LibraryCategoryFilterKey];
+                [self applyLibraryFilter];
+            }]];
+            [self presentViewController:edit animated:YES completion:nil];
+        }]];
+    }
+    [menu addAction:[UIAlertAction actionWithTitle:@"新建分类" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        [self showCreateCategoryWithCompletion:nil];
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    menu.popoverPresentationController.sourceView = source ?: self.view;
+    [self presentViewController:menu animated:YES completion:nil];
+}
+
+- (void)showCategoryPickerFrom:(UIView *)source
+{
+    NSDictionary *categories = ARMSX3LoadCategories();
+    NSString *active = [NSUserDefaults.standardUserDefaults stringForKey:ARMSX3LibraryCategoryFilterKey];
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"游戏分类" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    [menu addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@全部游戏", active.length ? @"" : @"✓ "] style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        [NSUserDefaults.standardUserDefaults removeObjectForKey:ARMSX3LibraryCategoryFilterKey];
+        [self applyLibraryFilter];
+    }]];
+    for (NSString *name in categories.allKeys)
+    {
+        NSUInteger count = [categories[name] count];
+        NSString *title = [NSString stringWithFormat:@"%@%@ (%lu)", [active isEqualToString:name] ? @"✓ " : @"", name, (unsigned long)count];
+        [menu addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            [NSUserDefaults.standardUserDefaults setObject:name forKey:ARMSX3LibraryCategoryFilterKey];
+            [self applyLibraryFilter];
+        }]];
+    }
+    [menu addAction:[UIAlertAction actionWithTitle:@"管理分类…" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) { [self showCategoryManagerFrom:source]; }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    menu.popoverPresentationController.sourceView = source ?: self.view;
+    [self presentViewController:menu animated:YES completion:nil];
+}
+
+- (void)showCategoryMembershipForGame:(NSDictionary *)game
+{
+    NSString *serial = game[@"serial"] ?: @"";
+    if (!serial.length) { [self showLibraryMessage:@"这个游戏没有可用于分类的 Title ID。"]; return; }
+    NSMutableDictionary *categories = ARMSX3LoadCategories();
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:game[@"title"] ?: @"游戏分类" message:@"再次点选可加入/移出分类。" preferredStyle:UIAlertControllerStyleActionSheet];
+    for (NSString *name in categories.allKeys)
+    {
+        BOOL member = [categories[name] containsObject:serial];
+        [menu addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@%@", member ? @"✓ " : @"", name] style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            NSMutableDictionary *next = ARMSX3LoadCategories();
+            NSMutableArray *members = next[name] ?: [NSMutableArray array];
+            if ([members containsObject:serial]) [members removeObject:serial]; else [members addObject:serial];
+            next[name] = members;
+            ARMSX3SaveCategories(next);
+            [self applyLibraryFilter];
+            [self showCategoryMembershipForGame:game];
+        }]];
+    }
+    [menu addAction:[UIAlertAction actionWithTitle:@"新建并加入分类…" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        [self showCreateCategoryWithCompletion:^(NSString *name) {
+            NSMutableDictionary *next = ARMSX3LoadCategories();
+            NSMutableArray *members = next[name] ?: [NSMutableArray array];
+            if (![members containsObject:serial]) [members addObject:serial];
+            next[name] = members; ARMSX3SaveCategories(next); [self applyLibraryFilter];
+        }];
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"完成" style:UIAlertActionStyleCancel handler:nil]];
+    menu.popoverPresentationController.sourceView = self.view;
+    [self presentViewController:menu animated:YES completion:nil];
+}
+
+- (void)chooseLibraryBackground
+{
+    _pickingLibraryBackground = YES;
+    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeImage] asCopy:YES];
+    picker.delegate = self;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls
+{
+    NSURL *picked = urls.firstObject;
+    if (_licenceGame)
+    {
+        NSDictionary *game = _licenceGame;
+        _licenceGame = nil;
+        if (![picked.pathExtension.lowercaseString isEqualToString:@"rap"]) { [self showLibraryMessage:@"请选择 .rap 许可证文件。"]; return; }
+        NSString *gamePath = [(NSURL *)game[@"url"] path] ?: @"";
+        if (!armsx3_ios_settings_editable()) { [self showLibraryMessage:@"请先停止当前游戏，再安装许可证。"]; return; }
+        __weak ARMSX3FrontendViewController *weakSelf = self;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            BOOL ok = armsx3_ios_install_rap_for_game(picked.fileSystemRepresentation, gamePath.UTF8String);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                ARMSX3FrontendViewController *self = weakSelf; if (!self) return;
+                [self reloadLibrary];
+                [self showLibraryMessage:ok ? @"许可证已安装，这个游戏现在应可正常启动。" : @"许可证安装失败；如果 key 与游戏不匹配，它不会被保留。"];
+            });
+        });
+        return;
+    }
+    if (!_pickingLibraryBackground) return;
+    _pickingLibraryBackground = NO;
+    NSString *error = nil;
+    if (!ARMSX3SetLibraryCustomBackground(picked, &error)) [self showLibraryMessage:error ?: @"无法导入背景图。"];
+}
+
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller { _pickingLibraryBackground = NO; _licenceGame = nil; }
+
+- (void)clearCacheForGame:(NSDictionary *)game
+{
+    if (!armsx3_ios_settings_editable()) { [self showLibraryMessage:@"请先停止当前游戏，再清理单游戏缓存。"]; return; }
+    NSString *serial = game[@"serial"] ?: @"";
+    if (!serial.length) { [self showLibraryMessage:@"这个游戏没有 Title ID，因此没有独立缓存目录。"]; return; }
+    NSURL *support = [NSFileManager.defaultManager URLForDirectory:NSApplicationSupportDirectory inDomain:NSUserDomainMask appropriateForURL:nil create:NO error:nil];
+    NSURL *dir = [[[[support URLByAppendingPathComponent:@"ARMSX3" isDirectory:YES] URLByAppendingPathComponent:@"cache/cache" isDirectory:YES] URLByAppendingPathComponent:serial isDirectory:YES] copy];
+    BOOL isDir = NO;
+    if (![NSFileManager.defaultManager fileExistsAtPath:dir.path isDirectory:&isDir] || !isDir) { [self showLibraryMessage:@"这个游戏目前没有 PPU/SPU/Shader 缓存。"]; return; }
+    __block NSUInteger files = 0; __block unsigned long long bytes = 0;
+    NSDirectoryEnumerator *enumerator = [NSFileManager.defaultManager enumeratorAtURL:dir includingPropertiesForKeys:@[NSURLIsRegularFileKey, NSURLFileSizeKey] options:0 errorHandler:nil];
+    for (NSURL *file in enumerator)
+    {
+        NSNumber *regular=nil,*size=nil; [file getResourceValue:&regular forKey:NSURLIsRegularFileKey error:nil];
+        if (regular.boolValue) { [file getResourceValue:&size forKey:NSURLFileSizeKey error:nil]; files++; bytes += size.unsignedLongLongValue; }
+    }
+    NSError *error = nil;
+    if (![NSFileManager.defaultManager removeItemAtURL:dir error:&error]) { [self showLibraryMessage:error.localizedDescription ?: @"缓存清理失败。"]; return; }
+    NSString *sizeText = [NSByteCountFormatter stringFromByteCount:(long long)bytes countStyle:NSByteCountFormatterCountStyleFile];
+    [self showLibraryMessage:[NSString stringWithFormat:@"已清理 %@ 的 %lu 个缓存文件（%@）。", serial, (unsigned long)files, sizeText]];
+}
+
 - (void)showMoreMenu:(UIButton *)sender
 {
     UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"游戏库"
         message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    NSInteger sortMode = ARMSX3LibraryInteger(ARMSX3LibrarySortKey, 0);
+    [menu addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"排序：%@", sortMode == 1 ? @"最近游玩" : @"标题 A–Z"] style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+        [self showSortMenuFrom:sender];
+    }]];
+    BOOL showNames = ARMSX3LibraryBool(ARMSX3LibraryShowGridNamesKey, YES);
+    [menu addAction:[UIAlertAction actionWithTitle:showNames ? @"✓ 网格显示游戏名" : @"网格显示游戏名" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+        [NSUserDefaults.standardUserDefaults setBool:!showNames forKey:ARMSX3LibraryShowGridNamesKey];
+        [self->_collectionView reloadData];
+    }]];
+    BOOL customNames = ARMSX3LibraryBool(ARMSX3LibraryCustomNamesEnabledKey, YES);
+    [menu addAction:[UIAlertAction actionWithTitle:customNames ? @"✓ 使用自定义名称" : @"使用自定义名称" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+        [NSUserDefaults.standardUserDefaults setBool:!customNames forKey:ARMSX3LibraryCustomNamesEnabledKey];
+        [self reloadLibrary];
+    }]];
+    BOOL englishTitles = ARMSX3LibraryBool(ARMSX3LibraryEnglishTitlesKey, NO);
+    [menu addAction:[UIAlertAction actionWithTitle:englishTitles ? @"✓ 英文标题" : @"英文标题" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+        [NSUserDefaults.standardUserDefaults setBool:!englishTitles forKey:ARMSX3LibraryEnglishTitlesKey];
+        [self reloadLibrary];
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"游戏分类…" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+        [self showCategoryPickerFrom:sender];
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:ARMSX3LibraryCustomBackgroundName() ? [NSString stringWithFormat:@"更换背景 · %@", ARMSX3LibraryCustomBackgroundName()] : @"选择游戏库背景…" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+        [self chooseLibraryBackground];
+    }]];
+    if (ARMSX3LibraryCustomBackgroundURL())
+        [menu addAction:[UIAlertAction actionWithTitle:@"清除自定义背景" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *a) { ARMSX3ClearLibraryCustomBackground(); }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"添加/打开游戏" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         [self->_host openGame];
     }]];
@@ -840,6 +1444,7 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
 }
 
 - (void)drawerLibrary { [self hideDrawer]; }
+- (void)drawerSetup { [self hideDrawer]; [_host showOnboarding]; }
 - (void)drawerBootFirmware { [self hideDrawer]; [_host bootFirmware]; }
 - (void)drawerSettings { [self hideDrawer]; [_host showSettings]; }
 - (void)drawerCoreSettings { [self hideDrawer]; [_host showCoreSettings]; }
@@ -850,7 +1455,7 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
 - (void)drawerControllers { [self hideDrawer]; [self presentControllerScreen]; }
 - (void)drawerPatches { [self hideDrawer]; [self presentViewController:ARMSX3MakePatchManager() animated:YES completion:nil]; }
 - (void)drawerMods { [self hideDrawer]; [self presentViewController:ARMSX3MakeModManager() animated:YES completion:nil]; }
-- (void)drawerTrophies { [self hideDrawer]; [self presentViewController:ARMSX3MakeTrophyManager() animated:YES completion:nil]; }
+- (void)drawerTrophies { [self hideDrawer]; [self presentViewController:ARMSX3MakeTrophiesViewController() animated:YES completion:nil]; }
 - (void)openExternalURLString:(NSString *)raw
 {
     NSURL *url = [NSURL URLWithString:raw];
@@ -859,7 +1464,7 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
 - (void)drawerDiscord { [self hideDrawer]; [self openExternalURLString:@"https://discord.gg/2Tynvwhc4A"]; }
 - (void)drawerGithub { [self hideDrawer]; [self openExternalURLString:@"https://github.com/ARMSX2/ARMSX3"]; }
 - (void)drawerWebsite { [self hideDrawer]; [self openExternalURLString:@"https://armsx2.net/"]; }
-- (void)drawerNews { [self hideDrawer]; [self presentInfoScreen:@"新闻与更新" icon:@"📰" body:@"与 Android News 入口保持一致。iOS 不额外维护第二套公告数据；项目更新从同一 ARMSX3 发布源进入。" primary:@"打开项目主页" action:@selector(openWebsiteFromInfo)]; }
+- (void)drawerNews { [self hideDrawer]; [self presentViewController:ARMSX3MakeNewsViewController() animated:YES completion:nil]; }
 - (void)drawerFriends
 {
     [self hideDrawer];
@@ -870,63 +1475,39 @@ typedef NS_ENUM(NSInteger, ARMSX3LibraryLayout)
 - (void)drawerAbout
 {
     [self hideDrawer];
-    NSString *shortVersion = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"-";
-    NSString *build = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"-";
-    NSProcessInfo *process = NSProcessInfo.processInfo;
-    NSString *device = UIDevice.currentDevice.model ?: @"iOS Device";
-    NSString *os = [NSString stringWithFormat:@"iOS %@", UIDevice.currentDevice.systemVersion ?: @"-"];
-    NSString *display = [NSString stringWithFormat:@"%.0f × %.0f @ %.0fx",
-        UIScreen.mainScreen.nativeBounds.size.width, UIScreen.mainScreen.nativeBounds.size.height,
-        UIScreen.mainScreen.nativeScale];
-    NSString *memory = [NSString stringWithFormat:@"%.1f GB", process.physicalMemory / 1073741824.0];
-    NSString *body = [NSString stringWithFormat:
-        @"ARMSX3\nRPCS3-based PS3 emulator frontend\n\n"
-         "应用版本：%@ (%@)\n"
-         "设备：%@\n"
-         "系统：%@\n"
-         "CPU 核心：%ld\n"
-         "内存：%@\n"
-         "显示：%@\n"
-         "架构：arm64\n"
-         "页大小：%ld KB\n\n"
-         "界面结构与 Android ARMSX3 对齐；文件选择、JIT、GameController、AVAudioSession/RemoteIO 与 Metal 保留为 iOS 平台实现。",
-        shortVersion, build, device, os, (long)process.processorCount, memory, display, (long)(getpagesize() / 1024)];
-    [self presentInfoScreen:@"关于 ARMSX3" icon:@"ℹ️" body:body primary:@"打开 GitHub" action:@selector(openGithubFromInfo)];
+    [self presentViewController:ARMSX3MakeAboutViewController() animated:YES completion:nil];
 }
 
 - (void)presentFirmwareManager
 {
-    NSString *version = @"未安装";
-    const char *raw = armsx3_ios_firmware_version();
-    if (raw && *raw) version = [NSString stringWithUTF8String:raw];
-    NSString *body = [NSString stringWithFormat:@"当前 PS3 系统软件：%@\n\n系统软件是全局安装，与 Android 端 BiosManager 一样从统一入口管理。", version];
-    [self presentInfoScreen:@"PS3 系统软件" icon:@"📀" body:body primary:@"安装 PS3UPDAT.PUP" action:@selector(openFirmwareFromInfo)];
+    __weak typeof(self) weakSelf = self;
+    [self presentViewController:ARMSX3MakeFirmwareViewController(^{
+        ARMSX3FrontendViewController *self = weakSelf;
+        if (self) [self->_host openFirmware];
+    }) animated:YES completion:nil];
 }
 
 - (void)presentPackageManager
 {
-    NSURL *support = [NSFileManager.defaultManager URLForDirectory:NSApplicationSupportDirectory
-        inDomain:NSUserDomainMask appropriateForURL:nil create:NO error:nil];
-    NSURL *installed = [[support URLByAppendingPathComponent:@"ARMSX3/dev_hdd0/game" isDirectory:YES] copy];
-    NSArray<NSURL *> *items = [NSFileManager.defaultManager contentsOfDirectoryAtURL:installed
-        includingPropertiesForKeys:nil options:NSDirectoryEnumerationSkipsHiddenFiles error:nil];
-    NSString *body = [NSString stringWithFormat:@"安装游戏、更新或 DLC 的 PS3 PKG。\n\n当前已安装标题目录：%lu\n安装位置：%@",
-        (unsigned long)items.count, installed.path ?: @"-"];
-    [self presentInfoScreen:@"PKG 安装器" icon:@"📦" body:body primary:@"选择 PKG" action:@selector(openPackageFromInfo)];
+    __weak typeof(self) weakSelf = self;
+    UIViewController *manager = ARMSX3MakePackageManager(^{
+        ARMSX3FrontendViewController *self = weakSelf;
+        if (!self) return;
+        [self.presentedViewController dismissViewControllerAnimated:YES completion:^{ [self->_host openPackage]; }];
+    });
+    [self presentViewController:manager animated:YES completion:nil];
 }
 
 - (void)presentControllerScreen
 {
-    NSMutableString *body = [NSMutableString string];
-    NSArray<GCController *> *controllers = GCController.controllers;
-    if (controllers.count == 0) [body appendString:@"当前没有连接外部控制器。\n\n触控控制仍可从运行界面或设置中开关。"];
-    else
-    {
-        [body appendFormat:@"已连接 %lu 个控制器：\n\n", (unsigned long)controllers.count];
-        for (GCController *controller in controllers)
-            [body appendFormat:@"• %@\n", controller.vendorName ?: @"Game Controller"];
-    }
-    [self presentInfoScreen:@"控制器" icon:@"🕹️" body:body primary:@"切换触控控制" action:@selector(toggleControlsFromInfo)];
+    __weak typeof(self) weakSelf = self;
+    ARMSX3ControllerManagerViewController *hub = [[ARMSX3ControllerManagerViewController alloc] initWithTouchControlsAction:^{
+        ARMSX3FrontendViewController *self = weakSelf;
+        if (self) [self->_host toggleControls];
+    }];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:hub];
+    nav.modalPresentationStyle = UIModalPresentationFullScreen;
+    [self presentViewController:nav animated:YES completion:nil];
 }
 
 - (void)presentFileManagerScreen:(NSString *)title relativePath:(NSString *)relative

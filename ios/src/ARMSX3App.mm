@@ -1,4 +1,5 @@
 #import <AVFoundation/AVFoundation.h>
+#import <CoreMotion/CoreMotion.h>
 #import <GameController/GameController.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -14,6 +15,13 @@
 #import "ARMSX3TouchControls.h"
 #import "ARMSX3ControllerMappings.h"
 #import "ARMSX3Localization.h"
+#import "ARMSX3OnboardingViewController.h"
+#import "ARMSX3LibraryMetadata.h"
+#import "ARMSX3OverlayArt.h"
+#import "ARMSX3AppPreferences.h"
+#import "ARMSX3SecondScreen.h"
+#import "ARMSX3RumbleBridge.h"
+#import "ARMSX3Updater.h"
 
 #include "armsx3_ios_core.h"
 #include "Emu/Io/pad_types.h"
@@ -187,6 +195,7 @@ typedef NS_ENUM(NSInteger, ARMSX3PickerPurpose)
     ARMSX3PickerPurposeGame,
     ARMSX3PickerPurposeFirmware,
     ARMSX3PickerPurposePackage,
+    ARMSX3PickerPurposeSwapDisc,
 };
 
 @class ARMSX3ViewController;
@@ -236,8 +245,10 @@ static NSString *armsx3_prepare_shared_documents(void)
 @implementation ARMSX3ViewController
 {
     ARMSX3MetalView *_metalView;
+    UIImageView *_overlayArtView;
     UILabel *_statusLabel;
     UIVisualEffectView *_toolbar;
+    UIButton *_pauseToolbarButton;
     UIVisualEffectView *_progressHUD;
     UILabel *_progressLabel;
     UIProgressView *_progressBar;
@@ -245,6 +256,7 @@ static NSString *armsx3_prepare_shared_documents(void)
     ARMSX3TouchControlsView *_touchControls;
     ARMSX3PickerPurpose _pickerPurpose;
     NSURL *_activeSecurityURL;
+    NSURL *_swapDiscSecurityURL;
     uint32_t _digital1;
     uint32_t _digital2;
     uint8_t _leftX;
@@ -259,12 +271,330 @@ static NSString *armsx3_prepare_shared_documents(void)
     BOOL _touchEditingFromFrontend;
     ARMSX3FrontendViewController *_frontend;
     NSMutableSet<NSString *> *_activeHotkeyPhysical;
+    NSMutableSet<NSString *> *_physicalPressed[7];
+    uint32_t _physicalDigital1[7];
+    uint32_t _physicalDigital2[7];
+    uint8_t _physicalLeftX[7], _physicalLeftY[7], _physicalRightX[7], _physicalRightY[7];
+    uint8_t _physicalLeftTrigger[7], _physicalRightTrigger[7];
+    dispatch_source_t _turboTimer;
+    BOOL _turboPulseOn;
+    NSTimeInterval _nextTurboToggle;
+    BOOL _physicalMacroHeld[7][4];
+    BOOL _physicalMacroPhase[7][4];
+    NSTimeInterval _physicalMacroNextToggle[7][4];
+    CMMotionManager *_motionManager;
+    double _gyroX, _gyroY;
+    double _gyroFilteredX, _gyroFilteredY;
+    double _gyroSteeringCenter;
+    BOOL _gyroSteeringCenterValid;
+    BOOL _gyroWasActive;
     id _languageObserver;
+    id _overlayObserver;
+    id _controllerMappingsObserver;
+    id _appAppearanceObserver;
+    id _batteryWarningObserver;
+    id _bootIntroEndObserver;
+    UIView *_bootIntroView;
+    AVPlayer *_bootIntroPlayer;
+    BOOL _bootIntroAttempted;
+    NSString *_currentGameSerial;
 }
 
 - (void)dealloc
 {
+    ARMSX3RumbleBridgeStop();
     if (_languageObserver) [NSNotificationCenter.defaultCenter removeObserver:_languageObserver];
+    if (_overlayObserver) [NSNotificationCenter.defaultCenter removeObserver:_overlayObserver];
+    if (_controllerMappingsObserver) [NSNotificationCenter.defaultCenter removeObserver:_controllerMappingsObserver];
+    if (_appAppearanceObserver) [NSNotificationCenter.defaultCenter removeObserver:_appAppearanceObserver];
+    if (_batteryWarningObserver) [NSNotificationCenter.defaultCenter removeObserver:_batteryWarningObserver];
+    if (_bootIntroEndObserver) [NSNotificationCenter.defaultCenter removeObserver:_bootIntroEndObserver];
+    [_bootIntroPlayer pause];
+    if (_turboTimer) dispatch_source_cancel(_turboTimer);
+    [_motionManager stopDeviceMotionUpdates];
+}
+
+- (UIInterfaceOrientation)currentInterfaceOrientation
+{
+    if (@available(iOS 13.0, *))
+        return self.view.window.windowScene.interfaceOrientation;
+    return UIInterfaceOrientationPortrait;
+}
+
+- (double)gyroDeadzone:(double)value
+{
+    const double magnitude = fabs(value);
+    if (magnitude <= 0.035) return 0.0;
+    return copysign((magnitude - 0.035) / 0.965, value);
+}
+
+- (void)recenterGyro
+{
+    _gyroX = _gyroY = 0.0;
+    _gyroFilteredX = _gyroFilteredY = 0.0;
+    _gyroSteeringCenterValid = NO;
+    _gyroWasActive = NO;
+}
+
+- (void)stopGyro
+{
+    BOOL hadOutput = _gyroWasActive || fabs(_gyroX) > 0.0001 || fabs(_gyroY) > 0.0001;
+    [_motionManager stopDeviceMotionUpdates];
+    [self recenterGyro];
+    if (hadOutput) [self pushPad];
+}
+
+- (void)handleDeviceMotion:(CMDeviceMotion *)motion
+{
+    ARMSX3ControllerMappings *m = ARMSX3ControllerMappings.shared;
+    const NSInteger mode = m.gyroMode;
+    if (mode == 0 || !motion) return;
+    const double sensitivity = m.gyroSensitivity / 100.0;
+    const UIInterfaceOrientation orientation = [self currentInterfaceOrientation];
+    double rawX = 0.0, rawY = 0.0;
+
+    if (mode == 1)
+    {
+        const double gx = motion.rotationRate.x;
+        const double gy = motion.rotationRate.y;
+        switch (orientation)
+        {
+        case UIInterfaceOrientationLandscapeLeft: rawX = gx; rawY = gy; break;
+        case UIInterfaceOrientationLandscapeRight: rawX = -gx; rawY = -gy; break;
+        case UIInterfaceOrientationPortraitUpsideDown: rawX = gy; rawY = -gx; break;
+        default: rawX = -gy; rawY = -gx; break;
+        }
+        rawX *= 0.72 * sensitivity;
+        rawY *= 0.72 * sensitivity;
+    }
+    else
+    {
+        const double gx = motion.gravity.x;
+        const double gy = motion.gravity.y;
+        double right = gx, up = gy;
+        switch (orientation)
+        {
+        case UIInterfaceOrientationLandscapeLeft: right = gy; up = -gx; break;
+        case UIInterfaceOrientationLandscapeRight: right = -gy; up = gx; break;
+        case UIInterfaceOrientationPortraitUpsideDown: right = -gx; up = -gy; break;
+        default: break;
+        }
+        const double roll = atan2(right, -up);
+        if (!_gyroSteeringCenterValid)
+        {
+            _gyroSteeringCenter = roll;
+            _gyroSteeringCenterValid = YES;
+        }
+        double delta = roll - _gyroSteeringCenter;
+        while (delta > M_PI) delta -= 2.0 * M_PI;
+        while (delta < -M_PI) delta += 2.0 * M_PI;
+        rawX = delta / (32.0 * M_PI / 180.0) * sensitivity;
+        rawY = 0.0;
+    }
+
+    rawX = [self gyroDeadzone:MIN(1.0, MAX(-1.0, rawX))];
+    rawY = [self gyroDeadzone:MIN(1.0, MAX(-1.0, rawY))];
+    if (m.gyroInvertX) rawX = -rawX;
+    if (m.gyroInvertY) rawY = -rawY;
+    const double smoothing = m.gyroSmoothing / 100.0;
+    const double alpha = MIN(1.0, MAX(0.16, 1.0 - smoothing * 0.86));
+    _gyroFilteredX += (rawX - _gyroFilteredX) * alpha;
+    _gyroFilteredY += (rawY - _gyroFilteredY) * alpha;
+    const double outputX = MIN(1.0, MAX(-1.0, _gyroFilteredX));
+    const double outputY = MIN(1.0, MAX(-1.0, _gyroFilteredY));
+    const BOOL active = fabs(outputX) > 0.004 || fabs(outputY) > 0.004;
+    if (!active && !_gyroWasActive) return;
+    if (active && fabs(outputX - _gyroX) < 0.004 && fabs(outputY - _gyroY) < 0.004) return;
+    _gyroX = active ? outputX : 0.0;
+    _gyroY = active ? outputY : 0.0;
+    _gyroWasActive = active;
+    [self pushPad];
+}
+
+- (void)refreshGyro
+{
+    if (!_motionManager) _motionManager = [[CMMotionManager alloc] init];
+    const BOOL gameplayVisible = _frontend && _frontend.view.hidden;
+    const NSInteger mode = ARMSX3ControllerMappings.shared.gyroMode;
+    if (!gameplayVisible || mode == 0 || !_motionManager.deviceMotionAvailable)
+    {
+        [self stopGyro];
+        return;
+    }
+    [_motionManager stopDeviceMotionUpdates];
+    [self recenterGyro];
+    _motionManager.deviceMotionUpdateInterval = 1.0 / 120.0;
+    __weak ARMSX3ViewController *weakSelf = self;
+    [_motionManager startDeviceMotionUpdatesToQueue:NSOperationQueue.mainQueue withHandler:^(CMDeviceMotion *motion, NSError *error) {
+        ARMSX3ViewController *self = weakSelf;
+        if (!self || error) return;
+        [self handleDeviceMotion:motion];
+    }];
+    _controllerMappingsObserver = [NSNotificationCenter.defaultCenter addObserverForName:ARMSX3ControllerMappingsDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
+        ARMSX3ViewController *self = weakSelf;
+        if (self) [self refreshGyro];
+    }];
+}
+
+- (void)reloadOverlayArt
+{
+    NSString *path = ARMSX3OverlayArtActivePath();
+    UIImage *image = path.length ? [UIImage imageWithContentsOfFile:path] : nil;
+    _overlayArtView.image = image;
+    _overlayArtView.alpha = ARMSX3OverlayArtOpacity();
+    _overlayArtView.hidden = !image || !_frontend || !_frontend.view.hidden;
+}
+
+- (void)configureTurboTimer
+{
+    if (_turboTimer) return;
+    _turboTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(_turboTimer, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 120), NSEC_PER_SEC / 120, NSEC_PER_MSEC * 2);
+    __weak ARMSX3ViewController *weakSelf = self;
+    dispatch_source_set_event_handler(_turboTimer, ^{
+        ARMSX3ViewController *self = weakSelf;
+        if (!self) return;
+        NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+        BOOL turboChanged = now >= self->_nextTurboToggle;
+        if (turboChanged)
+        {
+            self->_turboPulseOn = !self->_turboPulseOn;
+            self->_nextTurboToggle = now + (1.0 / 30.0);
+        }
+        for (NSInteger player = 0; player < 7; ++player)
+        {
+            BOOL changed = turboChanged && [ARMSX3ControllerMappings.shared heldTurboTargetsForPlayer:player pressedIn:self->_physicalPressed[player]].count;
+            for (NSInteger macro = 0; macro < 4; ++macro)
+            {
+                NSInteger frames = [self->_touchControls macroFrequencyForIndex:macro];
+                if (!self->_physicalMacroHeld[player][macro]) continue;
+                if (frames <= 0)
+                {
+                    if (!self->_physicalMacroPhase[player][macro])
+                    {
+                        self->_physicalMacroPhase[player][macro] = YES;
+                        changed = YES;
+                    }
+                    continue;
+                }
+                if (now >= self->_physicalMacroNextToggle[player][macro])
+                {
+                    self->_physicalMacroPhase[player][macro] = !self->_physicalMacroPhase[player][macro];
+                    self->_physicalMacroNextToggle[player][macro] = now + MAX(0.024, frames / 60.0);
+                    changed = YES;
+                }
+            }
+            if (changed) [self pushPhysicalPlayer:player];
+        }
+    });
+    dispatch_resume(_turboTimer);
+}
+
+- (NSMutableSet<NSString *> *)consumePhysicalMacrosForPlayer:(NSInteger)player pressed:(NSSet<NSString *> *)rawPressed
+{
+    NSMutableSet<NSString *> *normalPressed = [rawPressed mutableCopy];
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    for (NSInteger macro = 0; macro < 4; ++macro)
+    {
+        NSString *physical = [_touchControls macroPhysicalIdentifierForIndex:macro];
+        BOOL configured = physical.length && [_touchControls macroTargetsForIndex:macro].count;
+        BOOL held = configured && [rawPressed containsObject:physical];
+        if (configured) [normalPressed removeObject:physical];
+        if (held == _physicalMacroHeld[player][macro]) continue;
+        _physicalMacroHeld[player][macro] = held;
+        _physicalMacroPhase[player][macro] = held;
+        if (held)
+        {
+            NSInteger frames = [_touchControls macroFrequencyForIndex:macro];
+            _physicalMacroNextToggle[player][macro] = now + MAX(0.024, frames / 60.0);
+        }
+    }
+    return normalPressed;
+}
+
+- (void)applyPhysicalMacrosForPlayer:(NSInteger)player digital1:(uint32_t *)d1 digital2:(uint32_t *)d2
+    leftTrigger:(uint8_t *)lt rightTrigger:(uint8_t *)rt leftX:(uint8_t *)lx leftY:(uint8_t *)ly rightX:(uint8_t *)rx rightY:(uint8_t *)ry
+{
+    NSInteger macroLX = 0, macroLY = 0, macroRX = 0, macroRY = 0;
+    for (NSInteger macro = 0; macro < 4; ++macro)
+    {
+        if (!_physicalMacroPhase[player][macro]) continue;
+        for (NSString *target in [_touchControls macroTargetsForIndex:macro])
+        {
+            if ([target isEqualToString:@"up"]) *d1 |= CELL_PAD_CTRL_UP;
+            else if ([target isEqualToString:@"right"]) *d1 |= CELL_PAD_CTRL_RIGHT;
+            else if ([target isEqualToString:@"down"]) *d1 |= CELL_PAD_CTRL_DOWN;
+            else if ([target isEqualToString:@"left"]) *d1 |= CELL_PAD_CTRL_LEFT;
+            else if ([target isEqualToString:@"l3"]) *d1 |= CELL_PAD_CTRL_L3;
+            else if ([target isEqualToString:@"r3"]) *d1 |= CELL_PAD_CTRL_R3;
+            else if ([target isEqualToString:@"start"]) *d1 |= CELL_PAD_CTRL_START;
+            else if ([target isEqualToString:@"select"]) *d1 |= CELL_PAD_CTRL_SELECT;
+            else if ([target isEqualToString:@"cross"]) *d2 |= CELL_PAD_CTRL_CROSS;
+            else if ([target isEqualToString:@"circle"]) *d2 |= CELL_PAD_CTRL_CIRCLE;
+            else if ([target isEqualToString:@"square"]) *d2 |= CELL_PAD_CTRL_SQUARE;
+            else if ([target isEqualToString:@"triangle"]) *d2 |= CELL_PAD_CTRL_TRIANGLE;
+            else if ([target isEqualToString:@"l1"]) *d2 |= CELL_PAD_CTRL_L1;
+            else if ([target isEqualToString:@"r1"]) *d2 |= CELL_PAD_CTRL_R1;
+            else if ([target isEqualToString:@"l2"]) { *d2 |= CELL_PAD_CTRL_L2; *lt = 255; }
+            else if ([target isEqualToString:@"r2"]) { *d2 |= CELL_PAD_CTRL_R2; *rt = 255; }
+            else if ([target isEqualToString:@"lstick.up"]) macroLY--;
+            else if ([target isEqualToString:@"lstick.right"]) macroLX++;
+            else if ([target isEqualToString:@"lstick.down"]) macroLY++;
+            else if ([target isEqualToString:@"lstick.left"]) macroLX--;
+            else if ([target isEqualToString:@"rstick.up"]) macroRY--;
+            else if ([target isEqualToString:@"rstick.right"]) macroRX++;
+            else if ([target isEqualToString:@"rstick.down"]) macroRY++;
+            else if ([target isEqualToString:@"rstick.left"]) macroRX--;
+        }
+    }
+    if (macroLX) *lx = macroLX < 0 ? 0 : 255;
+    if (macroLY) *ly = macroLY < 0 ? 0 : 255;
+    if (macroRX) *rx = macroRX < 0 ? 0 : 255;
+    if (macroRY) *ry = macroRY < 0 ? 0 : 255;
+}
+
+- (void)pushPhysicalPlayer:(NSInteger)player
+{
+    if (player < 0 || player >= 7) return;
+    uint32_t d1 = _physicalDigital1[player];
+    uint32_t d2 = _physicalDigital2[player];
+    uint8_t lt = _physicalLeftTrigger[player];
+    uint8_t rt = _physicalRightTrigger[player];
+    NSSet<NSString *> *turbo = [ARMSX3ControllerMappings.shared heldTurboTargetsForPlayer:player pressedIn:_physicalPressed[player]];
+    if (!_turboPulseOn)
+    {
+        for (NSString *target in turbo)
+        {
+            if ([target isEqualToString:@"up"]) d1 &= ~CELL_PAD_CTRL_UP;
+            else if ([target isEqualToString:@"down"]) d1 &= ~CELL_PAD_CTRL_DOWN;
+            else if ([target isEqualToString:@"left"]) d1 &= ~CELL_PAD_CTRL_LEFT;
+            else if ([target isEqualToString:@"right"]) d1 &= ~CELL_PAD_CTRL_RIGHT;
+            else if ([target isEqualToString:@"l3"]) d1 &= ~CELL_PAD_CTRL_L3;
+            else if ([target isEqualToString:@"r3"]) d1 &= ~CELL_PAD_CTRL_R3;
+            else if ([target isEqualToString:@"start"]) d1 &= ~CELL_PAD_CTRL_START;
+            else if ([target isEqualToString:@"select"]) d1 &= ~CELL_PAD_CTRL_SELECT;
+            else if ([target isEqualToString:@"cross"]) d2 &= ~CELL_PAD_CTRL_CROSS;
+            else if ([target isEqualToString:@"circle"]) d2 &= ~CELL_PAD_CTRL_CIRCLE;
+            else if ([target isEqualToString:@"square"]) d2 &= ~CELL_PAD_CTRL_SQUARE;
+            else if ([target isEqualToString:@"triangle"]) d2 &= ~CELL_PAD_CTRL_TRIANGLE;
+            else if ([target isEqualToString:@"l1"]) d2 &= ~CELL_PAD_CTRL_L1;
+            else if ([target isEqualToString:@"r1"]) d2 &= ~CELL_PAD_CTRL_R1;
+            else if ([target isEqualToString:@"l2"]) { d2 &= ~CELL_PAD_CTRL_L2; lt = 0; }
+            else if ([target isEqualToString:@"r2"]) { d2 &= ~CELL_PAD_CTRL_R2; rt = 0; }
+        }
+    }
+    uint8_t lx = _physicalLeftX[player], ly = _physicalLeftY[player], rx = _physicalRightX[player], ry = _physicalRightY[player];
+    [self applyPhysicalMacrosForPlayer:player digital1:&d1 digital2:&d2 leftTrigger:&lt rightTrigger:&rt leftX:&lx leftY:&ly rightX:&rx rightY:&ry];
+    if (player == 0)
+    {
+        _digital1 = d1; _digital2 = d2;
+        _leftX = lx; _leftY = ly;
+        _rightX = rx; _rightY = ry;
+        _leftTrigger = lt; _rightTrigger = rt;
+        [self pushPad];
+    }
+    else
+        armsx3_ios_set_pad((int)player, d1, d2, lx, ly, rx, ry, lt, rt);
 }
 
 - (void)viewDidLoad
@@ -275,6 +605,14 @@ static NSString *armsx3_prepare_shared_documents(void)
     self.view.backgroundColor = UIColor.blackColor;
     _leftX = _leftY = _rightX = _rightY = 128;
     _activeHotkeyPhysical = [NSMutableSet set];
+    for (NSInteger player = 0; player < 7; ++player)
+    {
+        _physicalPressed[player] = [NSMutableSet set];
+        _physicalLeftX[player] = _physicalLeftY[player] = _physicalRightX[player] = _physicalRightY[player] = 128;
+    }
+    _turboPulseOn = YES;
+    _nextTurboToggle = NSProcessInfo.processInfo.systemUptime + (1.0 / 30.0);
+    _motionManager = [[CMMotionManager alloc] init];
 
     _metalView = [[ARMSX3MetalView alloc] initWithFrame:CGRectZero];
     _metalView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -286,9 +624,30 @@ static NSString *armsx3_prepare_shared_documents(void)
         [_metalView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
     ]];
 
+    _overlayArtView = [[UIImageView alloc] init];
+    _overlayArtView.translatesAutoresizingMaskIntoConstraints = NO;
+    _overlayArtView.contentMode = UIViewContentModeScaleToFill;
+    _overlayArtView.userInteractionEnabled = NO;
+    _overlayArtView.hidden = YES;
+    [self.view addSubview:_overlayArtView];
+    [NSLayoutConstraint activateConstraints:@[
+        [_overlayArtView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [_overlayArtView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [_overlayArtView.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [_overlayArtView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+    ]];
+    [self reloadOverlayArt];
+    __weak ARMSX3ViewController *overlayWeakSelf = self;
+    _overlayObserver = [NSNotificationCenter.defaultCenter addObserverForName:ARMSX3OverlayArtDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
+        [overlayWeakSelf reloadOverlayArt];
+    }];
+
     [self buildToolbar];
     [self buildTouchControls];
+    ARMSX3SecondScreenAttachControls(_touchControls);
+    ARMSX3RumbleBridgeStart();
     [self configureControllerNotifications];
+    [self configureTurboTimer];
     _frontend = [[ARMSX3FrontendViewController alloc] initWithHost:self documentsPath:g_documents_path];
     [self addChildViewController:_frontend];
     _frontend.view.translatesAutoresizingMaskIntoConstraints = NO;
@@ -324,6 +683,18 @@ static NSString *armsx3_prepare_shared_documents(void)
         self->_frontend.view.hidden = wasHidden;
         if (!wasHidden) [self.view bringSubviewToFront:self->_frontend.view];
     }];
+    _appAppearanceObserver = [NSNotificationCenter.defaultCenter addObserverForName:ARMSX3AppAppearanceDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
+        ARMSX3ViewController *self = weakSelf;
+        if (!self) return;
+        if (@available(iOS 16.0, *)) [self setNeedsUpdateOfSupportedInterfaceOrientations];
+        [self refreshGyro];
+    }];
+    _batteryWarningObserver = [NSNotificationCenter.defaultCenter addObserverForName:ARMSX3BatteryWarningNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+        ARMSX3ViewController *self = weakSelf;
+        NSString *message = [note.object isKindOfClass:NSString.class] ? note.object : @"Battery is low.";
+        if (self) [self showStatus:message error:YES];
+    }];
+    if (ARMSX3BatteryWarningsEnabled()) ARMSX3StartBatteryWarnings();
     [self showStatus:@"Starting..." error:NO];
     armsx3_ios_diagnostic_log("viewDidLoad UI ready");
 }
@@ -332,8 +703,81 @@ static NSString *armsx3_prepare_shared_documents(void)
 {
     [super viewDidAppear:animated];
     armsx3_ios_diagnostic_log("first UIKit frame visible");
+    if (!_bootIntroAttempted)
+    {
+        _bootIntroAttempted = YES;
+        [self showBootIntroIfNeeded];
+    }
     [self retryJITAndInitializeCore];
+    [self presentOnboardingIfNeeded];
+    ARMSX3AutoCheckForUpdates(self);
 }
+
+- (void)dismissBootIntro
+{
+    [_bootIntroPlayer pause];
+    _bootIntroPlayer = nil;
+    if (_bootIntroEndObserver) { [NSNotificationCenter.defaultCenter removeObserver:_bootIntroEndObserver]; _bootIntroEndObserver = nil; }
+    UIView *view = _bootIntroView;
+    _bootIntroView = nil;
+    [UIView animateWithDuration:0.18 animations:^{ view.alpha = 0; } completion:^(__unused BOOL finished) { [view removeFromSuperview]; }];
+    ARMSX3RefreshLibraryMusic(!_frontend.view.hidden);
+}
+
+- (void)showBootIntroIfNeeded
+{
+    if (!ARMSX3BootLogoEnabled()) return;
+    NSURL *url = [NSBundle.mainBundle URLForResource:@"boot_intro" withExtension:@"mp4"];
+    if (!url) return;
+    UIView *view = [[UIView alloc] initWithFrame:self.view.bounds];
+    view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    view.backgroundColor = UIColor.blackColor;
+    view.userInteractionEnabled = YES;
+    _bootIntroView = view;
+    [self.view addSubview:view];
+    AVPlayer *player = [AVPlayer playerWithURL:url];
+    _bootIntroPlayer = player;
+    AVPlayerLayer *layer = [AVPlayerLayer playerLayerWithPlayer:player];
+    layer.frame = view.bounds;
+    // Preserve the authored intro aspect ratio. AspectFill cropped/zoomed landscape intro
+    // video on tall iPhone/iPad windows and looked like the animation was forcibly stretched.
+    layer.videoGravity = AVLayerVideoGravityResizeAspect;
+    layer.needsDisplayOnBoundsChange = YES;
+    [view.layer addSublayer:layer];
+    [view addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(dismissBootIntro)]];
+    __weak typeof(self) weakSelf = self;
+    _bootIntroEndObserver = [NSNotificationCenter.defaultCenter addObserverForName:AVPlayerItemDidPlayToEndTimeNotification object:player.currentItem queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) { [weakSelf dismissBootIntro]; }];
+    ARMSX3RefreshLibraryMusic(NO);
+    [player play];
+    [self.view bringSubviewToFront:view];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ARMSX3ViewController *self = weakSelf;
+        if (self && self->_bootIntroView) [self dismissBootIntro];
+    });
+}
+
+- (void)presentOnboardingIfNeeded
+{
+    if (!armsx3_ios_is_initialized() || ARMSX3OnboardingCompleted() || self.presentedViewController) return;
+    [self presentOnboarding:NO];
+}
+
+- (void)presentOnboarding:(BOOL)reopening
+{
+    if (self.presentedViewController) return;
+    __weak typeof(self) weakSelf = self;
+    UIViewController *setup = ARMSX3MakeOnboardingViewController(^{
+        [weakSelf openFirmware];
+    }, ^{
+        [weakSelf openGame];
+    }, ^{
+        ARMSX3ViewController *self = weakSelf;
+        if (self) [self->_frontend reloadLibrary];
+    }, reopening);
+    [self presentViewController:setup animated:YES completion:nil];
+}
+
+- (void)showOnboarding { [self presentOnboarding:YES]; }
 
 - (void)retryJITAndInitializeCore
 {
@@ -369,6 +813,7 @@ static NSString *armsx3_prepare_shared_documents(void)
 
         dispatch_async(dispatch_get_main_queue(), ^{
             [self->_frontend setCoreReady:YES];
+            [self presentOnboardingIfNeeded];
         });
 
         const char *version = armsx3_ios_firmware_version();
@@ -382,23 +827,34 @@ static NSString *armsx3_prepare_shared_documents(void)
 - (void)setFrontendVisible:(BOOL)visible
 {
     dispatch_async(dispatch_get_main_queue(), ^{
-        self->_frontend.view.hidden = !visible;
-        self->_toolbar.hidden = visible;
         if (visible)
         {
+            ARMSX3PlayTimeStop();
+            self->_currentGameSerial = nil;
+        }
+        self->_frontend.view.hidden = !visible;
+        ARMSX3RefreshLibraryMusic(visible && self->_bootIntroView == nil);
+        if (visible) ARMSX3SetPauseMusicActive(NO);
+        if (visible)
+        {
+            [self->_touchControls applySkinForSerial:nil];
+            self->_overlayArtView.hidden = YES;
             self->_touchControls.hidden = YES;
             [self->_frontend reloadLibrary];
             [self.view bringSubviewToFront:self->_frontend.view];
         }
         else
         {
-            self->_touchControls.hidden = !self->_touchControls.controlsVisible;
-            [self.view bringSubviewToFront:self->_toolbar];
+            [self reloadOverlayArt];
+            self->_touchControls.hidden = !self->_touchControls.controlsVisible && !self->_touchControls.gestureEnabled;
             if (!self->_progressHUD.hidden)
                 [self.view bringSubviewToFront:self->_progressHUD];
             if (!self->_touchControls.hidden)
                 [self.view bringSubviewToFront:self->_touchControls];
         }
+        [self updatePauseToolbarVisibility];
+        [self refreshGyro];
+        if (@available(iOS 16.0, *)) [self setNeedsUpdateOfSupportedInterfaceOrientations];
     });
 }
 
@@ -412,9 +868,27 @@ static NSString *armsx3_prepare_shared_documents(void)
     double rate = self.view.window.screen.maximumFramesPerSecond ?: 60;
     armsx3_ios_set_surface((__bridge void *)_metalView,
         (int)llround(size.width * scale), (int)llround(size.height * scale), rate);
+    BOOL portraitTop = ARMSX3PortraitRenderTop(_currentGameSerial);
+    CGFloat insetPoints = size.height > size.width ? self.view.safeAreaInsets.top : 0;
+    armsx3_ios_set_render_position(portraitTop, (uint32_t)MAX(0, llround(insetPoints * scale)));
 }
 
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
+
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations
+{
+    if (_frontend && !_frontend.view.hidden)
+    {
+        switch (ARMSX3LauncherOrientationMode())
+        {
+        case 1: return UIInterfaceOrientationMaskLandscape;
+        case 2: return UIInterfaceOrientationMaskPortrait | UIInterfaceOrientationMaskPortraitUpsideDown;
+        case 3: return UIInterfaceOrientationMaskAll;
+        default: return UIInterfaceOrientationMaskAll;
+        }
+    }
+    return UIInterfaceOrientationMaskAll;
+}
 - (BOOL)prefersStatusBarHidden { return YES; }
 
 - (NSString *)applicationSupportPath
@@ -451,7 +925,8 @@ static NSString *armsx3_prepare_shared_documents(void)
     _toolbar.clipsToBounds = YES;
     [self.view addSubview:_toolbar];
 
-    UIButton *pause = [self toolbarButton:@"pause.fill" label:@"Open in-game menu" action:@selector(showEmulationMenu)];
+    UIButton *pause = [self toolbarButton:@"pause.fill" label:@"Open in-game menu" action:@selector(pauseToolbarTapped)];
+    _pauseToolbarButton = pause;
     _statusLabel = [[UILabel alloc] init];
     _statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
     _statusLabel.hidden = YES;
@@ -467,6 +942,7 @@ static NSString *armsx3_prepare_shared_documents(void)
         [pause.centerXAnchor constraintEqualToAnchor:_toolbar.contentView.centerXAnchor],
         [pause.centerYAnchor constraintEqualToAnchor:_toolbar.contentView.centerYAnchor],
     ]];
+    [self applyPauseTapRevealAppearance];
 
     _progressHUD = [[UIVisualEffectView alloc] initWithEffect:
         [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterialDark]];
@@ -503,17 +979,48 @@ static NSString *armsx3_prepare_shared_documents(void)
     ]];
 }
 
+- (BOOL)pauseTapToRevealEnabled
+{
+    return NO;
+}
+
+- (void)applyPauseTapRevealAppearance
+{
+    if (!_pauseToolbarButton || !_toolbar) return;
+    // Do not leave an invisible but tappable pause hotspot. Once this became the sole Pause/Menu
+    // affordance on iOS, tap-to-reveal could make the only button transparent while its 52pt hit
+    // target stayed live. The fallback must always be visibly discoverable.
+    _pauseToolbarButton.tintColor = UIColor.whiteColor;
+    _toolbar.effect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterialDark];
+    _toolbar.backgroundColor = UIColor.clearColor;
+}
+
+- (void)pauseToolbarTapped
+{
+    [self showEmulationMenu];
+}
+
+- (void)setPauseTapToRevealEnabled:(BOOL)enabled
+{
+    (void)enabled;
+    [NSUserDefaults.standardUserDefaults setBool:NO forKey:@"overlay.pauseTapReveal"];
+    [NSUserDefaults.standardUserDefaults setBool:YES forKey:@"overlay.pauseTapReveal.revealed"];
+    [self applyPauseTapRevealAppearance];
+}
+
 - (void)showEmulationMenu
 {
     if (self.presentedViewController) return;
     armsx3_ios_pause();
     _paused = YES;
+    ARMSX3SetPauseMusicActive(YES);
     ARMSX3EmulationMenuViewController *menu = [[ARMSX3EmulationMenuViewController alloc] initWithHost:self];
     [self presentViewController:menu animated:NO completion:nil];
 }
 
 - (void)resumeGameFromMenu
 {
+    ARMSX3SetPauseMusicActive(NO);
     _paused = NO;
     armsx3_ios_resume();
 }
@@ -522,6 +1029,40 @@ static NSString *armsx3_prepare_shared_documents(void)
 {
     ARMSX3SettingsViewController *settings = [[ARMSX3SettingsViewController alloc]
         initWithHost:self jitAvailable:_jitAvailable];
+    [self presentViewController:settings animated:YES completion:nil];
+}
+
+- (void)showTouchGestures
+{
+    UIViewController *controller = ARMSX3MakeGestureSettingsViewController(_touchControls);
+    if (controller) [self presentViewController:controller animated:YES completion:nil];
+}
+
+- (void)showTouchMacros
+{
+    UIViewController *controller = ARMSX3MakeMacroSettingsViewController(_touchControls);
+    if (controller) [self presentViewController:controller animated:YES completion:nil];
+}
+
+- (void)showCurrentGameSettings
+{
+    NSString *serial = _currentGameSerial;
+    if (!serial.length)
+    {
+        const char *raw = armsx3_ios_current_title_id();
+        if (raw && *raw) serial = [NSString stringWithUTF8String:raw];
+    }
+    if (!serial.length) { [self showSettings]; return; }
+    const char *rawTitle = armsx3_ios_current_title();
+    NSString *title = rawTitle && *rawTitle ? [NSString stringWithUTF8String:rawTitle] : serial;
+    [self showGameSettingsForSerial:serial title:title path:@""];
+}
+
+- (void)showGameSettingsForSerial:(NSString *)serial title:(NSString *)title path:(NSString *)path
+{
+    if (!serial.length) return;
+    ARMSX3SettingsViewController *settings = [[ARMSX3SettingsViewController alloc]
+        initWithHost:self jitAvailable:_jitAvailable gameSerial:serial gameTitle:title ?: serial gamePath:path ?: @""];
     [self presentViewController:settings animated:YES completion:nil];
 }
 
@@ -592,6 +1133,10 @@ static NSString *armsx3_prepare_shared_documents(void)
         ARMSX3ViewController *self = weakSelf;
         if (self && !self.presentedViewController) [self showEmulationMenu];
     };
+    _touchControls.controlsVisibilityChanged = ^(BOOL visible) {
+        ARMSX3ViewController *self = weakSelf;
+        if (self) [self updatePauseToolbarVisibility];
+    };
     _touchControls.editingEnded = ^{
         ARMSX3ViewController *self = weakSelf;
         if (!self) return;
@@ -602,10 +1147,10 @@ static NSString *armsx3_prepare_shared_documents(void)
         }
         else
         {
-            self->_touchControls.hidden = !self->_touchControls.controlsVisible;
-            [self.view bringSubviewToFront:self->_toolbar];
+            self->_touchControls.hidden = !self->_touchControls.controlsVisible && !self->_touchControls.gestureEnabled;
             if (!self->_touchControls.hidden) [self.view bringSubviewToFront:self->_touchControls];
         }
+        [self updatePauseToolbarVisibility];
     };
     [NSLayoutConstraint activateConstraints:@[
         [_touchControls.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
@@ -613,6 +1158,23 @@ static NSString *armsx3_prepare_shared_documents(void)
         [_touchControls.topAnchor constraintEqualToAnchor:self.view.topAnchor],
         [_touchControls.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
     ]];
+}
+
+- (void)updatePauseToolbarVisibility
+{
+    if (!_toolbar) return;
+    const BOOL gameplayVisible = _frontend && _frontend.view.hidden;
+    // One Pause/Menu entry point on iOS, independent of virtual-pad visibility. The Android PAUSE
+    // widget is not instantiated by ARMSX3TouchControlsView, so toggling/auto-hiding the pad must
+    // never make this button disappear or leave only a transparent hit target behind.
+    _toolbar.hidden = !gameplayVisible;
+    _toolbar.userInteractionEnabled = gameplayVisible;
+    _pauseToolbarButton.userInteractionEnabled = gameplayVisible;
+    if (gameplayVisible)
+    {
+        [self applyPauseTapRevealAppearance];
+        [self.view bringSubviewToFront:_toolbar];
+    }
 }
 
 - (void)showStatus:(NSString *)message error:(BOOL)error
@@ -677,7 +1239,8 @@ static NSString *armsx3_prepare_shared_documents(void)
     picker.allowsMultipleSelection = NO;
     NSURL *gamesURL = [self documentsSubdirectoryURL:@"Games"];
     if (gamesURL) picker.directoryURL = gamesURL;
-    [self presentViewController:picker animated:YES completion:nil];
+    UIViewController *presenter = self.presentedViewController ?: self;
+    [presenter presentViewController:picker animated:YES completion:nil];
 }
 
 - (void)openPackage
@@ -686,7 +1249,7 @@ static NSString *armsx3_prepare_shared_documents(void)
     UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc]
         initForOpeningContentTypes:@[UTTypeData] asCopy:YES];
     picker.delegate = self;
-    picker.allowsMultipleSelection = NO;
+    picker.allowsMultipleSelection = YES;
     NSURL *gamesURL = [self documentsSubdirectoryURL:@"Games"];
     if (gamesURL) picker.directoryURL = gamesURL;
     [self presentViewController:picker animated:YES completion:nil];
@@ -701,6 +1264,18 @@ static NSString *armsx3_prepare_shared_documents(void)
     picker.allowsMultipleSelection = NO;
     NSURL *firmwareURL = [self documentsSubdirectoryURL:@"Firmware"];
     if (firmwareURL) picker.directoryURL = firmwareURL;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)swapDiscFromMenu
+{
+    _pickerPurpose = ARMSX3PickerPurposeSwapDisc;
+    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc]
+        initForOpeningContentTypes:@[UTTypeFolder, UTTypeData, UTTypeItem] asCopy:NO];
+    picker.delegate = self;
+    picker.allowsMultipleSelection = NO;
+    NSURL *gamesURL = [self documentsSubdirectoryURL:@"Games"];
+    if (gamesURL) picker.directoryURL = gamesURL;
     [self presentViewController:picker animated:YES completion:nil];
 }
 
@@ -721,6 +1296,11 @@ static NSString *armsx3_prepare_shared_documents(void)
             [self showStatus:[NSString stringWithFormat:@"Firmware boot failed (%d)", result] error:YES];
             [self setFrontendVisible:YES];
         }
+        else if (self->_currentGameSerial.length)
+        {
+            NSString *serial = [self->_currentGameSerial copy];
+            dispatch_async(dispatch_get_main_queue(), ^{ ARMSX3PlayTimeStart(serial); });
+        }
     });
 }
 
@@ -730,14 +1310,29 @@ static NSString *armsx3_prepare_shared_documents(void)
     [_activeSecurityURL stopAccessingSecurityScopedResource];
     _activeSecurityURL = url;
     [_activeSecurityURL startAccessingSecurityScopedResource];
+    NSString *bootSerial = nil;
+    const char *gameInfoRaw = armsx3_ios_game_info_json(url.fileSystemRepresentation);
+    if (gameInfoRaw && *gameInfoRaw)
+    {
+        NSData *data = [[NSString stringWithUTF8String:gameInfoRaw] dataUsingEncoding:NSUTF8StringEncoding];
+        NSDictionary *info = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        bootSerial = [info[@"serial"] isKindOfClass:NSString.class] ? info[@"serial"] : nil;
+        [_touchControls applySkinForSerial:bootSerial];
+    }
+    _currentGameSerial = [bootSerial copy];
     [self setFrontendVisible:NO];
     [self showStatus:[NSString stringWithFormat:@"Booting %@", url.lastPathComponent] error:NO];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         int result = armsx3_ios_boot(url.fileSystemRepresentation);
         if (result != 0)
         {
-            [self showStatus:[NSString stringWithFormat:@"Boot failed (%d)", result] error:YES];
-            [self setFrontendVisible:YES];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NSString *message = result == 2
+                    ? @"这个目录只有游戏数据，没有可直接启动的 EBOOT.BIN；请从首页启动对应的 PKG 启动器。"
+                    : [NSString stringWithFormat:@"Boot failed (%d)", result];
+                [self showStatus:message error:YES];
+                [self setFrontendVisible:YES];
+            });
         }
     });
 }
@@ -758,24 +1353,58 @@ static NSString *armsx3_prepare_shared_documents(void)
 
     if (_pickerPurpose == ARMSX3PickerPurposePackage)
     {
-        if (![url.pathExtension.lowercaseString hasPrefix:@"pkg"])
+        NSMutableArray<NSURL *> *packages = [NSMutableArray array];
+        NSMutableArray<NSURL *> *licences = [NSMutableArray array];
+        for (NSURL *picked in urls)
         {
-            [self showStatus:@"请选择 .pkg 文件" error:YES];
+            NSString *name = picked.lastPathComponent.lowercaseString;
+            if ([name containsString:@".pkg"]) [packages addObject:picked];
+            else if ([name hasSuffix:@".rap"] || [name hasSuffix:@".edat"]) [licences addObject:picked];
+        }
+        if (!packages.count && !licences.count)
+        {
+            [self showStatus:@"请选择 .pkg、.rap 或 .edat 文件" error:YES];
             return;
         }
-        [self showStatus:@"Installing PKG..." error:NO];
+        [packages sortUsingComparator:^NSComparisonResult(NSURL *a, NSURL *b) {
+            return [a.lastPathComponent localizedStandardCompare:b.lastPathComponent];
+        }];
+        NSMutableArray<NSURL *> *ordered = [packages mutableCopy];
+        [ordered addObjectsFromArray:licences];
+        [self showStatus:ordered.count > 1 ? @"Installing packages..." : @"Installing package..." error:NO];
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-            BOOL ok = armsx3_ios_install_package(url.fileSystemRepresentation);
-            [self showStatus:ok ? @"PKG installed" : @"PKG installation failed" error:!ok];
+            std::vector<const char *> paths;
+            paths.reserve(ordered.count);
+            for (NSURL *picked in ordered) paths.push_back(picked.fileSystemRepresentation);
+            BOOL ok = armsx3_ios_install_packages(paths.data(), paths.size());
+            [self showStatus:ok ? @"Installation complete" : @"Installation failed" error:!ok];
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self->_frontend reloadLibrary];
-                UIAlertController *result = [UIAlertController alertControllerWithTitle:ok ? @"PKG 安装完成" : @"PKG 安装失败"
-                    message:ok ? @"游戏库已经刷新。" : @"请查看运行日志获取具体原因。"
+                UIAlertController *result = [UIAlertController alertControllerWithTitle:ok ? @"安装完成" : @"安装失败"
+                    message:ok ? @"PKG/许可证已处理，游戏库已经刷新。" : @"请查看运行日志获取具体原因。"
                     preferredStyle:UIAlertControllerStyleAlert];
                 [result addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
                 [self presentViewController:result animated:YES completion:nil];
             });
         });
+        return;
+    }
+
+    if (_pickerPurpose == ARMSX3PickerPurposeSwapDisc)
+    {
+        BOOL scoped = [url startAccessingSecurityScopedResource];
+        BOOL ok = armsx3_ios_swap_disc(url.fileSystemRepresentation);
+        if (ok)
+        {
+            [_swapDiscSecurityURL stopAccessingSecurityScopedResource];
+            _swapDiscSecurityURL = scoped ? url : nil;
+            [self showStatus:@"Disc changed" error:NO];
+        }
+        else
+        {
+            if (scoped) [url stopAccessingSecurityScopedResource];
+            [self showStatus:@"Disc change failed" error:YES];
+        }
         return;
     }
 
@@ -795,6 +1424,8 @@ static NSString *armsx3_prepare_shared_documents(void)
         const BOOL stopped = armsx3_ios_stop();
         if (stopped)
         {
+            [_swapDiscSecurityURL stopAccessingSecurityScopedResource];
+            _swapDiscSecurityURL = nil;
             armsx3_ios_log_memory_state("stop complete");
             [self setFrontendVisible:YES];
         }
@@ -805,7 +1436,7 @@ static NSString *armsx3_prepare_shared_documents(void)
 
 - (void)toggleControls
 {
-    _touchControls.controlsVisible = !_touchControls.controlsVisible;
+    _touchControls.visibilityMode = _touchControls.visibilityMode == 0 ? 11 : 0;
     if (!_frontend.view.hidden) _touchControls.hidden = YES;
 }
 
@@ -845,7 +1476,20 @@ static NSString *armsx3_prepare_shared_documents(void)
 
 - (void)pushPad
 {
-    armsx3_ios_set_pad(0, _digital1, _digital2, _leftX, _leftY, _rightX, _rightY,
+    uint8_t lx = _leftX, ly = _leftY, rx = _rightX, ry = _rightY;
+    ARMSX3ControllerMappings *mappings = ARMSX3ControllerMappings.shared;
+    const NSInteger gyroMode = mappings.gyroMode;
+    const BOOL gyroLeft = gyroMode == 2 || (gyroMode == 1 && mappings.gyroAimStick == 1);
+    if (gyroMode != 0 && (_gyroX != 0.0 || _gyroY != 0.0))
+    {
+        uint8_t *x = gyroLeft ? &lx : &rx;
+        uint8_t *y = gyroLeft ? &ly : &ry;
+        double nx = ((*x) - 127.5) / 127.5 + _gyroX;
+        double ny = ((*y) - 127.5) / 127.5 + _gyroY;
+        *x = (uint8_t)lrint((MIN(1.0, MAX(-1.0, nx)) + 1.0) * 127.5);
+        *y = (uint8_t)lrint((MIN(1.0, MAX(-1.0, ny)) + 1.0) * 127.5);
+    }
+    armsx3_ios_set_pad(0, _digital1, _digital2, lx, ly, rx, ry,
         _leftTrigger, _rightTrigger);
 }
 
@@ -937,7 +1581,12 @@ static NSString *armsx3_prepare_shared_documents(void)
         if (!self) return;
         ARMSX3ControllerMappings *mappings = ARMSX3ControllerMappings.shared;
         if ([mappings consumeCaptureForElement:element gamepad:gamepad]) return;
-        NSSet<NSString *> *pressed = [mappings pressedPhysicalIdentifiersForGamepad:gamepad];
+        if (self->_frontend.view.hidden) [self->_touchControls noteControllerInputDetected];
+        NSArray<GCController *> *controllers = GCController.controllers;
+        NSUInteger found = [controllers indexOfObjectIdenticalTo:controller];
+        NSInteger player = found == NSNotFound ? 0 : MIN((NSInteger)found, 6);
+        NSSet<NSString *> *rawPressed = [mappings pressedPhysicalIdentifiersForGamepad:gamepad];
+        NSMutableSet<NSString *> *pressed = [self consumePhysicalMacrosForPlayer:player pressed:rawPressed];
         NSMutableSet<NSString *> *activeHotkeys = [NSMutableSet set];
         for (NSString *physical in pressed)
         {
@@ -948,33 +1597,47 @@ static NSString *armsx3_prepare_shared_documents(void)
         }
         self->_activeHotkeyPhysical = activeHotkeys;
         uint32_t d1 = 0, d2 = 0;
-        if ([mappings isTarget:@"up" pressedIn:pressed]) d1 |= CELL_PAD_CTRL_UP;
-        if ([mappings isTarget:@"down" pressedIn:pressed]) d1 |= CELL_PAD_CTRL_DOWN;
-        if ([mappings isTarget:@"left" pressedIn:pressed]) d1 |= CELL_PAD_CTRL_LEFT;
-        if ([mappings isTarget:@"right" pressedIn:pressed]) d1 |= CELL_PAD_CTRL_RIGHT;
-        if ([mappings isTarget:@"cross" pressedIn:pressed]) d2 |= CELL_PAD_CTRL_CROSS;
-        if ([mappings isTarget:@"circle" pressedIn:pressed]) d2 |= CELL_PAD_CTRL_CIRCLE;
-        if ([mappings isTarget:@"square" pressedIn:pressed]) d2 |= CELL_PAD_CTRL_SQUARE;
-        if ([mappings isTarget:@"triangle" pressedIn:pressed]) d2 |= CELL_PAD_CTRL_TRIANGLE;
-        if ([mappings isTarget:@"l1" pressedIn:pressed]) d2 |= CELL_PAD_CTRL_L1;
-        if ([mappings isTarget:@"r1" pressedIn:pressed]) d2 |= CELL_PAD_CTRL_R1;
-        if ([mappings isTarget:@"l2" pressedIn:pressed]) d2 |= CELL_PAD_CTRL_L2;
-        if ([mappings isTarget:@"r2" pressedIn:pressed]) d2 |= CELL_PAD_CTRL_R2;
-        if ([mappings isTarget:@"l3" pressedIn:pressed]) d1 |= CELL_PAD_CTRL_L3;
-        if ([mappings isTarget:@"r3" pressedIn:pressed]) d1 |= CELL_PAD_CTRL_R3;
-        if ([mappings isTarget:@"start" pressedIn:pressed]) d1 |= CELL_PAD_CTRL_START;
-        if ([mappings isTarget:@"select" pressedIn:pressed]) d1 |= CELL_PAD_CTRL_SELECT;
-        self->_digital1 = d1;
-        self->_digital2 = d2;
-        self->_leftX = (uint8_t)lrintf((gamepad.leftThumbstick.xAxis.value + 1.f) * 127.5f);
-        self->_leftY = (uint8_t)lrintf((1.f - gamepad.leftThumbstick.yAxis.value) * 127.5f);
-        self->_rightX = (uint8_t)lrintf((gamepad.rightThumbstick.xAxis.value + 1.f) * 127.5f);
-        self->_rightY = (uint8_t)lrintf((1.f - gamepad.rightThumbstick.yAxis.value) * 127.5f);
-        NSString *leftTriggerBinding = [mappings bindingForTarget:@"l2"];
-        NSString *rightTriggerBinding = [mappings bindingForTarget:@"r2"];
-        self->_leftTrigger = (d2 & CELL_PAD_CTRL_L2) ? ([leftTriggerBinding isEqualToString:@"leftTrigger"] ? (uint8_t)lrintf(gamepad.leftTrigger.value * 255.f) : 255) : 0;
-        self->_rightTrigger = (d2 & CELL_PAD_CTRL_R2) ? ([rightTriggerBinding isEqualToString:@"rightTrigger"] ? (uint8_t)lrintf(gamepad.rightTrigger.value * 255.f) : 255) : 0;
-        [self pushPad];
+        const BOOL dpadAsStick = mappings.dpadAsLeftStick;
+        if (!dpadAsStick && [mappings isTarget:@"up" player:player pressedIn:pressed]) d1 |= CELL_PAD_CTRL_UP;
+        if (!dpadAsStick && [mappings isTarget:@"down" player:player pressedIn:pressed]) d1 |= CELL_PAD_CTRL_DOWN;
+        if (!dpadAsStick && [mappings isTarget:@"left" player:player pressedIn:pressed]) d1 |= CELL_PAD_CTRL_LEFT;
+        if (!dpadAsStick && [mappings isTarget:@"right" player:player pressedIn:pressed]) d1 |= CELL_PAD_CTRL_RIGHT;
+        if ([mappings isTarget:@"cross" player:player pressedIn:pressed]) d2 |= CELL_PAD_CTRL_CROSS;
+        if ([mappings isTarget:@"circle" player:player pressedIn:pressed]) d2 |= CELL_PAD_CTRL_CIRCLE;
+        if ([mappings isTarget:@"square" player:player pressedIn:pressed]) d2 |= CELL_PAD_CTRL_SQUARE;
+        if ([mappings isTarget:@"triangle" player:player pressedIn:pressed]) d2 |= CELL_PAD_CTRL_TRIANGLE;
+        if ([mappings isTarget:@"l1" player:player pressedIn:pressed]) d2 |= CELL_PAD_CTRL_L1;
+        if ([mappings isTarget:@"r1" player:player pressedIn:pressed]) d2 |= CELL_PAD_CTRL_R1;
+        if ([mappings isTarget:@"l2" player:player pressedIn:pressed]) d2 |= CELL_PAD_CTRL_L2;
+        if ([mappings isTarget:@"r2" player:player pressedIn:pressed]) d2 |= CELL_PAD_CTRL_R2;
+        if ([mappings isTarget:@"l3" player:player pressedIn:pressed]) d1 |= CELL_PAD_CTRL_L3;
+        if ([mappings isTarget:@"r3" player:player pressedIn:pressed]) d1 |= CELL_PAD_CTRL_R3;
+        if ([mappings isTarget:@"start" player:player pressedIn:pressed]) d1 |= CELL_PAD_CTRL_START;
+        if ([mappings isTarget:@"select" player:player pressedIn:pressed]) d1 |= CELL_PAD_CTRL_SELECT;
+
+        float leftX = gamepad.leftThumbstick.xAxis.value;
+        float leftY = gamepad.leftThumbstick.yAxis.value;
+        if (dpadAsStick && (fabsf(gamepad.dpad.xAxis.value) > 0.01f || fabsf(gamepad.dpad.yAxis.value) > 0.01f))
+        {
+            leftX = gamepad.dpad.xAxis.value;
+            leftY = gamepad.dpad.yAxis.value;
+        }
+        CGPoint left = [mappings processedStick:CGPointMake(leftX, leftY) left:YES];
+        CGPoint right = [mappings processedStick:CGPointMake(gamepad.rightThumbstick.xAxis.value, gamepad.rightThumbstick.yAxis.value) left:NO];
+        uint8_t lx = (uint8_t)lrint((left.x + 1.0) * 127.5);
+        uint8_t ly = (uint8_t)lrint((1.0 - left.y) * 127.5);
+        uint8_t rx = (uint8_t)lrint((right.x + 1.0) * 127.5);
+        uint8_t ry = (uint8_t)lrint((1.0 - right.y) * 127.5);
+        NSString *leftTriggerBinding = [mappings bindingForTarget:@"l2" player:player];
+        NSString *rightTriggerBinding = [mappings bindingForTarget:@"r2" player:player];
+        uint8_t lt = (d2 & CELL_PAD_CTRL_L2) ? ([leftTriggerBinding isEqualToString:@"leftTrigger"] ? (uint8_t)lrintf(gamepad.leftTrigger.value * 255.f) : 255) : 0;
+        uint8_t rt = (d2 & CELL_PAD_CTRL_R2) ? ([rightTriggerBinding isEqualToString:@"rightTrigger"] ? (uint8_t)lrintf(gamepad.rightTrigger.value * 255.f) : 255) : 0;
+        self->_physicalPressed[player] = [pressed mutableCopy];
+        self->_physicalDigital1[player] = d1; self->_physicalDigital2[player] = d2;
+        self->_physicalLeftX[player] = lx; self->_physicalLeftY[player] = ly;
+        self->_physicalRightX[player] = rx; self->_physicalRightY[player] = ry;
+        self->_physicalLeftTrigger[player] = lt; self->_physicalRightTrigger[player] = rt;
+        [self pushPhysicalPlayer:player];
     };
 }
 
@@ -1039,10 +1702,14 @@ static void armsx3_event_callback(int event, const char *message)
 }
 - (void)applicationDidEnterBackground:(UIApplication *)application
 {
+    ARMSX3SecondScreenSetForeground(NO);
+    ARMSX3RumbleBridgeStop();
     if (armsx3_ios_is_initialized()) armsx3_ios_pause();
 }
 - (void)applicationDidBecomeActive:(UIApplication *)application
 {
+    ARMSX3SecondScreenSetForeground(YES);
+    ARMSX3RumbleBridgeStart();
     ARMSX3ViewController *controller = g_view_controller;
     if (controller && !armsx3_ios_is_initialized())
         [controller retryJITAndInitializeCore];

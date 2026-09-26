@@ -16,4 +16,9 @@
 - (instancetype)initWithHost:(id<ARMSX3SettingsHost>)host
                 jitAvailable:(BOOL)jitAvailable
                     coreOnly:(BOOL)coreOnly;
+- (instancetype)initWithHost:(id<ARMSX3SettingsHost>)host
+                jitAvailable:(BOOL)jitAvailable
+                  gameSerial:(NSString *)gameSerial
+                   gameTitle:(NSString *)gameTitle
+                    gamePath:(NSString *)gamePath;
 @end

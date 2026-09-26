@@ -19,7 +19,7 @@
     <key>CFBundleShortVersionString</key>
     <string>0.9.9</string>
     <key>CFBundleVersion</key>
-    <string>37</string>
+    <string>45</string>
     <key>LSRequiresIPhoneOS</key>
     <true/>
     <key>MinimumOSVersion</key>
@@ -57,6 +57,8 @@
     </dict>
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>ARMSX3 uses Bluetooth game controllers for emulated input.</string>
+    <key>NSMotionUsageDescription</key>
+    <string>ARMSX3 uses device motion for optional gyroscope aiming and steering controls.</string>
     <key>NSLocalNetworkUsageDescription</key>
     <string>ARMSX3 uses the local network for games that provide network features.</string>
 </dict>

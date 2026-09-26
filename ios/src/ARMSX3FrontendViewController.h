@@ -9,6 +9,8 @@
 - (void)bootFirmware;
 - (void)showSettings;
 - (void)showCoreSettings;
+- (void)showOnboarding;
+- (void)showGameSettingsForSerial:(NSString *)serial title:(NSString *)title path:(NSString *)path;
 - (void)toggleControls;
 - (void)shareLog;
 - (void)stopGame;

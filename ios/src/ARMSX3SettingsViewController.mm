@@ -2,10 +2,37 @@
 #import "ARMSX3LibraryManagers.h"
 #import "ARMSX3ControllerMappings.h"
 #import "ARMSX3Localization.h"
+#import "ARMSX3OverlayArt.h"
+#import "ARMSX3SkinManager.h"
+#import "ARMSX3RPCNViewController.h"
+#import "ARMSX3LibraryMetadata.h"
+#import "ARMSX3ShaderChainViewController.h"
+#import "ARMSX3AppSettingsViewController.h"
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 #include "armsx3_ios_core.h"
 
 #include <cmath>
+
+static NSString *const ARMSX3LibraryAppearanceDidChangeNotification = @"ARMSX3LibraryAppearanceDidChangeNotification";
+static NSString *const ARMSX3LibraryShowSearchKey = @"ARMSX3.Library.ShowSearch";
+static NSString *const ARMSX3LibraryShowRecentsKey = @"ARMSX3.Library.ShowRecents";
+static NSString *const ARMSX3LibraryShowGridNamesKey = @"ARMSX3.Library.ShowGridNames";
+static NSString *const ARMSX3LibraryCoverScaleKey = @"ARMSX3.Library.CoverScalePercent";
+static NSString *const ARMSX3LibraryOpacityKey = @"ARMSX3.Library.OpacityPercent";
+
+static BOOL ARMSX3SettingBool(NSString *key, BOOL fallback)
+{
+    id value = [NSUserDefaults.standardUserDefaults objectForKey:key];
+    return value ? [value boolValue] : fallback;
+}
+
+
+static NSInteger ARMSX3SettingInteger(NSString *key, NSInteger fallback)
+{
+    id value = [NSUserDefaults.standardUserDefaults objectForKey:key];
+    return value ? [value integerValue] : fallback;
+}
 
 @interface ARMSX3CoreSetting : NSObject
 @property(nonatomic, copy) NSString *path;
@@ -203,6 +230,7 @@ static NSString *ARMSX3PolishedValue(id value)
 typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
 {
     ARMSX3SettingsCategoryGeneral,
+    ARMSX3SettingsCategoryInfo,
     ARMSX3SettingsCategoryPerformance,
     ARMSX3SettingsCategoryGraphics,
     ARMSX3SettingsCategoryAudio,
@@ -217,7 +245,7 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     ARMSX3SettingsCategoryCore,
 };
 
-@interface ARMSX3SettingsViewController () <UITableViewDataSource, UITableViewDelegate, UISearchBarDelegate>
+@interface ARMSX3SettingsViewController () <UITableViewDataSource, UITableViewDelegate, UISearchBarDelegate, UIDocumentPickerDelegate>
 @end
 
 @implementation ARMSX3SettingsViewController
@@ -225,6 +253,11 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     __weak id<ARMSX3SettingsHost> _host;
     BOOL _jitAvailable;
     BOOL _coreOnly;
+    NSString *_gameSerial;
+    NSString *_gameTitle;
+    NSString *_gamePath;
+    NSDictionary *_gameInfo;
+    NSInteger _infoPickerPurpose;
     ARMSX3SettingsCategory _category;
     NSArray<ARMSX3CoreSetting *> *_allSettings;
     NSArray<ARMSX3CoreSetting *> *_visibleSettings;
@@ -236,6 +269,244 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     UILabel *_subtitleLabel;
     UILabel *_pageTitleLabel;
     NSArray<UIButton *> *_categoryButtons;
+}
+
+- (void)showInfoMessage:(NSString *)message
+{
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:_gameTitle.length ? _gameTitle : _gameSerial
+        message:message preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:ARMSX3L(@"action.ok", @"OK") style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)editCustomGameName
+{
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:ARMSX3L(@"info.customName.label", @"Custom Display Name")
+        message:ARMSX3L(@"info.customName.help", @"Leave blank to restore the title read from PARAM.SFO.") preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
+        field.text = ARMSX3CustomGameName(self->_gameSerial) ?: self->_gameTitle;
+        field.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    [alert addAction:[UIAlertAction actionWithTitle:ARMSX3L(@"action.cancel", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:ARMSX3L(@"action.save", @"Save") style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        ARMSX3SetCustomGameName(self->_gameSerial, alert.textFields.firstObject.text);
+        NSString *custom = ARMSX3CustomGameName(self->_gameSerial);
+        if (custom.length) self->_gameTitle = custom;
+        [self updateLocalizedChrome];
+        [self->_tableView reloadData];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:ARMSX3L(@"info.customName.clear", @"Clear Override") style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
+        ARMSX3SetCustomGameName(self->_gameSerial, nil);
+        NSString *parsed = [self->_gameInfo[@"title"] isKindOfClass:NSString.class] ? self->_gameInfo[@"title"] : nil;
+        if (parsed.length) self->_gameTitle = parsed;
+        [self updateLocalizedChrome];
+        [self->_tableView reloadData];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)editCustomCover
+{
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:ARMSX3L(@"info.cover.label", @"Custom Cover") message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    [sheet addAction:[UIAlertAction actionWithTitle:ARMSX3L(@"info.cover.select", @"Choose Image") style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        self->_infoPickerPurpose = 1;
+        UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeImage] asCopy:YES];
+        picker.delegate = self;
+        picker.allowsMultipleSelection = NO;
+        [self presentViewController:picker animated:YES completion:nil];
+    }]];
+    if (ARMSX3CustomCoverURL(_gameSerial))
+        [sheet addAction:[UIAlertAction actionWithTitle:ARMSX3L(@"info.cover.remove", @"Remove Custom Cover") style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
+            ARMSX3ClearCustomCover(self->_gameSerial);
+            [self->_tableView reloadData];
+        }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:ARMSX3L(@"action.cancel", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
+    sheet.popoverPresentationController.sourceView = self.view;
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)exportGameConfig
+{
+    const char *raw = armsx3_ios_game_config_text(_gameSerial.UTF8String);
+    NSString *text = raw && *raw ? [NSString stringWithUTF8String:raw] : nil;
+    if (!text.length)
+    {
+        [self showInfoMessage:ARMSX3L(@"info.exportSettings.none", @"This title does not have a custom RPCS3 configuration yet.")];
+        return;
+    }
+    NSURL *documents = [NSFileManager.defaultManager URLForDirectory:NSDocumentDirectory inDomain:NSUserDomainMask appropriateForURL:nil create:YES error:nil];
+    NSURL *dir = [[documents URLByAppendingPathComponent:@"ARMSX3" isDirectory:YES] URLByAppendingPathComponent:@"Exports" isDirectory:YES];
+    [NSFileManager.defaultManager createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSURL *file = [dir URLByAppendingPathComponent:[NSString stringWithFormat:@"%@-config.yml", _gameSerial]];
+    if (![text writeToURL:file atomically:YES encoding:NSUTF8StringEncoding error:nil])
+    {
+        [self showInfoMessage:ARMSX3L(@"info.exportSettings.failed", @"Could not write the configuration export.")];
+        return;
+    }
+    UIActivityViewController *share = [[UIActivityViewController alloc] initWithActivityItems:@[file] applicationActivities:nil];
+    share.popoverPresentationController.sourceView = self.view;
+    [self presentViewController:share animated:YES completion:nil];
+}
+
+- (void)importGameConfig
+{
+    if (!armsx3_ios_settings_editable())
+    {
+        [self showInfoMessage:ARMSX3L(@"ios.settings.footer.running", @"Stop emulation before importing a per-game config.")];
+        return;
+    }
+    _infoPickerPurpose = 2;
+    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeData, UTTypeText] asCopy:YES];
+    picker.delegate = self;
+    picker.allowsMultipleSelection = NO;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)confirmResetGameSettings
+{
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:ARMSX3L(@"info.resetSettings", @"Reset Per-Game Settings?")
+        message:[NSString stringWithFormat:@"%@ (%@)\n%@", _gameTitle.length ? _gameTitle : _gameSerial, _gameSerial,
+            ARMSX3L(@"info.resetSettings.desc", @"This title will inherit global RPCS3 settings again.")]
+        preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:ARMSX3L(@"action.cancel", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:ARMSX3L(@"action.reset", @"Reset") style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
+        typeof(self) self = weakSelf;
+        if (self && armsx3_ios_reset_game_settings(self->_gameSerial.UTF8String))
+        {
+            [self reloadCoreSettings];
+            [self->_tableView reloadData];
+        }
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls
+{
+    NSURL *url = urls.firstObject;
+    NSInteger purpose = _infoPickerPurpose;
+    _infoPickerPurpose = 0;
+    if (!url) return;
+    if (purpose == 1)
+    {
+        if (!ARMSX3SetCustomCover(_gameSerial, url))
+            [self showInfoMessage:ARMSX3L(@"info.cover.failed", @"That file could not be used as a cover image.")];
+        [self->_tableView reloadData];
+        return;
+    }
+    if (purpose == 2)
+    {
+        NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:url.path error:nil];
+        if (attrs.fileSize > 2 * 1024 * 1024)
+        {
+            [self showInfoMessage:@"Configuration file is too large."];
+            return;
+        }
+        NSString *text = [NSString stringWithContentsOfURL:url encoding:NSUTF8StringEncoding error:nil];
+        if (!text.length || !armsx3_ios_import_game_config_text(_gameSerial.UTF8String, text.UTF8String))
+        {
+            [self showInfoMessage:ARMSX3L(@"info.importSettings.failed", @"The selected file is not a valid RPCS3 configuration.")];
+            return;
+        }
+        [self reloadCoreSettings];
+        [self showInfoMessage:ARMSX3L(@"info.importSettings.ok", @"Per-game configuration imported.")];
+    }
+}
+
+- (void)confirmClearCaches
+{
+    if (!armsx3_ios_settings_editable())
+    {
+        [self showInfoMessage:ARMSX3L(@"ios.settings.footer.running", @"Stop emulation before clearing caches.")];
+        return;
+    }
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:ARMSX3L(@"app.clearCache", @"Clear Cache")
+        message:ARMSX3L(@"app.clearCache.desc", @"Remove regenerable shader, pipeline, artwork and temporary download caches. They will be rebuilt as needed.")
+        preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:ARMSX3L(@"action.cancel", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:ARMSX3L(@"app.clearCache", @"Clear Cache") style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
+        typeof(self) self = weakSelf;
+        if (!self) return;
+        NSFileManager *fm = NSFileManager.defaultManager;
+        unsigned long long removedBytes = 0;
+        NSUInteger removedFiles = 0;
+        NSMutableArray<NSURL *> *roots = [NSMutableArray array];
+        NSURL *systemCache = [fm URLForDirectory:NSCachesDirectory inDomain:NSUserDomainMask appropriateForURL:nil create:YES error:nil];
+        if (systemCache) [roots addObject:systemCache];
+        NSURL *support = [fm URLForDirectory:NSApplicationSupportDirectory inDomain:NSUserDomainMask appropriateForURL:nil create:YES error:nil];
+        NSURL *coreCache = [[support URLByAppendingPathComponent:@"ARMSX3" isDirectory:YES] URLByAppendingPathComponent:@"cache" isDirectory:YES];
+        if (coreCache) [roots addObject:coreCache];
+
+        for (NSURL *root in roots)
+        {
+            NSArray<NSURL *> *children = [fm contentsOfDirectoryAtURL:root
+                includingPropertiesForKeys:@[NSURLIsDirectoryKey, NSURLFileSizeKey]
+                                   options:0 error:nil] ?: @[];
+            for (NSURL *child in children)
+            {
+                NSDirectoryEnumerator<NSURL *> *enumerator = [fm enumeratorAtURL:child
+                    includingPropertiesForKeys:@[NSURLIsRegularFileKey, NSURLFileSizeKey]
+                                       options:0 errorHandler:nil];
+                for (NSURL *entry in enumerator)
+                {
+                    NSNumber *regular = nil, *size = nil;
+                    [entry getResourceValue:&regular forKey:NSURLIsRegularFileKey error:nil];
+                    if (regular.boolValue)
+                    {
+                        [entry getResourceValue:&size forKey:NSURLFileSizeKey error:nil];
+                        removedBytes += size.unsignedLongLongValue;
+                        removedFiles++;
+                    }
+                }
+                NSNumber *regular = nil, *size = nil;
+                [child getResourceValue:&regular forKey:NSURLIsRegularFileKey error:nil];
+                if (regular.boolValue)
+                {
+                    [child getResourceValue:&size forKey:NSURLFileSizeKey error:nil];
+                    removedBytes += size.unsignedLongLongValue;
+                    removedFiles++;
+                }
+                [fm removeItemAtURL:child error:nil];
+            }
+        }
+        [fm createDirectoryAtURL:coreCache withIntermediateDirectories:YES attributes:nil error:nil];
+        double megabytes = removedBytes / (1024.0 * 1024.0);
+        NSString *amount = [NSString stringWithFormat:@"%.1f MB", megabytes];
+        NSString *doneTemplate = ARMSX3L(@"app.clearCache.done", @"Cleared %s of cached data.");
+        NSString *summary = removedFiles
+            ? [doneTemplate stringByReplacingOccurrencesOfString:@"%s" withString:amount]
+            : ARMSX3L(@"app.clearCache.empty", @"There was no cached data to clear.");
+        [self showInfoMessage:summary];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)confirmResetGlobalSettings
+{
+    if (!armsx3_ios_settings_editable())
+    {
+        [self showInfoMessage:ARMSX3L(@"ios.settings.footer.running", @"Stop emulation before resetting RPCS3 settings.")];
+        return;
+    }
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:ARMSX3L(@"app.resetAll", @"Reset All RPCS3 Settings")
+        message:ARMSX3L(@"app.resetAll.confirm", @"Reset all global emulator settings to their defaults? Games, firmware, saves and other user data are not deleted.")
+        preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:ARMSX3L(@"action.cancel", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:ARMSX3L(@"action.reset", @"Reset") style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
+        typeof(self) self = weakSelf;
+        if (!self) return;
+        if (!armsx3_ios_reset_global_settings())
+        {
+            [self showInfoMessage:ARMSX3L(@"app.resetAll.failed", @"Could not reset RPCS3 settings while the emulator is busy.")];
+            return;
+        }
+        [self reloadCoreSettings];
+        [self->_tableView reloadData];
+        [self showInfoMessage:ARMSX3L(@"app.resetAll.done", @"RPCS3 settings were restored to defaults.")];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (instancetype)initWithHost:(id<ARMSX3SettingsHost>)host jitAvailable:(BOOL)jitAvailable
@@ -259,6 +530,29 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     return self;
 }
 
+- (instancetype)initWithHost:(id<ARMSX3SettingsHost>)host
+                jitAvailable:(BOOL)jitAvailable
+                  gameSerial:(NSString *)gameSerial
+                   gameTitle:(NSString *)gameTitle
+                    gamePath:(NSString *)gamePath
+{
+    if ((self = [super initWithNibName:nil bundle:nil]))
+    {
+        _host = host;
+        _jitAvailable = jitAvailable;
+        _coreOnly = NO;
+        _gameSerial = [gameSerial copy];
+        _gameTitle = [gameTitle copy];
+        _gamePath = [gamePath copy];
+        _category = ARMSX3SettingsCategoryPerformance;
+        _allSettings = @[];
+        _visibleSettings = @[];
+        self.modalPresentationStyle = UIModalPresentationFullScreen;
+        self.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    }
+    return self;
+}
+
 - (void)viewDidLoad
 {
     [super viewDidLoad];
@@ -270,14 +564,39 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
 - (void)viewWillAppear:(BOOL)animated
 {
     [super viewWillAppear:animated];
+    [self reloadGameInfo];
     [self updateLocalizedChrome];
     [self reloadCoreSettings];
+}
+
+- (void)reloadGameInfo
+{
+    if (!_gameSerial.length) { _gameInfo = @{}; return; }
+    const char *raw = armsx3_ios_game_info_json(_gamePath.UTF8String);
+    NSData *data = raw && *raw ? [[NSString stringWithUTF8String:raw] dataUsingEncoding:NSUTF8StringEncoding] : nil;
+    id parsed = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    _gameInfo = [parsed isKindOfClass:NSDictionary.class] ? parsed : @{};
 }
 
 - (NSArray<NSDictionary *> *)categories
 {
     if (_coreOnly)
         return @[@{@"title": ARMSX3L(@"ios.settings.core", @"All Core Settings"), @"glyph": @"🧩", @"category": @(ARMSX3SettingsCategoryCore)}];
+    if (_gameSerial.length)
+        return @[
+            @{@"title": ARMSX3L(@"tab.info", @"Info"), @"glyph": @"ⓘ", @"category": @(ARMSX3SettingsCategoryInfo)},
+            @{@"title": ARMSX3L(@"tab.performance", @"Performance"), @"glyph": @"↯", @"category": @(ARMSX3SettingsCategoryPerformance)},
+            @{@"title": ARMSX3L(@"tab.renderer", @"Graphics"), @"glyph": @"◫", @"category": @(ARMSX3SettingsCategoryGraphics)},
+            @{@"title": ARMSX3L(@"tab.audio", @"Audio"), @"glyph": @"♫", @"category": @(ARMSX3SettingsCategoryAudio)},
+            @{@"title": ARMSX3L(@"tab.controls", @"Controls"), @"glyph": @"⌁", @"category": @(ARMSX3SettingsCategoryControls)},
+            @{@"title": ARMSX3L(@"tab.hotkeys", @"Hotkeys"), @"glyph": @"⌘", @"category": @(ARMSX3SettingsCategoryHotkeys)},
+            @{@"title": ARMSX3L(@"tab.skins", @"Skins"), @"glyph": @"◈", @"category": @(ARMSX3SettingsCategorySkins)},
+            @{@"title": ARMSX3L(@"tab.network", @"Network"), @"glyph": @"◎", @"category": @(ARMSX3SettingsCategoryNetwork)},
+            @{@"title": ARMSX3L(@"tab.overlay", @"On-Screen"), @"glyph": @"⊕", @"category": @(ARMSX3SettingsCategoryOnScreen)},
+            @{@"title": ARMSX3L(@"tab.fixes", @"Advanced"), @"glyph": @"⌘", @"category": @(ARMSX3SettingsCategoryAdvanced)},
+            @{@"title": ARMSX3L(@"tab.patches", @"Patches & Cheats"), @"glyph": @"✦", @"category": @(ARMSX3SettingsCategoryPatches)},
+            @{@"title": ARMSX3L(@"tab.mods", @"Mods"), @"glyph": @"▣", @"category": @(ARMSX3SettingsCategoryMods)},
+        ];
     return @[
         @{@"title": ARMSX3L(@"tab.app", @"App"), @"glyph": @"⌂", @"category": @(ARMSX3SettingsCategoryGeneral)},
         @{@"title": ARMSX3L(@"tab.performance", @"Performance"), @"glyph": @"↯", @"category": @(ARMSX3SettingsCategoryPerformance)},
@@ -361,6 +680,9 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
         button.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
         [button setTitle:[NSString stringWithFormat:@"%@  %@", item[@"glyph"], item[@"title"]]
             forState:UIControlStateNormal];
+        // Keep category selection under one state system. The configuration is updated only by
+        // updateCategoryButtons(); mixing configuration colors with layer/background mutations
+        // left previously tapped tabs looking selected on iOS 15/16.
         UIButtonConfiguration *configuration = [UIButtonConfiguration plainButtonConfiguration];
         configuration.contentInsets = NSDirectionalEdgeInsetsMake(8, 12, 8, 12);
         button.configuration = configuration;
@@ -433,7 +755,8 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
 
 - (void)updateLocalizedChrome
 {
-    _pageTitleLabel.text = _coreOnly ? ARMSX3L(@"ios.settings.core", @"All Core Settings") : ARMSX3L(@"ios.settings.title", @"ARMSX3 Settings");
+    _pageTitleLabel.text = _gameSerial.length ? (_gameTitle.length ? _gameTitle : _gameSerial) :
+        (_coreOnly ? ARMSX3L(@"ios.settings.core", @"All Core Settings") : ARMSX3L(@"ios.settings.title", @"ARMSX3 Settings"));
     _searchBar.placeholder = ARMSX3L(@"games.search.placeholder", @"Search settings…");
     NSArray *categories = [self categories];
     for (NSUInteger i = 0; i < MIN(categories.count, _categoryButtons.count); i++)
@@ -489,14 +812,60 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     for (UIButton *button in _categoryButtons)
     {
         const BOOL selected = button.tag == _category;
-        button.backgroundColor = selected
-            ? [UIColor.systemBlueColor colorWithAlphaComponent:0.28]
-            : UIColor.clearColor;
-        [button setTitleColor:selected ? UIColor.systemBlueColor : UIColor.secondaryLabelColor
-            forState:UIControlStateNormal];
-        button.layer.borderWidth = selected ? 1 : 0;
-        button.layer.borderColor = [UIColor.systemBlueColor colorWithAlphaComponent:0.55].CGColor;
+        button.selected = selected;
+        button.highlighted = NO;
+        UIColor *titleColor = selected ? UIColor.systemBlueColor : UIColor.secondaryLabelColor;
+        button.tintColor = titleColor;
+        UIButtonConfiguration *configuration = button.configuration ?: [UIButtonConfiguration plainButtonConfiguration];
+        configuration.baseForegroundColor = titleColor;
+        UIBackgroundConfiguration *background = [UIBackgroundConfiguration clearConfiguration];
+        background.backgroundColor = selected ? [UIColor.systemBlueColor colorWithAlphaComponent:0.28] : UIColor.clearColor;
+        background.strokeWidth = selected ? 1 : 0;
+        background.strokeColor = [UIColor.systemBlueColor colorWithAlphaComponent:0.55];
+        background.cornerRadius = 11;
+        configuration.background = background;
+        button.configuration = configuration;
     }
+}
+
+- (NSInteger)settingRowForIndexPath:(NSIndexPath *)indexPath
+{
+    NSInteger row = indexPath.row;
+    if (_searchBar.text.length == 0)
+    {
+        if (_category == ARMSX3SettingsCategoryControls) row -= 1;
+        else if (_category == ARMSX3SettingsCategoryNetwork) row -= 1;
+        else if (_category == ARMSX3SettingsCategoryGraphics) row -= 2;
+    }
+    return row;
+}
+
+- (void)showEnumPickerForSetting:(ARMSX3CoreSetting *)setting fromCell:(UITableViewCell *)cell
+{
+    if (!setting || !setting.variants.count || !armsx3_ios_settings_editable()) return;
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:setting.name
+        message:[NSString stringWithFormat:@"当前：%@", ARMSX3PolishedValue(setting.value)]
+        preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) weakSelf = self;
+    for (NSString *variant in setting.variants)
+    {
+        NSString *title = ARMSX3PolishedValue(variant);
+        if ([[setting.value description] isEqualToString:variant])
+            title = [@"✓ " stringByAppendingString:title];
+        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault
+            handler:^(__unused UIAlertAction *action) {
+                [weakSelf writeString:variant toSetting:setting];
+            }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:ARMSX3L(@"action.cancel", @"Cancel")
+        style:UIAlertActionStyleCancel handler:nil]];
+    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
+    if (popover)
+    {
+        popover.sourceView = cell ?: self.view;
+        popover.sourceRect = cell ? cell.bounds : CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 1, 1);
+    }
+    [self presentViewController:sheet animated:YES completion:nil];
 }
 
 - (NSString *)titleForCategory:(ARMSX3SettingsCategory)category
@@ -515,7 +884,9 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
         return;
     }
 
-    const char *raw = armsx3_ios_settings_json("");
+    const char *raw = _gameSerial.length
+        ? armsx3_ios_game_settings_json(_gameSerial.UTF8String, "")
+        : armsx3_ios_settings_json("");
     if (!raw || !*raw)
     {
         _allSettings = @[];
@@ -586,6 +957,8 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     NSString *path = setting.path;
     switch (category)
     {
+    case ARMSX3SettingsCategoryInfo:
+        return NO;
     case ARMSX3SettingsCategoryPerformance:
         return [path hasPrefix:@"Core@@"];
     case ARMSX3SettingsCategoryGraphics:
@@ -615,7 +988,7 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
 - (void)applyFilter
 {
     NSString *query = [_searchBar.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    if (_category == ARMSX3SettingsCategoryGeneral && query.length == 0)
+    if ((_category == ARMSX3SettingsCategoryGeneral || _category == ARMSX3SettingsCategoryInfo) && query.length == 0)
     {
         _visibleSettings = @[];
     }
@@ -648,8 +1021,11 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
 
     const char *firmwareVersion = armsx3_ios_firmware_version();
     NSString *firmware = firmwareVersion && *firmwareVersion ? [NSString stringWithUTF8String:firmwareVersion] : ARMSX3L(@"ios.general.notInstalled", @"Not installed");
-    _subtitleLabel.text = [NSString stringWithFormat:@"全局 · 固件 %@ · %@",
-        firmware, armsx3_ios_settings_editable() ? @"可编辑" : @"运行中只读"];
+    _subtitleLabel.text = _gameSerial.length
+        ? [NSString stringWithFormat:@"每游戏 · %@ · %@", _gameSerial,
+            armsx3_ios_settings_editable() ? @"可编辑" : @"运行中只读"]
+        : [NSString stringWithFormat:@"全局 · 固件 %@ · %@",
+            firmware, armsx3_ios_settings_editable() ? @"可编辑" : @"运行中只读"];
     [_tableView reloadData];
 }
 
@@ -665,8 +1041,11 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
 {
-    if (_category == ARMSX3SettingsCategoryGeneral && _searchBar.text.length == 0) return 8;
+    if (_category == ARMSX3SettingsCategoryInfo && _searchBar.text.length == 0) return 16;
+    if (_category == ARMSX3SettingsCategoryGeneral && _searchBar.text.length == 0) return 16;
+    if (_searchBar.text.length == 0 && _category == ARMSX3SettingsCategoryGraphics) return _visibleSettings.count + 2;
     if (_searchBar.text.length == 0 && _category == ARMSX3SettingsCategoryControls) return _visibleSettings.count + 1;
+    if (_searchBar.text.length == 0 && _category == ARMSX3SettingsCategoryNetwork) return _visibleSettings.count + 1;
     if (_searchBar.text.length == 0 && _category == ARMSX3SettingsCategoryHotkeys) return 1;
     if (_searchBar.text.length == 0 && _category == ARMSX3SettingsCategorySkins) return 3;
     if (_searchBar.text.length == 0 && _category == ARMSX3SettingsCategoryPatches) return 2;
@@ -683,6 +1062,8 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
 {
+    if (_category == ARMSX3SettingsCategoryInfo && _searchBar.text.length == 0)
+        return ARMSX3L(@"info.footer", @"Per-game settings use RPCS3 native custom_configs. Tap information rows to copy. Custom names and covers update the library immediately.");
     if (_category == ARMSX3SettingsCategoryGeneral && _searchBar.text.length == 0)
         return ARMSX3L(@"ios.settings.footer.general", @"The settings center follows the Android ARMSX3 structure. RPCS3 options directly edit the shared config.yml.");
     if (!armsx3_ios_settings_editable())
@@ -708,9 +1089,9 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     else if (_category == ARMSX3SettingsCategorySkins)
     {
         NSArray *rows = @[
-            @[@"触控皮肤与布局", @"Android TouchControls 的布局、透明度和控件选项"],
-            @[@"编辑触控布局", @"拖动、缩放、网格与重叠检查"],
-            @[@"恢复 Android 默认", @"恢复 Android TouchLayout.default()"],
+            @[ARMSX3L(@"skins.title", @"Controller Skins"), _gameSerial.length ? ARMSX3L(@"skins.perGame.description", @"Choose a skin for this game or inherit the global skin.") : ARMSX3L(@"skins.subtitle", @"Built-in, imported and downloadable controller skins.")],
+            @[ARMSX3L(@"ios.general.touch", @"Touch Controller"), ARMSX3L(@"pad.visibilityMode.description", @"Layout, opacity, gestures, macros and touch behavior.")],
+            @[ARMSX3L(@"ios.touch.edit", @"Edit Touch Layout"), ARMSX3L(@"ios.touch.hint", @"Drag, scale, grid snap and overlap detection.")],
         ];
         cell.textLabel.text = rows[row][0]; cell.detailTextLabel.text = rows[row][1];
     }
@@ -725,6 +1106,86 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
         cell.detailTextLabel.text = row ? @"沿用 Android 的按标题作用域概念" : @"使用 ARMSX3/RPCS3 数据目录，不建立第二套 iOS 格式";
     }
     return cell;
+}
+
+- (void)libraryBoolChanged:(UISwitch *)sender
+{
+    NSString *key = sender.tag == 8 ? ARMSX3LibraryShowSearchKey : (sender.tag == 9 ? ARMSX3LibraryShowRecentsKey : ARMSX3LibraryShowGridNamesKey);
+    [NSUserDefaults.standardUserDefaults setBool:sender.isOn forKey:key];
+    [NSNotificationCenter.defaultCenter postNotificationName:ARMSX3LibraryAppearanceDidChangeNotification object:nil];
+}
+
+- (void)librarySliderMoved:(UISlider *)sender
+{
+    ARMSX3SliderAccessory *accessory = [self sliderAccessoryForSlider:sender];
+    if (accessory) [self updateSliderLabel:accessory];
+}
+
+- (void)librarySliderCommitted:(UISlider *)sender
+{
+    ARMSX3SliderAccessory *accessory = [self sliderAccessoryForSlider:sender];
+    if (!accessory) return;
+    NSInteger value = (NSInteger)llround([self sliderValue:accessory]);
+    [NSUserDefaults.standardUserDefaults setInteger:value forKey:accessory.settingPath];
+    [NSNotificationCenter.defaultCenter postNotificationName:ARMSX3LibraryAppearanceDidChangeNotification object:nil];
+}
+
+- (UITableViewCell *)gameInfoCellAtRow:(NSInteger)row
+{
+    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+    cell.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+    cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+    cell.detailTextLabel.numberOfLines = 0;
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    NSString *customName = ARMSX3CustomGameName(_gameSerial);
+    NSString *baseVersion = [_gameInfo[@"version"] isKindOfClass:NSString.class] ? _gameInfo[@"version"] : @"";
+    NSString *installedVersion = [_gameInfo[@"installedVersion"] isKindOfClass:NSString.class] ? _gameInfo[@"installedVersion"] : @"";
+    NSInteger dlc = [_gameInfo[@"dlcCount"] integerValue];
+    NSString *region = [self regionForSerial:_gameSerial];
+    NSString *container = _gamePath.length ? ([NSFileManager.defaultManager fileExistsAtPath:_gamePath isDirectory:NULL] && !_gamePath.pathExtension.length ? @"Folder" : (_gamePath.pathExtension.uppercaseString.length ? _gamePath.pathExtension.uppercaseString : @"Folder")) : @"—";
+    NSArray<NSArray<NSString *> *> *rows = @[
+        @[ARMSX3L(@"info.title", @"Title"), customName ?: (_gameTitle.length ? _gameTitle : @"—")],
+        @[ARMSX3L(@"info.serial", @"Title ID"), _gameSerial ?: @"—"],
+        @[ARMSX3L(@"info.baseVersion", @"Base Version"), baseVersion.length ? baseVersion : @"—"],
+        @[ARMSX3L(@"info.gameVersion", @"Installed Update"), installedVersion.length ? installedVersion : ARMSX3L(@"info.noUpdate", @"No title update installed")],
+        @[ARMSX3L(@"info.dlc", @"DLC"), dlc > 0 ? [NSString stringWithFormat:@"%ld", (long)dlc] : ARMSX3L(@"info.dlc.none", @"None detected")],
+        @[ARMSX3L(@"info.region", @"Region"), region],
+        @[ARMSX3L(@"info.container", @"Container"), container],
+        @[ARMSX3L(@"info.platform", @"Platform"), @"PlayStation 3"],
+        @[ARMSX3L(@"info.playTime", @"Play Time"), ARMSX3FormatPlayedTime(ARMSX3PlayedSeconds(_gameSerial))],
+        @[ARMSX3L(@"info.lastPlayed", @"Last Played"), ARMSX3FormatLastPlayed(ARMSX3LastPlayedDate(_gameSerial))],
+        @[ARMSX3L(@"info.path", @"Path"), _gamePath.length ? _gamePath : @"—"],
+        @[ARMSX3L(@"info.customName.label", @"Custom Display Name"), customName ?: ARMSX3L(@"info.customName.none", @"Not set")],
+        @[ARMSX3L(@"info.cover.label", @"Custom Cover"), ARMSX3CustomCoverURL(_gameSerial) ? ARMSX3L(@"info.cover.custom", @"Custom image selected") : ARMSX3L(@"info.cover.default", @"Using game artwork")],
+        @[ARMSX3L(@"info.exportSettings", @"Export Per-Game Settings"), @"RPCS3 custom config (.yml)"],
+        @[ARMSX3L(@"info.importSettings", @"Import Per-Game Settings"), @"Validate and replace this title's custom config"],
+        @[ARMSX3L(@"info.resetSettings", @"Reset Per-Game Settings"), ARMSX3L(@"info.resetSettings.desc", @"Delete this title's custom config and inherit global settings")],
+    ];
+    cell.textLabel.text = rows[row][0];
+    cell.detailTextLabel.text = rows[row][1];
+    if (row >= 11) cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    if (row == 15)
+    {
+        cell.textLabel.textColor = UIColor.systemRedColor;
+        cell.userInteractionEnabled = armsx3_ios_settings_editable();
+    }
+    return cell;
+}
+
+- (NSString *)regionForSerial:(NSString *)serial
+{
+    NSString *s = [[serial uppercaseString] stringByReplacingOccurrencesOfString:@"-" withString:@""];
+    NSArray *usa = @[@"BLUS", @"BCUS", @"NPUB", @"NPUA", @"SLUS", @"SCUS"];
+    NSArray *eu = @[@"BLES", @"BCES", @"NPEB", @"NPEA", @"SLES", @"SCES"];
+    NSArray *jp = @[@"BLJM", @"BCJS", @"NPJB", @"NPJA", @"SLPS", @"SLPM", @"SCPS"];
+    NSArray *kr = @[@"BLKS", @"BCKS", @"NPKB", @"SLKA", @"SCKA"];
+    NSArray *asia = @[@"BLAS", @"BCAS", @"NPHB", @"NPHA"];
+    for (NSString *prefix in usa) if ([s hasPrefix:prefix]) return @"NTSC-U (USA)";
+    for (NSString *prefix in eu) if ([s hasPrefix:prefix]) return @"PAL (Europe)";
+    for (NSString *prefix in jp) if ([s hasPrefix:prefix]) return @"NTSC-J (Japan)";
+    for (NSString *prefix in kr) if ([s hasPrefix:prefix]) return @"NTSC-K (Korea)";
+    for (NSString *prefix in asia) if ([s hasPrefix:prefix]) return @"Asia";
+    return @"—";
 }
 
 - (UITableViewCell *)generalCellAtRow:(NSInteger)row
@@ -747,6 +1208,58 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     case 7:
         cell.textLabel.text = ARMSX3L(@"app.language", @"Language");
         cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ · %@", ARMSX3L(@"app.language.desc", @"Choose the app language. Applies instantly."), ARMSX3ResolvedLanguageCode()];
+        break;
+    case 8:
+    case 9:
+    case 10:
+    {
+        NSString *key = row == 8 ? ARMSX3LibraryShowSearchKey : (row == 9 ? ARMSX3LibraryShowRecentsKey : ARMSX3LibraryShowGridNamesKey);
+        cell.textLabel.text = row == 8 ? ARMSX3L(@"app.library.search", @"Show Search") : (row == 9 ? ARMSX3L(@"app.library.recents", @"Show Recently Played") : ARMSX3L(@"games.overflow.gridNames", @"Show Grid Titles"));
+        cell.detailTextLabel.text = row == 8 ? ARMSX3L(@"app.library.search.desc", @"Show the game-library search control.") : (row == 9 ? ARMSX3L(@"app.library.recents.desc", @"Show the recently played strip above the library.") : ARMSX3L(@"app.library.gridNames.desc", @"Show game title and metadata under grid and shelf covers."));
+        UISwitch *toggle = [[UISwitch alloc] init];
+        toggle.tag = row;
+        toggle.on = ARMSX3SettingBool(key, YES);
+        [toggle addTarget:self action:@selector(libraryBoolChanged:) forControlEvents:UIControlEventValueChanged];
+        cell.accessoryType = UITableViewCellAccessoryNone;
+        cell.accessoryView = toggle;
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        break;
+    }
+    case 11:
+    case 12:
+    {
+        BOOL cover = row == 11;
+        cell.textLabel.text = cover ? ARMSX3L(@"app.library.coverSize", @"Cover Size") : ARMSX3L(@"app.library.opacity", @"Library Opacity");
+        cell.detailTextLabel.text = cover ? @"75–250%" : @"20–100%";
+        ARMSX3SliderAccessory *slider = [[ARMSX3SliderAccessory alloc] init];
+        slider.settingPath = cover ? ARMSX3LibraryCoverScaleKey : ARMSX3LibraryOpacityKey;
+        slider.settingType = @"int";
+        slider.minimum = cover ? 75 : 20;
+        slider.maximum = cover ? 250 : 100;
+        slider.slider.minimumValue = 0;
+        slider.slider.maximumValue = 1;
+        NSInteger current = ARMSX3SettingInteger(slider.settingPath, 100);
+        slider.slider.value = (current - slider.minimum) / (slider.maximum - slider.minimum);
+        [slider.slider addTarget:self action:@selector(librarySliderMoved:) forControlEvents:UIControlEventValueChanged];
+        [slider.slider addTarget:self action:@selector(librarySliderCommitted:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
+        [self updateSliderLabel:slider];
+        cell.accessoryType = UITableViewCellAccessoryNone;
+        cell.accessoryView = slider;
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        break;
+    }
+    case 13:
+        cell.textLabel.text = ARMSX3L(@"app.clearCache", @"Clear Cache");
+        cell.detailTextLabel.text = ARMSX3L(@"app.clearCache.desc", @"Remove regenerable shader, pipeline, artwork and temporary download caches.");
+        break;
+    case 14:
+        cell.textLabel.text = ARMSX3L(@"app.resetAll", @"Reset All RPCS3 Settings");
+        cell.detailTextLabel.text = ARMSX3L(@"app.resetAll.desc", @"Restore global emulator settings to defaults without deleting games, firmware or saves.");
+        cell.textLabel.textColor = UIColor.systemRedColor;
+        break;
+    case 15:
+        cell.textLabel.text = ARMSX3L(@"app.title", @"App Settings");
+        cell.detailTextLabel.text = @"Theme, library background, game folders, audio, backup, save data, launch and battery options";
         break;
     case 1:
         cell.textLabel.text = ARMSX3L(@"ios.general.installFirmware", @"Install PS3 System Software (.PUP)");
@@ -782,8 +1295,40 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
 {
+    if (_category == ARMSX3SettingsCategoryInfo && _searchBar.text.length == 0)
+        return [self gameInfoCellAtRow:indexPath.row];
     if (_category == ARMSX3SettingsCategoryGeneral && _searchBar.text.length == 0)
         return [self generalCellAtRow:indexPath.row];
+    if (_category == ARMSX3SettingsCategoryGraphics && _searchBar.text.length == 0 && indexPath.row == 0)
+    {
+        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+        cell.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+        cell.textLabel.text = ARMSX3L(@"renderer.section.overlayArt", @"Overlay Artwork");
+        NSString *active = ARMSX3OverlayArtActivePath();
+        cell.detailTextLabel.text = active.length
+            ? [NSString stringWithFormat:@"%@ · %.0f%%", active.lastPathComponent, ARMSX3OverlayArtOpacity() * 100]
+            : ARMSX3L(@"renderer.overlayArt.none", @"None");
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        return cell;
+    }
+    if (_category == ARMSX3SettingsCategoryGraphics && _searchBar.text.length == 0 && indexPath.row == 1)
+    {
+        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+        cell.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+        cell.textLabel.text = ARMSX3L(@"renderer.shaderChain.title", @"Shader Chain");
+        cell.detailTextLabel.text = ARMSX3L(@"renderer.shaderChain.runtimeMissing", @"Manage RetroArch .slangp presets · runtime not bundled in this iOS build");
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        return cell;
+    }
+    if (_category == ARMSX3SettingsCategoryNetwork && _searchBar.text.length == 0 && indexPath.row == 0)
+    {
+        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+        cell.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+        cell.textLabel.text = @"RPCN";
+        cell.detailTextLabel.text = ARMSX3L(@"rpcn.section.account", @"Account, servers, IPv6, friends and online trophies");
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        return cell;
+    }
     if (_category == ARMSX3SettingsCategoryControls && _searchBar.text.length == 0 && indexPath.row == 0)
     {
         UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
@@ -810,8 +1355,7 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
     cell.textLabel.numberOfLines = 2;
 
-    NSInteger settingRow = indexPath.row;
-    if (_category == ARMSX3SettingsCategoryControls && _searchBar.text.length == 0) settingRow--;
+    NSInteger settingRow = [self settingRowForIndexPath:indexPath];
     ARMSX3CoreSetting *setting = _visibleSettings[settingRow];
     cell.textLabel.text = setting.name;
     cell.detailTextLabel.text = ARMSX3PolishedSettingDetail(setting);
@@ -832,25 +1376,16 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     }
     else if ([setting.type isEqualToString:@"enum"] && setting.variants.count)
     {
-        UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
-        [button setTitle:ARMSX3PolishedValue(setting.value) forState:UIControlStateNormal];
-        button.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
-        button.showsMenuAsPrimaryAction = YES;
-        NSMutableArray<UIMenuElement *> *actions = [NSMutableArray array];
-        __weak typeof(self) weakSelf = self;
-        for (NSString *variant in setting.variants)
-        {
-            UIAction *action = [UIAction actionWithTitle:ARMSX3PolishedValue(variant) image:nil identifier:nil
-                handler:^(__unused UIAction *selectedAction) {
-                    [weakSelf writeString:variant toSetting:setting];
-                }];
-            action.state = [[setting.value description] isEqualToString:variant] ? UIMenuElementStateOn : UIMenuElementStateOff;
-            [actions addObject:action];
-        }
-        button.menu = [UIMenu menuWithTitle:setting.name children:actions];
-        button.enabled = editable;
-        cell.accessoryView = button;
-        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        UILabel *value = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 150, 40)];
+        value.text = ARMSX3PolishedValue(setting.value);
+        value.textAlignment = NSTextAlignmentRight;
+        value.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+        value.textColor = editable ? UIColor.systemBlueColor : UIColor.secondaryLabelColor;
+        value.adjustsFontSizeToFitWidth = YES;
+        value.minimumScaleFactor = 0.65;
+        cell.accessoryView = value;
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        cell.selectionStyle = editable ? UITableViewCellSelectionStyleDefault : UITableViewCellSelectionStyleNone;
     }
     else if ([self canUseSliderForSetting:setting])
     {
@@ -958,7 +1493,9 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
 - (void)writeJSON:(NSString *)json path:(NSString *)path
 {
     if (!armsx3_ios_settings_editable()) return;
-    const BOOL ok = armsx3_ios_set_setting_json(path.UTF8String, json.UTF8String);
+    const BOOL ok = _gameSerial.length
+        ? armsx3_ios_set_game_setting_json(_gameSerial.UTF8String, path.UTF8String, json.UTF8String)
+        : armsx3_ios_set_setting_json(path.UTF8String, json.UTF8String);
     if (ok)
     {
         [self reloadCoreSettings];
@@ -977,6 +1514,39 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath
 {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    if (_searchBar.text.length == 0 && _category == ARMSX3SettingsCategoryGraphics && indexPath.row == 0)
+    {
+        [self presentViewController:ARMSX3MakeOverlayArtViewController() animated:YES completion:nil];
+        return;
+    }
+    if (_searchBar.text.length == 0 && _category == ARMSX3SettingsCategoryGraphics && indexPath.row == 1)
+    {
+        [self presentViewController:ARMSX3MakeShaderChainViewController(_gameSerial) animated:YES completion:nil];
+        return;
+    }
+    if (_category == ARMSX3SettingsCategoryInfo && _searchBar.text.length == 0)
+    {
+        NSInteger row = indexPath.row;
+        if (row <= 10)
+        {
+            NSString *value = [self gameInfoCellAtRow:row].detailTextLabel.text;
+            if (value.length && ![value isEqualToString:@"—"])
+            {
+                UIPasteboard.generalPasteboard.string = value;
+                [self showInfoMessage:ARMSX3L(@"info.copied", @"Copied to clipboard")];
+            }
+            return;
+        }
+        if (row == 11) { [self editCustomGameName]; return; }
+        if (row == 12) { [self editCustomCover]; return; }
+        if (row == 13) { [self exportGameConfig]; return; }
+        if (row == 14) { [self importGameConfig]; return; }
+        if (row == 15 && _gameSerial.length && armsx3_ios_settings_editable())
+        {
+            [self confirmResetGameSettings];
+        }
+        return;
+    }
     if (_category == ARMSX3SettingsCategoryGeneral && _searchBar.text.length == 0)
     {
         id<ARMSX3SettingsHost> host = _host;
@@ -1007,6 +1577,18 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
             UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[[ARMSX3LanguageViewController alloc] init]];
             [self presentViewController:nav animated:YES completion:nil];
         }
+        else if (indexPath.row == 13)
+        {
+            [self confirmClearCaches];
+        }
+        else if (indexPath.row == 14)
+        {
+            [self confirmResetGlobalSettings];
+        }
+        else if (indexPath.row == 15)
+        {
+            [self presentViewController:ARMSX3MakeAppSettingsViewController() animated:YES completion:nil];
+        }
         return;
     }
 
@@ -1019,6 +1601,11 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
 
     if (_searchBar.text.length == 0 && _category == ARMSX3SettingsCategorySkins)
     {
+        if (indexPath.row == 0)
+        {
+            [self presentViewController:ARMSX3MakeSkinManagerViewController(_gameSerial) animated:YES completion:nil];
+            return;
+        }
         id<ARMSX3SettingsHost> host = _host;
         if (!host) return;
         [self dismissViewControllerAnimated:YES completion:^{ [host showTouchControlsSettings]; }];
@@ -1027,13 +1614,15 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     if (_searchBar.text.length == 0 && _category == ARMSX3SettingsCategoryPatches)
     {
         if (indexPath.row == 0)
-            [self presentViewController:ARMSX3MakePatchManager() animated:YES completion:nil];
+            [self presentViewController:_gameSerial.length ? ARMSX3MakePatchManagerForSerial(_gameSerial) : ARMSX3MakePatchManager()
+                animated:YES completion:nil];
         return;
     }
     if (_searchBar.text.length == 0 && _category == ARMSX3SettingsCategoryMods)
     {
         if (indexPath.row == 0)
-            [self presentViewController:ARMSX3MakeModManager() animated:YES completion:nil];
+            [self presentViewController:_gameSerial.length ? ARMSX3MakeModManagerForSerial(_gameSerial) : ARMSX3MakeModManager()
+                animated:YES completion:nil];
         return;
     }
     if (_searchBar.text.length == 0 && _category == ARMSX3SettingsCategoryHotkeys)
@@ -1043,11 +1632,15 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
         return;
     }
 
-    NSInteger settingRow = indexPath.row;
-    if (_category == ARMSX3SettingsCategoryControls && _searchBar.text.length == 0) settingRow--;
+    NSInteger settingRow = [self settingRowForIndexPath:indexPath];
     if (!armsx3_ios_settings_editable() || settingRow < 0 || settingRow >= (NSInteger)_visibleSettings.count) return;
     ARMSX3CoreSetting *setting = _visibleSettings[settingRow];
-    if ([setting.type isEqualToString:@"bool"] || [setting.type isEqualToString:@"enum"] || [self canUseSliderForSetting:setting]) return;
+    if ([setting.type isEqualToString:@"enum"] && setting.variants.count)
+    {
+        [self showEnumPickerForSetting:setting fromCell:[tableView cellForRowAtIndexPath:indexPath]];
+        return;
+    }
+    if ([setting.type isEqualToString:@"bool"] || [self canUseSliderForSetting:setting]) return;
 
     UIAlertController *editor = [UIAlertController alertControllerWithTitle:setting.name
         message:setting.path preferredStyle:UIAlertControllerStyleAlert];

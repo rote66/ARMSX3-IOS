@@ -23,6 +23,18 @@ foreach(skin_file IN LISTS ARMSX3_CONTROLLER_SKIN_RESOURCES)
         MACOSX_PACKAGE_LOCATION "Resources/controller_skins/${skin_dir}")
 endforeach()
 
+# Reuse Android's cross-platform launcher media instead of maintaining a second
+# copy with subtly different audio/video assets.
+set(ARMSX3_ANDROID_RAW ${CMAKE_SOURCE_DIR}/android/armsx3-ui/app/src/main/res/raw)
+set(ARMSX3_APP_MEDIA
+    ${ARMSX3_ANDROID_RAW}/library_music.m4a
+    ${ARMSX3_ANDROID_RAW}/pause_music.mp3
+    ${ARMSX3_ANDROID_RAW}/boot_intro.mp4
+    ${ARMSX3_ANDROID_RAW}/library_fallback.gif)
+foreach(media_file IN LISTS ARMSX3_APP_MEDIA)
+    set_source_files_properties("${media_file}" PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
+endforeach()
+
 set(ARMSX3_I18N_ROOT ${CMAKE_SOURCE_DIR}/android/armsx3-ui/app/src/main/assets/i18n)
 file(GLOB ARMSX3_I18N_RESOURCES CONFIGURE_DEPENDS "${ARMSX3_I18N_ROOT}/*.json")
 foreach(i18n_file IN LISTS ARMSX3_I18N_RESOURCES)
@@ -33,6 +45,22 @@ add_executable(ARMSX3 MACOSX_BUNDLE
     src/ARMSX3App.mm
     src/ARMSX3FrontendViewController.mm
     src/ARMSX3LibraryManagers.mm
+    src/ARMSX3GameUpdatesViewController.mm
+    src/ARMSX3FirmwareViewController.mm
+    src/ARMSX3TrophiesViewController.mm
+    src/ARMSX3OverlayArt.mm
+    src/ARMSX3ShaderChainViewController.mm
+    src/ARMSX3SkinManager.mm
+    src/ARMSX3RPCNViewController.mm
+    src/ARMSX3LibraryMetadata.mm
+    src/ARMSX3NewsViewController.mm
+    src/ARMSX3AboutViewController.mm
+    src/ARMSX3OnboardingViewController.mm
+    src/ARMSX3AppPreferences.mm
+    src/ARMSX3AppSettingsViewController.mm
+    src/ARMSX3Updater.mm
+    src/ARMSX3SecondScreen.mm
+    src/ARMSX3RumbleBridge.mm
     src/ARMSX3EmulationMenuViewController.mm
     src/ARMSX3SettingsViewController.mm
     src/ARMSX3TouchControls.mm
@@ -40,11 +68,14 @@ add_executable(ARMSX3 MACOSX_BUNDLE
     src/ARMSX3ControllerMappings.mm
     src/ARMSX3IOSAudioBackend.mm
     src/armsx3_ios_core.mm
+    ${CMAKE_SOURCE_DIR}/3rdparty/zlib/zlib/contrib/minizip/zip.c
+    ${CMAKE_SOURCE_DIR}/3rdparty/zlib/zlib/contrib/minizip/ioapi.c
     ${ARMSX3_IOS_INPUT_SOURCES}
     ${CMAKE_SOURCE_DIR}/rpcs3/dev/iso.cpp
     ${CMAKE_SOURCE_DIR}/rpcs3/rpcs3_version.cpp
     ${ARMSX3_CONTROLLER_SKIN_RESOURCES}
     ${ARMSX3_I18N_RESOURCES}
+    ${ARMSX3_APP_MEDIA}
     Assets.xcassets)
 
 target_compile_definitions(ARMSX3 PRIVATE ARMSX3_IOS=1)
@@ -59,20 +90,22 @@ target_include_directories(ARMSX3 PRIVATE
     ${CMAKE_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/rpcs3
     ${CMAKE_SOURCE_DIR}/3rdparty/libusb/libusb/libusb
+    ${CMAKE_SOURCE_DIR}/3rdparty/zlib/zlib
+    ${CMAKE_SOURCE_DIR}/3rdparty/zlib/zlib/contrib/minizip
     ${CMAKE_SOURCE_DIR}/3rdparty/yaml-cpp/yaml-cpp/include)
-
-target_include_directories(rpcs3_emu PRIVATE
-    ${CMAKE_SOURCE_DIR}/3rdparty/librashader/include)
 
 target_link_libraries(ARMSX3 PRIVATE
     rpcs3_emu
+    3rdparty::zlib
     3rdparty::fusion
     3rdparty::libusb
     "-framework UIKit"
     "-framework Foundation"
     "-framework QuartzCore"
+    "-framework ImageIO"
     "-framework Metal"
     "-framework GameController"
+    "-framework CoreMotion"
     "-framework UniformTypeIdentifiers"
     "-framework AVFoundation"
     "-framework AudioToolbox"
@@ -87,7 +120,7 @@ set_target_properties(ARMSX3 PROPERTIES
     MACOSX_BUNDLE_BUNDLE_NAME ARMSX3
     MACOSX_BUNDLE_GUI_IDENTIFIER com.armsx3.ios
     MACOSX_BUNDLE_SHORT_VERSION_STRING 0.9.9
-    MACOSX_BUNDLE_BUNDLE_VERSION 37
+    MACOSX_BUNDLE_BUNDLE_VERSION 45
     XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER com.armsx3.ios
     XCODE_ATTRIBUTE_CLANG_ENABLE_OBJC_ARC YES
     XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET 15.0
