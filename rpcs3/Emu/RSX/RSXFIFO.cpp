@@ -498,19 +498,25 @@ namespace rsx
 				return;
 			}
 
+			// Keep the increment mode valid even for a one-argument packet. A first-argument
+			// retry uses read_unsafe(), which advances m_command_reg by m_command_inc before
+			// dispatch. Leaving this stale for count==1 makes the retry depend on the previous
+			// packet's increment mode.
+			m_command_inc = ((m_cmd & RSX_METHOD_NON_INCREMENT_CMD_MASK) == RSX_METHOD_NON_INCREMENT_CMD) ? 0 : 4;
+
 			if (count > 1)
 			{
 				// Set up readback parameters
 				m_command_reg = m_cmd & 0xfffc;
-				m_command_inc = ((m_cmd & RSX_METHOD_NON_INCREMENT_CMD_MASK) == RSX_METHOD_NON_INCREMENT_CMD) ? 0 : 4;
 				m_remaining_commands = count - 1;
 			}
 
 			if (g_cfg.core.rsx_fifo_accuracy)
 			{
-				m_internal_get += 4;
-
-				auto [ok, arg] = fetch_u32(m_internal_get);
+				// Do not advance GET until the first argument is actually available.
+				// read_unsafe() retries from m_internal_get + 4, so advancing here on a
+				// FIFO_EMPTY result would permanently skip the missing first argument.
+				auto [ok, arg] = fetch_u32(m_internal_get + 4);
 
 				if (!ok)
 				{
@@ -522,13 +528,16 @@ namespace rsx
 					else
 					{
 						data.reg = FIFO_EMPTY;
-						m_command_reg = m_cmd & 0xfffc;
+						// read_unsafe() increments command_reg before dispatching the retried
+						// argument, so park one increment behind the original method.
+						m_command_reg = (m_cmd & 0xfffc) - m_command_inc;
 						m_remaining_commands++;
 					}
 
 					return;
 				}
 
+				m_internal_get += 4;
 				data.set(m_cmd & 0xfffc, arg);
 				return;
 			}
