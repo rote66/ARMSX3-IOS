@@ -20,6 +20,8 @@ enum class game_content_type
 
 namespace rpcs3::utils
 {
+	u32 get_auto_llvm_compile_threads();
+	u32 get_llvm_compile_thread_cap();
 	u32 get_max_threads();
 
 	void configure_logs(bool force_enable = false);

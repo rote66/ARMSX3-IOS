@@ -42,6 +42,8 @@ bool armsx3_ios_game_locked(const char* game_path);
 bool armsx3_ios_install_rap_for_game(const char* rap_path, const char* game_path);
 bool armsx3_ios_extract_package_to(const char* path, const char* destination);
 bool armsx3_ios_settings_editable(void);
+unsigned int armsx3_ios_auto_llvm_workers(void);
+unsigned int armsx3_ios_max_llvm_workers(void);
 const char* armsx3_ios_settings_json(const char* path);
 bool armsx3_ios_set_setting_json(const char* path, const char* json_value);
 bool armsx3_ios_set_setting_json_live(const char* path, const char* json_value);

@@ -192,6 +192,8 @@ static NSString *ARMSX3PolishedSettingDetail(ARMSX3CoreSetting *setting)
         @"Video@@Performance Overlay@@Enable Frametime Graph": @"绘制每帧耗时曲线，比平均 FPS 更容易看出瞬时卡顿。",
         @"Core@@PPU Decoder": @"PPU 的执行方式。LLVM 重编译器通常性能最好。",
         @"Core@@SPU Decoder": @"SPU 的执行方式。LLVM 重编译器通常是推荐选择。",
+        @"Core@@LLVM Precompilation": @"开启后会在启动阶段完整扫描并预编译额外的 PPU/SPU 模块，减少游戏中的即时 LLVM 编译和卡顿。iOS 会按设备内存限制并发；关闭后仍保留当前标题主 PPU 和标题 SPU 的受控预加载，其余模块按需编译。",
+        @"Core@@Max LLVM Compile Threads": @"0 = 自动：按设备物理内存上限和当前进程内存余量选择 worker。手动值用于覆盖自动并发，但仍受设备内存安全上限限制。数值越大首次编译越快，也会提高峰值内存占用。",
         @"Video@@Resolution Scale": @"调整内部渲染分辨率。数值越高画面越清晰，但 GPU 压力也越大。",
         @"Video@@Write Color Buffers": @"部分游戏的后处理、HUD 或画面特效需要；会增加开销，遇到相关图形问题时再开启。",
         @"Video@@Read Color Buffers": @"允许 RSX 读取 CPU 写入的颜色数据。少数游戏需要，开启会降低性能。",
@@ -1454,6 +1456,12 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
 - (void)updateSliderLabel:(ARMSX3SliderAccessory *)accessory
 {
     const double value = [self sliderValue:accessory];
+    if ([accessory.settingPath isEqualToString:@"Core@@Max LLVM Compile Threads"] && llround(value) == 0)
+    {
+        accessory.valueLabel.text = [NSString stringWithFormat:@"%@ (%u)",
+            ARMSX3L(@"value.auto", @"Auto"), armsx3_ios_auto_llvm_workers()];
+        return;
+    }
     accessory.valueLabel.text = [accessory.settingType isEqualToString:@"float"]
         ? [NSString stringWithFormat:@"%.2f", value]
         : [NSString stringWithFormat:@"%.0f", value];

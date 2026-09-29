@@ -863,6 +863,16 @@ const char* cfg_type_name_ios(const cfg::_base* node)
 	}
 }
 
+extern "C" unsigned int armsx3_ios_auto_llvm_workers(void)
+{
+	return rpcs3::utils::get_auto_llvm_compile_threads();
+}
+
+extern "C" unsigned int armsx3_ios_max_llvm_workers(void)
+{
+	return rpcs3::utils::get_llvm_compile_thread_cap();
+}
+
 void emit_cfg_json_ios(const cfg::_base* node, std::string& out)
 {
 	if (node->get_type() == cfg::type::node)
@@ -903,6 +913,14 @@ void emit_cfg_json_ios(const cfg::_base* node, std::string& out)
 		bool first = true;
 		for (const std::string& variant : node->to_list())
 		{
+#if defined(ARCH_ARM64)
+			// RPCS3's SPU ASMJIT backend is x86-64 only. The desktop Qt UI disables
+			// this choice on non-x64 hosts; do the same for the generic iOS settings
+			// JSON so neither the full settings page nor the in-game quick menu can
+			// offer a value that apply_setting_value_ios must reject.
+			if (node->get_name() == "SPU Decoder" && variant == "Recompiler (ASMJIT)")
+				continue;
+#endif
 			if (!first) out += ',';
 			first = false;
 			json_append_escaped_ios(out, variant);
@@ -915,7 +933,10 @@ void emit_cfg_json_ios(const cfg::_base* node, std::string& out)
 		out += ",\"min\":";
 		json_append_escaped_ios(out, min);
 		out += ",\"max\":";
-		json_append_escaped_ios(out, node->max_to_string());
+		if (node->get_name() == "Max LLVM Compile Threads")
+			json_append_escaped_ios(out, std::to_string(armsx3_ios_max_llvm_workers()));
+		else
+			json_append_escaped_ios(out, node->max_to_string());
 	}
 
 	out += '}';

@@ -97,6 +97,12 @@ struct jit_runtime final : jit_runtime_base
 	// Same as alloc(0, 1, exec)
 	static u8* peek(bool exec = true) noexcept;
 
+	// Shared arena accounting. Primarily used by bounded mobile precompilation so
+	// startup work can leave executable space for code discovered at runtime.
+	static usz code_used() noexcept;
+	static usz code_capacity() noexcept;
+	static usz code_remaining() noexcept;
+
 	// Should be called at least once after global initialization
 	static void initialize();
 

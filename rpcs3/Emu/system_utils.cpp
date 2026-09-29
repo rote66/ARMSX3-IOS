@@ -21,12 +21,66 @@ LOG_CHANNEL(sys_log, "SYS");
 
 namespace rpcs3::utils
 {
+	u32 get_llvm_compile_thread_cap()
+	{
+		const u32 hw_threads = std::max<u32>(::utils::get_thread_count(), 1);
+
+#ifdef ARMSX3_IOS
+		// A manual override is still bounded by physical RAM. LLVM compilation can
+		// transiently consume far more memory than the final JIT object, especially
+		// while MCJIT is optimizing and relocating a large PPU module. Keep an
+		// explicit upper bound of roughly one worker per 2 GiB of installed RAM so a
+		// user can raise the automatic value without turning a slider into an easy
+		// jetsam switch.
+		if (const u64 total = ::utils::get_total_memory())
+		{
+			constexpr u64 bytes_per_worker = 2ull * 1024 * 1024 * 1024;
+			const u32 by_ram = std::max<u32>(1, static_cast<u32>(total / bytes_per_worker));
+			return std::min(hw_threads, by_ram);
+		}
+
+		return 1;
+#else
+		return hw_threads;
+#endif
+	}
+
+	u32 get_auto_llvm_compile_threads()
+	{
+		const u32 hard_cap = get_llvm_compile_thread_cap();
+
+#ifdef ARMSX3_IOS
+		// Automatic mode is intentionally more conservative than the manual cap.
+		// It is based first on the device's physical-memory ceiling, then optionally
+		// tightened using the process headroom reported by iOS.  This keeps cold
+		// full-precompile boots bounded while still scaling above one worker on
+		// higher-memory devices.
+		u32 workers = hard_cap;
+		if (const u64 total = ::utils::get_total_memory())
+		{
+			constexpr u64 bytes_per_auto_worker = 3ull * 1024 * 1024 * 1024;
+			workers = std::min(workers,
+				std::max<u32>(1, static_cast<u32>(total / bytes_per_auto_worker)));
+		}
+
+		if (const u64 avail = ::utils::get_avail_memory())
+		{
+			constexpr u64 headroom_per_worker = 1536ull * 1024 * 1024;
+			workers = std::min(workers,
+				std::max<u32>(1, static_cast<u32>(avail / headroom_per_worker)));
+		}
+
+		return std::max<u32>(workers, 1);
+#else
+		return hard_cap;
+#endif
+	}
+
 	u32 get_max_threads()
 	{
 		const u32 max_threads = static_cast<u32>(g_cfg.core.llvm_threads);
-		const u32 hw_threads = ::utils::get_thread_count();
-		const u32 thread_count = max_threads > 0 ? std::min(max_threads, hw_threads) : hw_threads;
-		return thread_count;
+		const u32 hard_cap = get_llvm_compile_thread_cap();
+		return max_threads > 0 ? std::min(max_threads, hard_cap) : get_auto_llvm_compile_threads();
 	}
 
 	void configure_logs(bool force_enable)

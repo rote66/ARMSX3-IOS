@@ -458,6 +458,23 @@ u8* jit_runtime::peek(bool exec) noexcept
 	}
 }
 
+usz jit_runtime::code_used() noexcept
+{
+	return s_code_pos.load() & 0xffff'ffff;
+}
+
+usz jit_runtime::code_capacity() noexcept
+{
+	return get_jit_segment_size();
+}
+
+usz jit_runtime::code_remaining() noexcept
+{
+	const usz used = code_used();
+	const usz capacity = code_capacity();
+	return used < capacity ? capacity - used : 0;
+}
+
 bool jit_runtime::prepare_execution() noexcept
 {
 #if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE

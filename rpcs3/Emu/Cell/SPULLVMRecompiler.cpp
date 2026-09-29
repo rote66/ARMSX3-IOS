@@ -1859,7 +1859,39 @@ public:
 		// again: the duplicate compile raced `compiled` publication and trampoline
 		// rebuilds (wedging SPURS bring-up on cold boots), and made up the majority
 		// of cold compilation work.
-		if (add_loc->llvm_compile_state.compare_and_swap(0, 1) != 0)
+		bool owns_compile = add_loc->llvm_compile_state.compare_and_swap(0, 1) == 0;
+
+#ifdef ARCH_ARM64
+		// compile_spu_llvm_with_retry deliberately creates a fresh LLVM instance after
+		// a backend failure and retries the SAME spu_program with a lower-pressure
+		// codegen variant. The failed first owner leaves llvm_compile_state == 3.
+		//
+		// Before this exception existed, the retry immediately found state 3 here and
+		// returned nullptr without ever entering LLVM. The log therefore claimed
+		// "Retrying without TBL2/TBX2" and then produced no code/no error. NFSMW's
+		// large RWAC decompression block exposed this: the intended fallback was
+		// structurally unreachable and the 2771-instruction hot block fell all the
+		// way to the SPU interpreter.
+		//
+		// Only an explicit non-default ARM64 retry context may reopen a failed item.
+		// Ordinary runtime arrivals still treat state 3 as terminal, preserving the
+		// duplicate-compilation exclusion above.
+		const bool arm64_codegen_retry =
+			g_spu_llvm_compile_context &&
+			(!g_spu_llvm_compile_context->use_tbl2 || !g_spu_llvm_compile_context->use_fma);
+
+		if (!owns_compile && arm64_codegen_retry &&
+			add_loc->llvm_compile_state.compare_and_swap(3, 1) == 3)
+		{
+			owns_compile = true;
+			spu_log.notice("SPU LLVM retry reclaimed failed compile slot for block 0x%x (tbl2=%u fma=%u)",
+				func.entry_point,
+				g_spu_llvm_compile_context->use_tbl2 ? 1u : 0u,
+				g_spu_llvm_compile_context->use_fma ? 1u : 0u);
+		}
+#endif
+
+		if (!owns_compile)
 		{
 			// Bounded, like the duplicate wait above. An untimed wait on a claim is only
 			// as sound as every path the owner can leave by, and a waiter that misses the

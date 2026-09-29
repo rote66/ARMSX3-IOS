@@ -4297,7 +4297,13 @@ extern bool ppu_stdcx(ppu_thread& ppu, u32 addr, u64 reg_value)
 
 struct jit_core_allocator
 {
+#ifdef ARMSX3_IOS
+	// 0 means RAM-bounded automatic mode; a non-zero user setting is still
+	// clamped to the physical-memory cap by get_max_threads().
+	const s16 thread_count = static_cast<s16>(rpcs3::utils::get_max_threads());
+#else
 	const s16 thread_count = g_cfg.core.llvm_threads ? std::min<s32>(g_cfg.core.llvm_threads, limit()) : limit();
+#endif
 
 	// Initialize global semaphore with the max number of threads
 	::semaphore<0x7fff> sem{std::max<s16>(thread_count, 1)};
@@ -4931,7 +4937,7 @@ extern void ppu_precompile(std::vector<std::string>& dir_queue, std::vector<ppu_
 	ppu_log.notice("Module compile budget: %u KB in flight, from %u MB available of %u MB",
 		file_size_limit / 1024, avail_memory >> 20, total_memory >> 20);
 
-	const u32 software_thread_limit = std::min<u32>(g_cfg.core.llvm_threads ? g_cfg.core.llvm_threads : u32{umax}, ::size32(file_queue));
+	const u32 software_thread_limit = std::min<u32>(rpcs3::utils::get_max_threads(), ::size32(file_queue));
 	const u32 cpu_thread_limit = utils::get_thread_count() > 8u ? std::max<u32>(utils::get_thread_count(), 2) - 1 : utils::get_thread_count(); // One LLVM thread less
 
 	std::vector<u128> decrypt_klics;

@@ -982,6 +982,32 @@ spu_cache::~spu_cache()
 {
 }
 
+static bool allow_spu_data_precompilation()
+{
+	if (g_cfg.core.llvm_precompilation)
+	{
+		return true;
+	}
+
+#ifdef ARMSX3_IOS
+	// Keep the broad iOS LLVM-precompilation workaround in System.cpp: it prevents
+	// PPU/dev_flash directory scanning and the large temporary MCJIT footprint that
+	// originally made title boot unreliable on memory-constrained devices.
+	//
+	// SPU code embedded in the title is a different tradeoff. If we do not mine it
+	// here, LLVM has to discover and compile those blocks from the live JobThreads.
+	// Debug/prototype titles can have a very small render watchdog; NFS MW's March
+	// build, for example, asserts after three seconds while resource-decompression
+	// jobs are still compiling. Precompile only the title's discoverable SPU code,
+	// only for the normal LLVM+cache path, and never for VSH.
+	return !Emu.IsVsh() &&
+		g_cfg.core.spu_decoder == spu_decoder_type::llvm &&
+		g_cfg.core.spu_cache;
+#else
+	return false;
+#endif
+}
+
 extern void utilize_spu_data_segment(u32 vaddr, const void* ls_data_vaddr, u32 size)
 {
 	if (u32 rem = vaddr % 4)
@@ -1010,7 +1036,7 @@ extern void utilize_spu_data_segment(u32 vaddr, const void* ls_data_vaddr, u32 s
 	// SPU code mining is too important
 	size = std::min<u32>(SPU_LS_SIZE - vaddr, size);
 
-	if (!g_cfg.core.llvm_precompilation)
+	if (!allow_spu_data_precompilation())
 	{
 		return;
 	}
@@ -1227,7 +1253,9 @@ void spu_cache::initialize(bool build_existing_cache)
 		total_precompile += sec.funcs.size();
 	}
 
-	const bool spu_precompilation_enabled = func_list.empty() && g_cfg.core.spu_cache && g_cfg.core.llvm_precompilation;
+	const bool allow_data_precompilation = allow_spu_data_precompilation();
+	const bool spu_precompilation_enabled = func_list.empty() && g_cfg.core.spu_cache && allow_data_precompilation;
+	const bool compile_discovered_data = g_cfg.core.spu_cache && allow_data_precompilation && total_precompile != 0;
 
 	if (spu_precompilation_enabled)
 	{
@@ -1238,13 +1266,63 @@ void spu_cache::initialize(bool build_existing_cache)
 	{
 		return;
 	}
-	else
+	else if (!compile_discovered_data)
 	{
 		total_precompile = 0;
 		data_list = {};
 	}
+	else
+	{
+		// An existing cache may be incomplete (for example after a previous run
+		// reached new JobThread code on demand). Keep it local while the old entries
+		// are rebuilt so they are not appended to the file a second time, but also
+		// compile the newly mined title data for this session. A fresh cache takes
+		// the branch above and persists these blocks normally.
+#ifdef ARMSX3_IOS
+		spu_log.notice("iOS SPU preload: compiling %u cached functions plus %u discovered title functions before guest execution",
+			func_list.size(), total_precompile);
+#endif
+	}
 
 	atomic_t<usz> data_indexer = 0;
+
+#ifdef ARMSX3_IOS
+	// iOS uses one shared executable arena for PPU, SPU and asmjit trampolines.
+	// Do not let eager SPU cache building consume the final pages: titles can
+	// DMA/generate SPU jobs after boot and those blocks need somewhere to live.
+	//
+	// Build 49 demonstrated the failure mode on a 4 GiB device: the 512 MiB
+	// arena has a 256 MiB code half and the session ended at 249 MiB used. Keep
+	// a modest reserve so startup compilation can do most of the work without
+	// making later JobThread compilation fail at the hard arena boundary.
+	constexpr usz ios_spu_runtime_jit_reserve = 24 * 1024 * 1024;
+	atomic_t<bool> preload_budget_reached{false};
+	atomic_t<u32> backend_blocks_skipped{0};
+
+	auto ios_spu_preload_has_budget = [&]() -> bool
+	{
+		if (preload_budget_reached)
+		{
+			return false;
+		}
+
+		const usz remaining = jit_runtime::code_remaining();
+		if (remaining <= ios_spu_runtime_jit_reserve)
+		{
+			if (!preload_budget_reached.exchange(true))
+			{
+				spu_log.notice(
+					"iOS SPU preload: executable budget reached at %u/%u MiB; reserving %u MiB for runtime SPU/PPU JIT",
+					static_cast<u32>(jit_runtime::code_used() >> 20),
+					static_cast<u32>(jit_runtime::code_capacity() >> 20),
+					static_cast<u32>(ios_spu_runtime_jit_reserve >> 20));
+			}
+			return false;
+		}
+
+		return true;
+	};
+#endif
 
 	if (g_cfg.core.spu_decoder == spu_decoder_type::dynamic || g_cfg.core.spu_decoder == spu_decoder_type::llvm)
 	{
@@ -1373,6 +1451,13 @@ void spu_cache::initialize(bool build_existing_cache)
 				continue;
 			}
 
+#ifdef ARMSX3_IOS
+			if (!ios_spu_preload_has_budget())
+			{
+				continue;
+			}
+#endif
+
 			// Get data start
 			const u32 start = func.lower_bound;
 			const u32 size0 = ::size32(func.data);
@@ -1420,11 +1505,40 @@ void spu_cache::initialize(bool build_existing_cache)
 					logged_error++;
 				}
 			}
-			else if (!compile_program(std::move(func2)))
+			else
 			{
-				// Likely, out of JIT memory. Signal to prevent further building.
-				fail_flag |= 1;
-				continue;
+				const u32 entry_point = func2.entry_point;
+
+				if (!compile_program(std::move(func2)))
+				{
+#ifdef ARCH_ARM64
+					// A single block can be permanently unsupported by LLVM's AArch64
+					// allocator. compile_spu_llvm_with_retry marks that block so runtime
+					// dispatch uses the interpreter. That is a local compatibility
+					// fallback, not a reason to abort every remaining preload candidate.
+					//
+					// Build 49 hit exactly this on NFSMW block 0x44c0 and incorrectly
+					// stopped after 1001 programs, leaving a large JobThread compile burst
+					// in gameplay.
+					if (spu_block_compile_failed(entry_point)
+#ifdef ARMSX3_IOS
+						&& ios_spu_preload_has_budget()
+#endif
+					)
+					{
+#ifdef ARMSX3_IOS
+						backend_blocks_skipped++;
+#endif
+						std::memset(ls.data() + start / 4, 0, 4 * (size0 - 1));
+						continue;
+					}
+#endif
+
+					// An unclassified failure is treated as a resource/JIT failure. Stop
+					// eager building but keep the valid programs already installed.
+					fail_flag |= 1;
+					continue;
+				}
 			}
 
 			// Clear fake LS
@@ -1488,6 +1602,13 @@ void spu_cache::initialize(bool build_existing_cache)
 				continue;
 			}
 
+#ifdef ARMSX3_IOS
+			if (!ios_spu_preload_has_budget())
+			{
+				continue;
+			}
+#endif
+
 			if (last_sec_idx != sec_idx)
 			{
 				if (last_sec_idx != umax)
@@ -1518,9 +1639,25 @@ void spu_cache::initialize(bool build_existing_cache)
 				const u32 last_inst = std::bit_cast<be_t<u32>>(func2.data.back());
 				const u32 prog_size = ::size32(func2.data);
 
+				const u32 entry_point = func2.entry_point;
 				if (!compile_program(std::move(func2)))
 				{
-					// Likely, out of JIT memory. Signal to prevent further building.
+#ifdef ARCH_ARM64
+					if (spu_block_compile_failed(entry_point)
+#ifdef ARMSX3_IOS
+						&& ios_spu_preload_has_budget()
+#endif
+					)
+					{
+#ifdef ARMSX3_IOS
+						backend_blocks_skipped++;
+#endif
+						// The marked range will use the interpreter if reached. Move to
+						// the next discovered entry instead of terminating all preload.
+						break;
+					}
+#endif
+
 					fail_flag |= 1;
 					break;
 				}
@@ -1647,13 +1784,22 @@ void spu_cache::initialize(bool build_existing_cache)
 
 	spu_log.notice("SPU Runtime: Workers built %u programs.", built_total);
 
+#ifdef ARMSX3_IOS
+	spu_log.notice(
+		"iOS SPU preload summary: built=%u backend_skipped=%u budget_limited=%u code=%u/%u MiB remaining=%u MiB",
+		built_total, backend_blocks_skipped.load(), preload_budget_reached.load() ? 1u : 0u,
+		static_cast<u32>(jit_runtime::code_used() >> 20),
+		static_cast<u32>(jit_runtime::code_capacity() >> 20),
+		static_cast<u32>(jit_runtime::code_remaining() >> 20));
+#endif
+
 	if (Emu.IsStopped())
 	{
 		spu_log.error("SPU Runtime: Cache building aborted.");
 		return;
 	}
 
-	// Running out of JIT memory part-way is not a reason to throw the cache away.
+	// A resource/JIT failure part-way is not a reason to throw the cache away.
 	//
 	// This used to return here, which skipped the global cache instance below and left
 	// g_fxo's spu_cache empty for the whole session. Nothing said so, and the consequence is
@@ -1669,7 +1815,7 @@ void spu_cache::initialize(bool build_existing_cache)
 	// was actually lost and fall through.
 	if (fail_flag)
 	{
-		spu_log.error("SPU Runtime: ran out of JIT memory after building %u programs."
+		spu_log.error("SPU Runtime: eager cache building stopped after an unclassified LLVM/JIT resource failure at %u programs."
 			" The rest are compiled on demand; cached programs are kept.", built_total);
 	}
 	else if ((g_cfg.core.spu_decoder == spu_decoder_type::asmjit || g_cfg.core.spu_decoder == spu_decoder_type::llvm) && !func_list.empty())

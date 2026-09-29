@@ -2337,14 +2337,6 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 			}
 
 #ifdef ARMSX3_IOS
-			// Eager PPU/SPU precompilation is a poor fit for iOS. It scans and compiles a
-			// large part of dev_flash before the title can present a frame, and each temporary
-			// MCJIT instance carries a large executable arena. On the 4 GB test device this
-			// produced a long black screen and eventually repeated WX commit failures while
-			// compiling firmware PRX modules that the game had not even requested yet.
-			// Keep the LLVM decoders for normal titles, but compile modules on demand instead.
-			g_cfg.core.llvm_precompilation.set(false);
-
 			// VSH is unusually large: on the iPhone 14,6 test device its main image is
 			// split into 64 PPU LLVM objects. Even with firmware-directory precompilation
 			// disabled, a one-worker mobile JIT spends minutes compiling the main image
@@ -2361,13 +2353,24 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 			// overwrite the temporary values again.
 			if (m_path.ends_with("vsh.self"sv))
 			{
+				g_cfg.core.llvm_precompilation.set(false);
 				g_cfg.core.ppu_decoder.set(ppu_decoder_type::_static);
 				g_cfg.core.spu_decoder.set(spu_decoder_type::_static);
 				sys_log.notice("iOS firmware boot: static PPU + static SPU interpreters enabled and LLVM precompilation disabled after config load");
 			}
 			else
 			{
-				sys_log.notice("iOS title boot: LLVM precompilation disabled; modules will compile on demand");
+				const u32 configured_workers = static_cast<u32>(g_cfg.core.llvm_threads);
+				const u32 active_workers = rpcs3::utils::get_max_threads();
+				const u32 auto_workers = rpcs3::utils::get_auto_llvm_compile_threads();
+				const u32 worker_cap = rpcs3::utils::get_llvm_compile_thread_cap();
+				sys_log.notice(
+					"iOS title boot: bounded LLVM precompilation=%s workers=%u mode=%s auto=%u cap=%u precise_spu_verify=%s total_ram=%uMiB headroom=%uMiB",
+					g_cfg.core.llvm_precompilation ? "enabled" : "disabled",
+					active_workers, configured_workers ? "manual" : "auto", auto_workers, worker_cap,
+					g_cfg.core.precise_spu_verification ? "enabled" : "disabled",
+					static_cast<u32>(::utils::get_total_memory() >> 20),
+					static_cast<u32>(::utils::get_avail_memory() >> 20));
 			}
 #endif
 
