@@ -5,6 +5,7 @@
 #include "Crypto/unself.h"
 #include "Emu/Audio/Null/NullAudioBackend.h"
 #include "Emu/Audio/Null/null_enumerator.h"
+#include "Emu/emu_callbacks.h"
 #include "ARMSX3IOSAudioBackend.h"
 #include "Emu/Cell/Modules/cellMsgDialog.h"
 #include "Emu/Cell/Modules/cellSaveData.h"
@@ -1803,7 +1804,7 @@ ios_main_callback_dispatcher g_ios_main_callbacks;
 
 void set_callbacks()
 {
-	EmuCallbacks callbacks{};
+	emu_callbacks callbacks{};
 	callbacks.call_from_main_thread = [](std::function<void()> fn, atomic_t<u32>* wake_up)
 	{
 		if (wake_up)
@@ -1933,7 +1934,7 @@ void set_callbacks()
 		}
 		return std::string{};
 	};
-	Emu.SetCallbacks(std::move(callbacks));
+	g_emu_callbacks = std::move(callbacks);
 }
 } // namespace
 
