@@ -1142,7 +1142,8 @@ typedef NS_ENUM(NSInteger, ARMSX3SettingsCategory)
     NSString *customName = ARMSX3CustomGameName(_gameSerial);
     NSString *baseVersion = [_gameInfo[@"version"] isKindOfClass:NSString.class] ? _gameInfo[@"version"] : @"";
     NSString *installedVersion = [_gameInfo[@"installedVersion"] isKindOfClass:NSString.class] ? _gameInfo[@"installedVersion"] : @"";
-    NSInteger dlc = [_gameInfo[@"dlcCount"] integerValue];
+    id dlcCount = _gameInfo[@"dlcCount"];
+    NSInteger dlc = [dlcCount isKindOfClass:NSNumber.class] ? [dlcCount integerValue] : 0;
     NSString *region = [self regionForSerial:_gameSerial];
     NSString *container = _gamePath.length ? ([NSFileManager.defaultManager fileExistsAtPath:_gamePath isDirectory:NULL] && !_gamePath.pathExtension.length ? @"Folder" : (_gamePath.pathExtension.uppercaseString.length ? _gamePath.pathExtension.uppercaseString : @"Folder")) : @"—";
     NSArray<NSArray<NSString *> *> *rows = @[

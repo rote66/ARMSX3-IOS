@@ -119,4 +119,5 @@ if otool -L ${OUTPUT_DIR}/Payload/ARMSX3.app/ARMSX3 | grep -E '/opt/homebrew|/us
     print -u2 "Unexpected non-system dynamic library dependency"
     exit 1
 fi
+shasum -a 256 "${IPA}" > "${IPA}.sha256"
 print "IPA: ${IPA}"

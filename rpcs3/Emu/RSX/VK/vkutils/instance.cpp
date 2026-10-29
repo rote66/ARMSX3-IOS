@@ -3,6 +3,10 @@
 
 #include "Emu/system_config.h"
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
 namespace vk
 {
 	// Supported extensions
@@ -160,6 +164,9 @@ namespace vk
 #ifdef __APPLE__
 		// Declare MVK variables here to ensure the lifetime within the entire scope
 		const VkBool32 setting_true = VK_TRUE;
+#if TARGET_OS_SIMULATOR
+		const VkBool32 setting_false = VK_FALSE;
+#endif
 		const int32_t setting_fast_math = g_cfg.video.disable_msl_fast_math.get() ? MVK_CONFIG_FAST_MATH_NEVER : MVK_CONFIG_FAST_MATH_ON_DEMAND;
 		bool portability_enumeration_enabled = false;
 
@@ -203,6 +210,10 @@ namespace vk
 
 				mvk_settings.push_back(VkLayerSettingEXT{ kMVKMoltenVKDriverLayerName, "MVK_CONFIG_RESUME_LOST_DEVICE", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &setting_true });
 				mvk_settings.push_back(VkLayerSettingEXT{ kMVKMoltenVKDriverLayerName, "MVK_CONFIG_FAST_MATH_ENABLED", VK_LAYER_SETTING_TYPE_INT32_EXT, 1, &setting_fast_math });
+#if TARGET_OS_SIMULATOR
+				mvk_settings.push_back(VkLayerSettingEXT{ kMVKMoltenVKDriverLayerName, "MVK_CONFIG_FULL_IMAGE_VIEW_SWIZZLE", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &setting_true });
+				mvk_settings.push_back(VkLayerSettingEXT{ kMVKMoltenVKDriverLayerName, "MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &setting_false });
+#endif
 
 				mvk_layer_settings_create_info.sType = VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT;
 				mvk_layer_settings_create_info.pNext = next_info;

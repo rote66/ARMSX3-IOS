@@ -78,7 +78,7 @@ namespace
 #ifdef ARMSX3_IOS
 			jit_log.notice("iOS LLVM recoverable helper: entered");
 #endif
-#if defined(__APPLE__) && !TARGET_OS_IPHONE
+#if defined(__APPLE__) && (!TARGET_OS_IPHONE || TARGET_OS_SIMULATOR)
 			pthread_jit_write_protect_np(false);
 #endif
 			g_llvm_fatal_message = &error;
@@ -92,7 +92,7 @@ namespace
 #endif
 
 			g_llvm_fatal_message = nullptr;
-#if defined(__APPLE__) && !TARGET_OS_IPHONE
+#if defined(__APPLE__) && (!TARGET_OS_IPHONE || TARGET_OS_SIMULATOR)
 			pthread_jit_write_protect_np(true);
 #endif
 		});

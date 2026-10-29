@@ -3,16 +3,30 @@ set -euo pipefail
 
 SCRIPT_DIR=${0:A:h}
 SOURCE_DIR=${SCRIPT_DIR:h}
-BUILD_DIR=${ARMSX3_IOS_BUILD_DIR:-${SOURCE_DIR}/build/ios-device}
+IOS_SDK=${ARMSX3_IOS_SDK:-iphoneos}
+case ${IOS_SDK} in
+    iphoneos)
+        BUILD_VARIANT=ios-device
+        TARGET_TRIPLE=arm64-apple-ios15.0
+        MOLTENVK_PLATFORM=ios-arm64
+        ;;
+    iphonesimulator)
+        BUILD_VARIANT=ios-simulator
+        TARGET_TRIPLE=arm64-apple-ios15.0-simulator
+        MOLTENVK_PLATFORM=ios-arm64-simulator
+        ;;
+    *) print -u2 "Unsupported iOS SDK: ${IOS_SDK}"; exit 2 ;;
+esac
+BUILD_DIR=${ARMSX3_IOS_BUILD_DIR:-${SOURCE_DIR}/build/${BUILD_VARIANT}}
 DEPS_DIR=${BUILD_DIR}/ios-deps
-SRC_DIR=${BUILD_DIR}/dependency-sources
+SRC_DIR=${ARMSX3_IOS_DEPENDENCY_SOURCES_DIR:-${BUILD_DIR}/dependency-sources}
 JOBS=${ARMSX3_JOBS:-$(getconf _NPROCESSORS_ONLN)}
-SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-CLANG=$(xcrun --sdk iphoneos --find clang)
-CXX=$(xcrun --sdk iphoneos --find clang++)
-AR=$(xcrun --sdk iphoneos --find ar)
-RANLIB=$(xcrun --sdk iphoneos --find ranlib)
-STRIP=$(xcrun --sdk iphoneos --find strip)
+SDK=$(xcrun --sdk ${IOS_SDK} --show-sdk-path)
+CLANG=$(xcrun --sdk ${IOS_SDK} --find clang)
+CXX=$(xcrun --sdk ${IOS_SDK} --find clang++)
+AR=$(xcrun --sdk ${IOS_SDK} --find ar)
+RANLIB=$(xcrun --sdk ${IOS_SDK} --find ranlib)
+STRIP=$(xcrun --sdk ${IOS_SDK} --find strip)
 MIN_IOS=15.0
 ABSEIL_VERSION=20250512.1
 
@@ -56,6 +70,12 @@ prepare_abseil() {
         print "Abseil source already prepared"
         return
     fi
+    local device_source=${SOURCE_DIR}/build/ios-device/_deps/absl-src
+    if [[ ${IOS_SDK} == iphonesimulator && -f ${device_source}/CMakeLists.txt ]]; then
+        mkdir -p ${BUILD_DIR}/_deps
+        ditto ${device_source} ${source}
+        return
+    fi
     rm -rf ${source}
     mkdir -p ${BUILD_DIR}/_deps
     git clone --depth 1 --branch ${ABSEIL_VERSION} \
@@ -79,8 +99,12 @@ build_ffmpeg() {
     if [[ ! -d ${source} ]]; then
         tar -xf ${archive} -C ${SRC_DIR}
     fi
-    mkdir -p ${source}/build-ios
-    pushd ${source}/build-ios >/dev/null
+    local build=${source}/build-ios
+    if [[ ${IOS_SDK} == iphonesimulator ]]; then
+        build=${source}/build-ios-simulator
+    fi
+    mkdir -p ${build}
+    pushd ${build} >/dev/null
     ../configure \
         --prefix=${prefix} \
         --target-os=darwin \
@@ -91,8 +115,8 @@ build_ffmpeg() {
         --ranlib=${RANLIB} \
         --strip=${STRIP} \
         --sysroot=${SDK} \
-        --extra-cflags="-arch arm64 -miphoneos-version-min=${MIN_IOS} -fembed-bitcode-marker" \
-        --extra-ldflags="-arch arm64 -miphoneos-version-min=${MIN_IOS}" \
+        --extra-cflags="-target ${TARGET_TRIPLE}" \
+        --extra-ldflags="-target ${TARGET_TRIPLE}" \
         --enable-cross-compile \
         --enable-static \
         --disable-shared \
@@ -131,19 +155,23 @@ build_moltenvk() {
         ExternalDependencies.xcodeproj/project.pbxproj
     sed -i '' -E 's/MACOSX_DEPLOYMENT_TARGET = [0-9.]+;/MACOSX_DEPLOYMENT_TARGET = 12.0;/g' \
         ExternalDependencies.xcodeproj/project.pbxproj
+    local dependency_platform=--ios
+    if [[ ${IOS_SDK} == iphonesimulator ]]; then
+        dependency_platform=--iossim
+    fi
     IPHONEOS_DEPLOYMENT_TARGET=${MIN_IOS} MACOSX_DEPLOYMENT_TARGET=12.0 \
-        ./fetchDependencies --ios
+        ./fetchDependencies ${dependency_platform}
     xcodebuild build -quiet \
         -project MoltenVKPackaging.xcodeproj \
         -scheme "MoltenVK Package (iOS only)" \
         -configuration Release \
-        -sdk iphoneos \
+        -sdk ${IOS_SDK} \
         -arch arm64 \
         IPHONEOS_DEPLOYMENT_TARGET=${MIN_IOS} \
         CODE_SIGNING_ALLOWED=NO
     popd >/dev/null
 
-    local library=$(find ${source} -path '*/ios-arm64/libMoltenVK.a' -print -quit)
+    local library=$(find ${source} -path "*/${MOLTENVK_PLATFORM}/libMoltenVK.a" -print -quit)
     local headers=${source}/Package/Release/MoltenVK/include
     if [[ -z ${library} || -z ${headers} ]]; then
         print -u2 "Could not locate MoltenVK iOS build products"
@@ -201,13 +229,13 @@ build_llvm() {
     "${CMAKE_BIN}" -S ${source} -B ${build} -G "Unix Makefiles" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_SYSTEM_NAME=iOS \
-        -DCMAKE_OSX_SYSROOT=iphoneos \
+        -DCMAKE_OSX_SYSROOT=${IOS_SDK} \
         -DCMAKE_OSX_ARCHITECTURES=arm64 \
         -DCMAKE_OSX_DEPLOYMENT_TARGET=${MIN_IOS} \
         -DCMAKE_INSTALL_PREFIX=${prefix} \
         -DLLVM_TABLEGEN=${tablegen} \
         -DLLVM_NATIVE_TOOL_DIR=${tablegen:h} \
-        -DLLVM_DEFAULT_TARGET_TRIPLE=arm64-apple-ios${MIN_IOS} \
+        -DLLVM_DEFAULT_TARGET_TRIPLE=${TARGET_TRIPLE} \
         -DLLVM_TARGETS_TO_BUILD=AArch64 \
         -DLLVM_ENABLE_PROJECTS= \
         -DLLVM_BUILD_TOOLS=OFF \

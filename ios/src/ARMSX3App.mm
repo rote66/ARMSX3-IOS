@@ -37,10 +37,12 @@
 #include <sys/ucontext.h>
 #include <unistd.h>
 
+#if !TARGET_OS_SIMULATOR
 // Ask jailbreak injectors that honor dyld's restriction marker to leave this
 // process untouched. JIT authorization comes from the app entitlements.
 __attribute__((used, section("__RESTRICT,__restrict")))
 static const char g_restrict_tweak_injection = 0;
+#endif
 
 static std::atomic<int> g_diagnostic_log_fd{-1};
 
@@ -298,10 +300,19 @@ static NSString *armsx3_prepare_shared_documents(void)
     AVPlayer *_bootIntroPlayer;
     BOOL _bootIntroAttempted;
     NSString *_currentGameSerial;
+#if TARGET_OS_SIMULATOR
+    dispatch_source_t _simulatorInputTimer;
+    NSDate *_simulatorInputModified;
+    NSTimeInterval _simulatorInputReleaseAt;
+    NSArray<NSNumber *> *_simulatorPressedKeys;
+#endif
 }
 
 - (void)dealloc
 {
+#if TARGET_OS_SIMULATOR
+    if (_simulatorInputTimer) dispatch_source_cancel(_simulatorInputTimer);
+#endif
     ARMSX3RumbleBridgeStop();
     if (_languageObserver) [NSNotificationCenter.defaultCenter removeObserver:_languageObserver];
     if (_overlayObserver) [NSNotificationCenter.defaultCenter removeObserver:_overlayObserver];
@@ -697,7 +708,95 @@ static NSString *armsx3_prepare_shared_documents(void)
     if (ARMSX3BatteryWarningsEnabled()) ARMSX3StartBatteryWarnings();
     [self showStatus:@"Starting..." error:NO];
     armsx3_ios_diagnostic_log("viewDidLoad UI ready");
+#if TARGET_OS_SIMULATOR
+    [self configureSimulatorInput];
+#endif
 }
+
+#if TARGET_OS_SIMULATOR
+- (void)applySimulatorPad:(NSDictionary *)command
+{
+    for (NSNumber *key in _simulatorPressedKeys)
+        armsx3_ios_set_key(key.unsignedIntValue, false);
+    _simulatorPressedKeys = @[];
+    NSArray *keys = [command[@"keys"] isKindOfClass:NSArray.class] ? command[@"keys"] : @[];
+    NSDictionary<NSString *, NSNumber *> *namedKeys = @{
+        @"space": @0x20, @"escape": @0x01000000, @"tab": @0x01000001,
+        @"backspace": @0x01000003, @"enter": @0x01000004,
+        @"left": @0x01000012, @"up": @0x01000013,
+        @"right": @0x01000014, @"down": @0x01000015
+    };
+    NSMutableSet<NSNumber *> *pressed = [NSMutableSet set];
+    for (id value in keys)
+    {
+        if (![value isKindOfClass:NSString.class]) continue;
+        NSNumber *key = namedKeys[[value lowercaseString]];
+        if (!key && [value length] == 1)
+        {
+            const unichar character = [[value uppercaseString] characterAtIndex:0];
+            if (character >= 0x20 && character < 0x7f) key = @(character);
+        }
+        if (key && ![pressed containsObject:key] && armsx3_ios_set_key(key.unsignedIntValue, true))
+            [pressed addObject:key];
+    }
+    _simulatorPressedKeys = pressed.allObjects;
+    const auto value = [&command](NSString *key, NSInteger fallback, NSInteger maximum) {
+        id number = command[key];
+        return [number isKindOfClass:NSNumber.class] ? MIN(maximum, MAX(0, [number integerValue])) : fallback;
+    };
+    _digital1 = static_cast<uint32_t>(value(@"digital1", 0, 65535));
+    _digital2 = static_cast<uint32_t>(value(@"digital2", 0, 65535));
+    _leftX = static_cast<uint8_t>(value(@"left_x", 128, 255));
+    _leftY = static_cast<uint8_t>(value(@"left_y", 128, 255));
+    _rightX = static_cast<uint8_t>(value(@"right_x", 128, 255));
+    _rightY = static_cast<uint8_t>(value(@"right_y", 128, 255));
+    _leftTrigger = static_cast<uint8_t>(value(@"left_trigger", 0, 255));
+    _rightTrigger = static_cast<uint8_t>(value(@"right_trigger", 0, 255));
+    [self pushPad];
+}
+
+- (void)configureSimulatorInput
+{
+    if (![NSProcessInfo.processInfo.environment[@"ARMSX3_SIMULATOR_INPUT"] isEqualToString:@"1"]) return;
+    NSString *path = [g_documents_path stringByAppendingPathComponent:@"SimulatorInput.json"];
+    _simulatorInputModified = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil][NSFileModificationDate];
+    _simulatorInputTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(_simulatorInputTimer, DISPATCH_TIME_NOW, NSEC_PER_SEC / 30, NSEC_PER_MSEC * 2);
+    __weak ARMSX3ViewController *weakSelf = self;
+    dispatch_source_set_event_handler(_simulatorInputTimer, ^{
+        ARMSX3ViewController *self = weakSelf;
+        if (!self || !armsx3_ios_is_initialized()) return;
+        const NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+        if (self->_simulatorInputReleaseAt && now >= self->_simulatorInputReleaseAt)
+        {
+            self->_simulatorInputReleaseAt = 0;
+            [self applySimulatorPad:@{}];
+        }
+        NSDictionary *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
+        NSDate *modified = attributes[NSFileModificationDate];
+        if (!modified || [modified isEqualToDate:self->_simulatorInputModified]) return;
+        self->_simulatorInputModified = modified;
+        if ([attributes[NSFileSize] unsignedLongLongValue] > 4096) return;
+        NSData *data = [NSData dataWithContentsOfFile:path];
+        id object = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        if (![object isKindOfClass:NSDictionary.class]) return;
+        NSDictionary *command = object;
+        NSString *boot = [command[@"boot"] isKindOfClass:NSString.class] ? command[@"boot"] : nil;
+        if (boot.length && !armsx3_ios_game_active())
+        {
+            [self bootGameAtURL:[NSURL fileURLWithPath:boot]];
+            return;
+        }
+        if (!armsx3_ios_game_active() || boot.length) return;
+        id duration = command[@"duration_ms"];
+        const NSInteger milliseconds = [duration isKindOfClass:NSNumber.class] ? [duration integerValue] : 200;
+        self->_simulatorInputReleaseAt = now + MIN(5000, MAX(50, milliseconds)) / 1000.0;
+        [self applySimulatorPad:command];
+    });
+    dispatch_resume(_simulatorInputTimer);
+    armsx3_ios_diagnostic_log("simulator file input enabled: Documents/SimulatorInput.json");
+}
+#endif
 
 - (void)viewDidAppear:(BOOL)animated
 {
@@ -810,6 +909,30 @@ static NSString *armsx3_prepare_shared_documents(void)
             [self showStatus:@"Core initialization failed" error:YES];
             return;
         }
+
+#if TARGET_OS_SIMULATOR
+        NSString *simulatorFirmware = NSProcessInfo.processInfo.environment[@"ARMSX3_SIMULATOR_FIRMWARE"];
+        if (simulatorFirmware.length)
+        {
+            if (!armsx3_ios_can_boot_firmware())
+            {
+                [self showStatus:@"Installing simulator PS3 firmware..." error:NO];
+                if (!armsx3_ios_install_firmware(simulatorFirmware.fileSystemRepresentation))
+                {
+                    armsx3_ios_diagnostic_log("simulator firmware installation failed");
+                    [self showStatus:@"Simulator PS3 firmware installation failed" error:YES];
+                    return;
+                }
+            }
+            armsx3_ios_diagnostic_log("simulator firmware ready; booting XMB/VSH");
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self->_frontend setCoreReady:YES];
+                [self dismissBootIntro];
+                [self bootFirmware];
+            });
+            return;
+        }
+#endif
 
         dispatch_async(dispatch_get_main_queue(), ^{
             [self->_frontend setCoreReady:YES];
@@ -1674,7 +1797,6 @@ static void armsx3_event_callback(int event, const char *message)
 @end
 
 @interface ARMSX3AppDelegate : UIResponder <UIApplicationDelegate>
-@property(nonatomic, strong) UIWindow *window;
 @end
 
 @implementation ARMSX3AppDelegate
@@ -1689,24 +1811,36 @@ static void armsx3_event_callback(int event, const char *message)
     [audioSession setActive:YES error:&audioError];
     armsx3_ios_diagnostic_log(audioError ? "iOS audio session activation failed" : "iOS audio session active");
     g_documents_path = armsx3_prepare_shared_documents();
-    self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
-    self.window.rootViewController = [[ARMSX3ViewController alloc] init];
-    [self.window makeKeyAndVisible];
-    armsx3_ios_diagnostic_log("application window visible");
-    armsx3_ios_log_memory_state("launch");
     return YES;
 }
 - (void)applicationDidReceiveMemoryWarning:(UIApplication *)application
 {
     armsx3_ios_log_memory_state("warning");
 }
-- (void)applicationDidEnterBackground:(UIApplication *)application
+@end
+
+@interface ARMSX3SceneDelegate : UIResponder <UIWindowSceneDelegate>
+@property(nonatomic, strong) UIWindow *window;
+@end
+
+@implementation ARMSX3SceneDelegate
+- (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session
+    options:(UISceneConnectionOptions *)connectionOptions
+{
+    if (![scene isKindOfClass:UIWindowScene.class]) return;
+    self.window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
+    self.window.rootViewController = [[ARMSX3ViewController alloc] init];
+    [self.window makeKeyAndVisible];
+    armsx3_ios_diagnostic_log("application scene window visible");
+    armsx3_ios_log_memory_state("launch");
+}
+- (void)sceneDidEnterBackground:(UIScene *)scene
 {
     ARMSX3SecondScreenSetForeground(NO);
     ARMSX3RumbleBridgeStop();
     if (armsx3_ios_is_initialized()) armsx3_ios_pause();
 }
-- (void)applicationDidBecomeActive:(UIApplication *)application
+- (void)sceneDidBecomeActive:(UIScene *)scene
 {
     ARMSX3SecondScreenSetForeground(YES);
     ARMSX3RumbleBridgeStart();

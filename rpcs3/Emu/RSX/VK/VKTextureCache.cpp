@@ -10,6 +10,10 @@
 
 #include "util/asm.hpp"
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
 namespace vk
 {
 	u64 hash_image_properties(VkFormat format, u16 w, u16 h, u16 d, u16 mipmaps, VkImageType type, VkImageCreateFlags create_flags, VkSharingMode sharing_mode)
@@ -1781,27 +1785,41 @@ namespace vk
 			return nullptr;
 		}
 
-		if (!linear_format_supported)
-		{
-			return nullptr;
-		}
+#if defined(__APPLE__) && TARGET_OS_SIMULATOR
+		linear_format_supported = false;
+#endif
 
-		// Uploads a linear memory range as a BGRA8 texture
-		auto image = std::make_unique<vk::viewable_image>(*m_device, m_memory_types.host_visible_coherent,
-			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+		auto image = std::make_unique<vk::viewable_image>(*m_device,
+			linear_format_supported ? m_memory_types.host_visible_coherent : m_memory_types.device_local,
+			linear_format_supported ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 			VK_IMAGE_TYPE_2D,
 			format,
-			width, height, 1, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_LAYOUT_PREINITIALIZED,
-			VK_IMAGE_TILING_LINEAR, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0,
+			width, height, 1, 1, 1, VK_SAMPLE_COUNT_1_BIT,
+			linear_format_supported ? VK_IMAGE_LAYOUT_PREINITIALIZED : VK_IMAGE_LAYOUT_UNDEFINED,
+			linear_format_supported ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL,
+			VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+				(linear_format_supported ? 0 : VK_IMAGE_USAGE_TRANSFER_DST_BIT), 0,
 			VMM_ALLOCATION_POOL_SWAPCHAIN);
 
-		VkImageSubresource subresource{};
-		subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-
 		VkSubresourceLayout layout{};
-		vkGetImageSubresourceLayout(*m_device, image->value, &subresource, &layout);
-
-		void* mem = image->memory->map(0, layout.rowPitch * height);
+		std::unique_ptr<vk::buffer> staging;
+		void* mem;
+		if (linear_format_supported)
+		{
+			VkImageSubresource subresource{};
+			subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			vkGetImageSubresourceLayout(*m_device, image->value, &subresource, &layout);
+			mem = image->memory->map(0, layout.rowPitch * height);
+		}
+		else
+		{
+			layout.rowPitch = static_cast<u64>(width) * sizeof(u32);
+			layout.size = layout.rowPitch * height;
+			staging = std::make_unique<vk::buffer>(*m_device, layout.size, m_memory_types.host_visible_coherent,
+				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+				VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0, VMM_ALLOCATION_POOL_SWAPCHAIN);
+			mem = staging->map(0, layout.size);
+		}
 
 		auto src = vm::_ptr<const char>(address);
 		auto dst = static_cast<char*>(mem);
@@ -1819,7 +1837,21 @@ namespace vk
 			dst += layout.rowPitch;
 		}
 
-		image->memory->unmap();
+		if (staging)
+		{
+			staging->unmap();
+			image->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+			VkBufferImageCopy region{};
+			region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+			region.imageExtent = { width, height, 1 };
+			vk::copy_buffer_to_image(cmd, staging.get(), image.get(), region);
+			vk::get_resource_manager()->dispose(staging);
+		}
+		else
+		{
+			image->memory->unmap();
+		}
 
 		vk::change_image_layout(cmd, image.get(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 

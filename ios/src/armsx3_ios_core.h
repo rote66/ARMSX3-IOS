@@ -86,6 +86,7 @@ double armsx3_ios_current_fps(void);
 bool armsx3_ios_set_pad(int port, uint32_t digital1, uint32_t digital2,
 	uint8_t left_x, uint8_t left_y, uint8_t right_x, uint8_t right_y,
 	uint8_t left_trigger, uint8_t right_trigger);
+bool armsx3_ios_set_key(uint32_t qt_key_code, bool pressed);
 uint16_t armsx3_ios_pad_rumble(int port);
 void armsx3_ios_set_render_position(bool portrait_top, uint32_t top_inset_px);
 bool armsx3_ios_portrait_render_top(void);

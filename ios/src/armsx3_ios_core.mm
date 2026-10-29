@@ -38,6 +38,7 @@
 #include "Emu/system_utils.hpp"
 #include "Emu/vfs_config.h"
 #include "Input/pad_thread.h"
+#include "Input/virtual_keyboard_handler.h"
 #include "Input/virtual_pad_handler.h"
 #include "Loader/PUP.h"
 #include "Loader/PSF.h"
@@ -1469,7 +1470,7 @@ extern "C" const char* armsx3_ios_game_info_json(const char* path_raw)
 	json_append_escaped_ios(g_game_info_json, archive_cover_path);
 	g_game_info_json += ",\"installedVersion\":";
 	json_append_escaped_ios(g_game_info_json, installed_version);
-	g_game_info_json += fmt::format(",\"dlcCount\":{}", dlc_count);
+	g_game_info_json += fmt::format(",\"dlcCount\":%u", dlc_count);
 	g_game_info_json += '}';
 	return g_game_info_json.c_str();
 }
@@ -1860,7 +1861,10 @@ void set_callbacks()
 	callbacks.handle_taskbar_progress = [](s32, s32) {};
 	callbacks.init_kb_handler = []
 	{
-		ensure(g_fxo->init<KeyboardHandlerBase, NullKeyboardHandler>(Emu.DeserialManager()));
+		if (g_cfg.io.keyboard == keyboard_handler::basic)
+			ensure(g_fxo->init<KeyboardHandlerBase, virtual_keyboard_handler>(Emu.DeserialManager()));
+		else
+			ensure(g_fxo->init<KeyboardHandlerBase, NullKeyboardHandler>(Emu.DeserialManager()));
 	};
 	callbacks.init_mouse_handler = []
 	{
@@ -1927,8 +1931,21 @@ void set_callbacks()
 	callbacks.play_sound = [](const std::string&, std::optional<f32>) {};
 	callbacks.get_image_info = [](const std::string&, std::string&, s32&, s32&, s32&) { return false; };
 	callbacks.get_scaled_image = [](const std::string&, s32, s32, s32&, s32&, u8*, bool) { return false; };
-	callbacks.resolve_path = [](std::string_view path) { return std::string(path); };
-	callbacks.resolve_path_may_not_exist = [](std::string_view path) { return std::string(path); };
+	callbacks.resolve_path = [](std::string_view path)
+	{
+		std::error_code error;
+		const auto resolved = std::filesystem::canonical(std::filesystem::path(path), error);
+		return error ? std::string{} : resolved.string();
+	};
+	callbacks.resolve_path_may_not_exist = [](std::string_view path)
+	{
+		if (path.empty()) return std::string{};
+		std::error_code error;
+		const auto absolute = std::filesystem::absolute(std::filesystem::path(path), error);
+		if (error) return std::string{};
+		const auto resolved = std::filesystem::weakly_canonical(absolute, error);
+		return error ? std::string{} : resolved.string();
+	};
 	callbacks.get_font_dirs = [] { return std::vector<std::string>{}; };
 	callbacks.on_install_pkgs = [](const std::vector<std::string>& pkgs, bool optical)
 	{
@@ -2012,6 +2029,7 @@ extern "C" bool armsx3_ios_initialize(const char* root_dir, void* metal_view,
 	const std::string hdd0_root = root + "dev_hdd0/";
 	merge_legacy_vfs_tree_ios(std::filesystem::path(g_android_config_dir) / "dev_hdd0",
 		std::filesystem::path(hdd0_root));
+	std::filesystem::create_directories(hdd0_root);
 	g_cfg_vfs.load();
 	g_cfg_vfs.dev_hdd0.set(hdd0_root);
 	g_cfg_vfs.save();
@@ -2134,7 +2152,10 @@ extern "C" bool armsx3_ios_jit_test()
 
 extern "C" bool armsx3_ios_jit_authorized()
 {
-#if defined(__aarch64__)
+#if TARGET_OS_SIMULATOR && defined(__aarch64__)
+	armsx3_ios_diagnostic_log("simulator JIT: validating executable memory with the shared arena test");
+	return true;
+#elif defined(__aarch64__)
 	u32 cs_flags = 0;
 	const int result = csops(getpid(), 0, &cs_flags, sizeof(cs_flags));
 	const bool debugged = result == 0 && (cs_flags & 0x10000000u) != 0;
@@ -2391,6 +2412,15 @@ extern "C" bool armsx3_ios_request_screenshot()
 	if (!Emu.IsRunning() && !Emu.IsPaused()) return false;
 	g_user_asked_for_screenshot = true;
 	return true;
+}
+
+extern "C" bool armsx3_ios_set_key(uint32_t qt_key_code, bool pressed)
+{
+	if (!Emu.IsRunning() || g_cfg.io.keyboard != keyboard_handler::basic) return false;
+	auto* handler = g_fxo->try_get<KeyboardHandlerBase>();
+	if (!handler) return false;
+	const std::u32string text = qt_key_code < 128 ? std::u32string(1, static_cast<char32_t>(qt_key_code)) : std::u32string{};
+	return handler->HandleKey(qt_key_code, 0, pressed, false, text);
 }
 
 extern "C" bool armsx3_ios_set_pad(int port, uint32_t digital1, uint32_t digital2,

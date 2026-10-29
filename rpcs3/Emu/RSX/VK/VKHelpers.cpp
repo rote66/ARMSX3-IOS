@@ -13,6 +13,10 @@
 #include "vkutils/device.h"
 #include <unordered_map>
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
 namespace vk
 {
 	std::string ubo_array_dim(u32 element_size)
@@ -250,6 +254,11 @@ namespace vk
 				vkDestroyBuffer(*g_render_device, tmp, nullptr);
 			}
 		}
+
+#if defined(__APPLE__) && TARGET_OS_SIMULATOR
+		g_heap_compatible_buffer_types &= ~(VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT);
+		rsx_log.notice("Simulator texel buffers use private memory with explicit staging.");
+#endif
 
 		descriptors::init();
 	}
