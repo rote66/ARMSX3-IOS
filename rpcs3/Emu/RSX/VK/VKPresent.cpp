@@ -30,11 +30,11 @@
 
 extern atomic_t<bool> g_user_asked_for_screenshot;
 extern atomic_t<recording_mode> g_recording_mode;
-// android/src/remote_play.cpp
-extern atomic_t<u32> g_remote_play_max_size;
-extern atomic_t<u32> g_remote_play_frames;
-extern atomic_t<u32> g_remote_play_skipped;
-extern atomic_t<bool> g_remote_play_hardware;
+// Updated by android/src/remote_play.cpp
+atomic_t<u32> g_remote_play_max_size{0};
+atomic_t<u32> g_remote_play_frames{0};
+atomic_t<u32> g_remote_play_skipped{0};
+atomic_t<bool> g_remote_play_hardware{false};
 
 namespace vk
 {

@@ -36,17 +36,17 @@ extern atomic_t<recording_mode> g_recording_mode;
 // Read by VKPresent.cpp. The largest frame to stream, packed (width << 16) | height, or 0 while
 // remote play is off. While it is set the presenter reads every frame back scaled to fit and
 // without a GPU stall, instead of taking the full-size, fully synchronous recording path.
-atomic_t<u32> g_remote_play_max_size{0};
+extern atomic_t<u32> g_remote_play_max_size;
 
 // Counted by VKPresent.cpp while capturing: every game frame the presenter saw, and the ones it
 // could not capture because the GPU or the app still held every slot. With the two below they are
 // the host's side of the stream stats (_rpcsx_remotePlayCounters).
-atomic_t<u32> g_remote_play_frames{0};
-atomic_t<u32> g_remote_play_skipped{0};
+extern atomic_t<u32> g_remote_play_frames;
+extern atomic_t<u32> g_remote_play_skipped;
 
 // Read by VKPresent.cpp: frames go out as shareable buffers when the device can, unless the app has
 // said it cannot import them (_rpcsx_remotePlaySetHardware).
-atomic_t<bool> g_remote_play_hardware{false};
+extern atomic_t<bool> g_remote_play_hardware;
 
 namespace
 {
