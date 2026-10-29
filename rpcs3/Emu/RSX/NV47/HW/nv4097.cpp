@@ -844,6 +844,16 @@ namespace rsx
 			}
 
 			util::write_gcm_label<true, true>(ctx, reg, addr, val);
+
+#ifdef ARMSX3_IOS
+			if (addr == 0x40300CC0)
+			{
+				// Build108 still showed target=N/done=N-1. Keep the probe on the actual
+				// BACK_END write path: distinguish a guest semaphore release that is never
+				// issued from a label write that is issued but not visible to the acquire.
+				rsx_log.success("BACK_END label after write: addr=0x%X value=0x%08x observed=0x%08x", addr, val, static_cast<u32>(vm::_ref<RsxSemaphore>(addr)));
+			}
+#endif
 		}
 
 		void sync(context* ctx, u32, u32)

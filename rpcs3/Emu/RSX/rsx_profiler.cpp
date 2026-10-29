@@ -37,6 +37,13 @@ extern atomic_t<u64> g_sema_hist[6];
 #include <dlfcn.h>
 #include "gcm_printing.h"
 
+#ifdef ARMSX3_IOS
+#include <pthread.h>
+#include <mach/mach.h>
+#include <mach/thread_act.h>
+#include <mach/thread_info.h>
+#endif
+
 // SPU -> PPU event delivery counters, defined in SPUThread.cpp. Neither of that path's two
 // failure modes -- a silent EAGAIN retry, or an event DROPPED onto a full queue -- is visible
 // in a log, so a SPURS kernel spinning on event handoff while the RSX starves reads exactly
@@ -59,6 +66,7 @@ LOG_CHANNEL(prof_log, "RSXPROF");
 namespace rsx::prof
 {
 	std::atomic<bool> g_enabled{false};
+	std::atomic<bool> g_forced_enable{false};
 	accounting g_acc{};
 	std::atomic<u64> g_last_frame_tsc{0};
 
@@ -619,6 +627,16 @@ namespace rsx::prof
 	u64 g_last_switch = 0;
 	const void* g_owner_thread = nullptr;
 
+#ifdef ARMSX3_IOS
+	// The wall-clock buckets intentionally use CNTVCT because they are extremely hot. That
+	// means preemption is charged to whichever bucket happened to be active, so a long
+	// "FIFO decode" interval cannot distinguish execution from the RSX thread being off-CPU.
+	// Keep the Mach thread port for the owner so the independent sampler can read true
+	// user+system CPU time while the RSX itself is not making progress.
+	atomic_t<u32> g_owner_mach_thread{0};
+	u64 g_stall_cpu_prev_ns = umax;
+#endif
+
 	// Stall reporting state. See poll_stall.
 	u64 g_last_stall_check = 0;
 	u64 g_stall_frames = umax;
@@ -736,7 +754,100 @@ namespace rsx::prof
 	void bind_to_current_thread()
 	{
 		g_owner_thread = current_thread_token();
+#ifdef ARMSX3_IOS
+		g_owner_mach_thread = static_cast<u32>(pthread_mach_thread_np(pthread_self()));
+		prof_log.notice("iOS RSX profiler owner: token=%p pthread=%p mach=0x%x",
+			g_owner_thread, reinterpret_cast<const void*>(pthread_self()), +g_owner_mach_thread);
+#endif
 	}
+
+#ifdef ARMSX3_IOS
+	u64 read_owner_cpu_time_ns()
+	{
+		const mach_port_name_t port = static_cast<mach_port_name_t>(+g_owner_mach_thread);
+
+		if (!port)
+		{
+			return umax;
+		}
+
+		mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+		thread_basic_info_data_t info{};
+
+		if (thread_info(port, THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info), &count) != KERN_SUCCESS)
+		{
+			return umax;
+		}
+
+		return static_cast<u64>(info.user_time.seconds + info.system_time.seconds) * 1'000'000'000ull +
+			static_cast<u64>(info.user_time.microseconds + info.system_time.microseconds) * 1'000ull;
+	}
+
+#if defined(ARCH_ARM64)
+	void log_owner_native_state()
+	{
+		const mach_port_name_t port = static_cast<mach_port_name_t>(+g_owner_mach_thread);
+		if (!port)
+		{
+			return;
+		}
+
+		thread_basic_info_data_t info{};
+		mach_msg_type_number_t info_count = THREAD_BASIC_INFO_COUNT;
+		const kern_return_t info_result = thread_info(port, THREAD_BASIC_INFO,
+			reinterpret_cast<thread_info_t>(&info), &info_count);
+
+		arm_thread_state64_t registers{};
+		mach_msg_type_number_t register_count = ARM_THREAD_STATE64_COUNT;
+		const kern_return_t register_result = thread_get_state(port, ARM_THREAD_STATE64,
+			reinterpret_cast<thread_state_t>(&registers), &register_count);
+
+		std::string snapshot = fmt::format("iOS RSX native snapshot: mach=0x%x info_rc=%d state=%d flags=0x%x cpu_usage=%d policy=%d registers_rc=%d",
+			port, info_result, info.run_state, info.flags, info.cpu_usage, info.policy, register_result);
+
+		if (register_result == KERN_SUCCESS)
+		{
+			const u64 stack_pointer = arm_thread_state64_get_sp(registers);
+			u64 frame_pointer = arm_thread_state64_get_fp(registers);
+			fmt::append(snapshot, " pc=0x%x lr=0x%x sp=0x%x fp=0x%x",
+				arm_thread_state64_get_pc(registers), arm_thread_state64_get_lr(registers), stack_pointer, frame_pointer);
+
+			Dl_info image{};
+			if (dladdr(reinterpret_cast<const void*>(&log_owner_native_state), &image))
+			{
+				fmt::append(snapshot, " executable_base=%p", image.dli_fbase);
+			}
+
+			for (u32 frame_index = 0; frame_index < 12; frame_index++)
+			{
+				if ((frame_pointer & 15) || frame_pointer < stack_pointer || frame_pointer - stack_pointer > 8 * 1024 * 1024)
+				{
+					break;
+				}
+
+				std::array<u64, 2> frame{};
+				vm_size_t copied = 0;
+				const kern_return_t read_result = vm_read_overwrite(mach_task_self(), frame_pointer,
+					sizeof(frame), reinterpret_cast<vm_address_t>(frame.data()), &copied);
+				if (read_result != KERN_SUCCESS || copied != sizeof(frame))
+				{
+					fmt::append(snapshot, "\n    frame[%u] read_rc=%d copied=%u", frame_index, read_result, copied);
+					break;
+				}
+
+				fmt::append(snapshot, "\n    frame[%u] fp=0x%x lr=0x%x", frame_index, frame_pointer, frame[1]);
+				if (frame[0] <= frame_pointer)
+				{
+					break;
+				}
+				frame_pointer = frame[0];
+			}
+		}
+
+		prof_log.error("%s", snapshot);
+	}
+#endif
+#endif
 
 	const char* name_of(bucket b)
 	{
@@ -782,6 +893,7 @@ namespace rsx::prof
 		case bucket::idle_fifo: return "Idle: FIFO empty";
 		case bucket::idle_sema: return "Idle: guest semaphore";
 		case bucket::idle_pause: return "Idle: cpu_wait";
+		case bucket::external_pause: return "External pause";
 		case bucket::unclassified: return "Unclassified";
 		default: return "?";
 		}
@@ -805,8 +917,26 @@ namespace rsx::prof
 		g_current = bucket::fifo_decode;
 
 		bind_to_current_thread();
+#ifdef ARMSX3_IOS
+		g_stall_cpu_prev_ns = umax;
+#endif
 		g_enabled.store(enabled, std::memory_order_relaxed);
 		prof_log.success("RSX profiling %s", enabled ? "enabled" : "disabled");
+	}
+
+	void request_forced_enable()
+	{
+		g_forced_enable.store(true, std::memory_order_relaxed);
+	}
+
+	void clear_forced_enable()
+	{
+		g_forced_enable.store(false, std::memory_order_relaxed);
+	}
+
+	bool forced_enable_requested()
+	{
+		return g_forced_enable.load(std::memory_order_relaxed);
 	}
 
 	// Walk every guest thread and say what it is in. Thread-local scalars only: id, name,
@@ -1312,7 +1442,22 @@ namespace rsx::prof
 		// then failed its owner check, nothing ever switched buckets, and the whole window was
 		// charged to whichever bucket happened to be current. The result reads as "FIFO decode
 		// 100%", which is indistinguishable from a real finding and was briefly taken for one.
-		if (current_thread_token() != g_owner_thread) [[unlikely]]
+		// The NFSMW iOS forced-profiler path is deliberately armed from the FIFO/RSX
+		// maintenance loop, which is the thread whose scopes we need to measure. On iOS,
+		// on_frame_end can be reached from a different renderer callback thread; rebinding
+		// here then disables every FIFO/RSX scope and leaves g_current at the synthetic
+		// `fifo_decode` value below. Build100 exposed that directly: almost every frame
+		// printed "RSX profiling re-bound", and the later 4.9s "FIFO decode" stall was just
+		// that stale default rather than a measured bucket. Keep the explicitly-forced owner
+		// intact; ordinary user-enabled profiling retains the cross-game rebind behavior.
+		const bool may_rebind_owner =
+#ifdef ARMSX3_IOS
+			!forced_enable_requested();
+#else
+			true;
+#endif
+
+		if (may_rebind_owner && current_thread_token() != g_owner_thread) [[unlikely]]
 		{
 			bind_to_current_thread();
 
@@ -1497,7 +1642,16 @@ namespace rsx::prof
 			return false;
 		}
 
-		g_last_stall_check = now;
+		const u64 previous_check = std::exchange(g_last_stall_check, now);
+
+#ifdef ARMSX3_IOS
+		const u64 cpu_now_ns = read_owner_cpu_time_ns();
+		const u64 cpu_delta_ns =
+			(cpu_now_ns != umax && g_stall_cpu_prev_ns != umax && cpu_now_ns >= g_stall_cpu_prev_ns)
+				? cpu_now_ns - g_stall_cpu_prev_ns
+				: umax;
+		g_stall_cpu_prev_ns = cpu_now_ns;
+#endif
 
 		// Fire on "barely moving", not only on "stopped".
 		//
@@ -1559,6 +1713,23 @@ namespace rsx::prof
 			ev[0] - g_stall_ev_prev[0], ev[1] - g_stall_ev_prev[1], ev[2] - g_stall_ev_prev[2],
 			ev[3] - g_stall_ev_prev[3], ev[4] - g_stall_ev_prev[4],
 			fifo, sample_guest_threads(false));
+
+#ifdef ARMSX3_IOS
+		if (cpu_delta_ns != umax && previous_check)
+		{
+			const double wall_s = static_cast<double>(now - previous_check) / static_cast<double>(freq);
+			const double cpu_s = static_cast<double>(cpu_delta_ns) / 1'000'000'000.0;
+			prof_log.error("\tRSX host CPU: %.3fs of %.3fs wall (%.1f%% on-CPU)", cpu_s, wall_s,
+				wall_s > 0.0 ? (cpu_s * 100.0 / wall_s) : 0.0);
+		}
+		else
+		{
+			prof_log.error("\tRSX host CPU: unavailable (Mach thread CPU-time baseline/query not ready)");
+		}
+#if defined(ARCH_ARM64)
+		log_owner_native_state();
+#endif
+#endif
 
 		// Delivery of RSX events to the guest, which decides whether _gcm_intr_thread runs at all.
 		// Attempts near zero means the vblank source itself has stopped producing; attempts climbing

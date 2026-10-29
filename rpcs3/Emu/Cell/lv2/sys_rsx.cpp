@@ -110,6 +110,15 @@ atomic_t<u32> g_rsx_q_id{0};       // queue this port is connected to, 0 = none,
 atomic_t<u32> g_rsx_q_pending{0};  // events sitting undelivered in it
 atomic_t<u32> g_rsx_q_waiter{0};   // 1 if a PPU is registered as waiting on it
 
+// Narrow timing marker for display-queue method 0x103. NFSMW has repeatedly shown the
+// completion packet already present in guest RAM while the RSX snapshot sits immediately
+// after GCM_DRIVER_QUEUE+4. These four atomics distinguish a stall inside on_frame_end from
+// one inside event delivery without enabling the full RSX profiler or logging on the hot path.
+atomic_t<u32> g_rsx_queue103_phase{0};      // 0=outside, 1=on_frame_end, 2=send_event
+atomic_t<u64> g_rsx_queue103_started_us{0};
+atomic_t<u64> g_rsx_queue103_seq{0};
+atomic_t<u64> g_rsx_queue103_last_us{0};
+
 bool rsx::thread::send_event(u64 data1, u64 event_flags, u64 data3)
 {
 	// Filter event bits, send them only if they are masked by gcm
@@ -794,8 +803,17 @@ error_code sys_rsx_context_attribute(u32 context_id, u32 package_id, u64 a3, u64
 		driverInfo.head[a3].lastQueuedBufferId = static_cast<u32>(a4);
 		driverInfo.head[a3].flipFlags |= 0x40000000 | (1 << a4);
 
+		const u64 queue103_start = get_system_time();
+		g_rsx_queue103_seq++;
+		g_rsx_queue103_started_us = queue103_start;
+		g_rsx_queue103_phase = 1;
 		render->on_frame_end(static_cast<u32>(a4));
-		if (!render->send_event(0, SYS_RSX_EVENT_QUEUE_BASE << a3, 0))
+		g_rsx_queue103_phase = 2;
+		const bool queue_event_sent = render->send_event(0, SYS_RSX_EVENT_QUEUE_BASE << a3, 0);
+		g_rsx_queue103_last_us = get_system_time() - queue103_start;
+		g_rsx_queue103_phase = 0;
+
+		if (!queue_event_sent)
 		{
 			break;
 		}

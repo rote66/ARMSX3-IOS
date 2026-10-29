@@ -72,6 +72,7 @@ namespace rsx::prof
 		idle_fifo,        // FIFO empty: the guest has not queued any commands
 		idle_sema,        // nv406e semaphore acquire: waiting for the guest to release us
 		idle_pause,       // cpu_wait: emulator-level pause/sync, not the guest
+		external_pause,   // eng_lock/external_interrupt_lock: FIFO paused by another host thread
 		unclassified,     // RSX thread time not covered by any scope above
 
 		count
@@ -113,7 +114,11 @@ namespace rsx::prof
 	/** Cheap identity check: one register read, no TLS machinery. */
 	inline const void* current_thread_token()
 	{
-#if defined(__aarch64__)
+#if defined(__APPLE__) && defined(__aarch64__)
+		std::uintptr_t token;
+		__asm__("mrs %0, tpidrro_el0" : "=r"(token));
+		return reinterpret_cast<const void*>(token & ~std::uintptr_t{7});
+#elif defined(__aarch64__)
 		return __builtin_thread_pointer();
 #else
 		// Falls back to a real thread local off the hot path's critical arch.
@@ -556,6 +561,15 @@ namespace rsx::prof
 
 	void set_enabled(bool enabled);
 	inline bool enabled() { return g_enabled.load(std::memory_order_relaxed); }
+
+	// iOS NFSMW's FinishEntry loop can request the already-existing RSX profiler without
+	// binding it from the PPU thread. The RSX thread consumes the request at its normal
+	// 64-command maintenance point and calls set_enabled(true) itself, preserving the
+	// profiler's owner-thread invariant. This is diagnostic-only state and is cleared when
+	// the renderer exits.
+	void request_forced_enable();
+	void clear_forced_enable();
+	bool forced_enable_requested();
 }
 
 // Two levels, so __LINE__ expands to its value before being pasted rather than literally.

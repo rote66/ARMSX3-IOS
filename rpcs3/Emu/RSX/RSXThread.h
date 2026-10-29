@@ -191,6 +191,8 @@ namespace rsx
 		u32 last_known_code_start = 0;
 		atomic_t<u32> external_interrupt_lock{ 0 };
 		atomic_t<bool> external_interrupt_ack{ false };
+		atomic_t<u32> external_interrupt_site{ 0 };
+		atomic_t<u64> external_interrupt_since_us{ 0 };
 		atomic_t<u32> is_initialized{0};
 
 		bool is_fifo_idle() const;
@@ -470,7 +472,7 @@ namespace rsx
 		// Emu App/Game flip, only immediately flips when called from rsxthread
 		bool request_emu_flip(u32 buffer);
 
-		void pause();
+		void pause(u32 site = 0);
 		void unpause();
 		void wait_pause();
 

@@ -1384,6 +1384,16 @@ namespace rsx
 
 			if ((m_cycles_counter++ & 63) == 0 || m_eng_interrupt_mask)
 			{
+#ifdef ARMSX3_IOS
+				// NFSMW's FinishEntry detector runs on the guest PPU thread, but the profiler
+				// must be armed by RSX itself so its owner token and bucket clock are valid.
+				// Check only at this existing maintenance point rather than on every command.
+				if (rsx::prof::forced_enable_requested() && !rsx::prof::enabled())
+				{
+					rsx::prof::set_enabled(true);
+				}
+#endif
+
 				// Execute backend-local tasks first
 				//
 				// These two run once per 64 FIFO commands rather than per command, so
@@ -1459,6 +1469,13 @@ namespace rsx
 	{
 		// Before anything else: the sampler walks guest thread objects, and everything below
 		// leads to those being destroyed.
+#ifdef ARMSX3_IOS
+		if (rsx::prof::forced_enable_requested())
+		{
+			rsx::prof::clear_forced_enable();
+			rsx::prof::set_enabled(false);
+		}
+#endif
 		rsx::prof::stop_sampler();
 
 		// Not on a lost device. sync() blocks on occlusion query results that a dead GPU can
@@ -3536,9 +3553,14 @@ namespace rsx
 	}
 
 	//Pause/cont wrappers for FIFO ctrl. Never call this from rsx thread itself!
-	void thread::pause()
+	void thread::pause(u32 site)
 	{
-		external_interrupt_lock++;
+		const u32 previous = external_interrupt_lock.fetch_add(1);
+		if (!previous)
+		{
+			external_interrupt_site.store(site);
+			external_interrupt_since_us.store(get_system_time());
+		}
 
 		while (!external_interrupt_ack && !is_stopped())
 		{
@@ -3549,11 +3571,18 @@ namespace rsx
 	void thread::unpause()
 	{
 		// TODO: Clean this shit up
-		external_interrupt_lock--;
+		const u32 previous = external_interrupt_lock.fetch_sub(1);
+		if (previous == 1)
+		{
+			external_interrupt_site.store(0);
+			external_interrupt_since_us.store(0);
+		}
 	}
 
 	void thread::wait_pause()
 	{
+		RSX_PROF_SCOPE(external_pause);
+
 		do
 		{
 			if (g_cfg.video.multithreaded_rsx)
@@ -3598,7 +3627,11 @@ namespace rsx
 
 	void thread::on_frame_end(u32 buffer, bool forced)
 	{
-		prof::set_enabled(g_cfg.video.rsx_profiler.get());
+		prof::set_enabled(g_cfg.video.rsx_profiler.get()
+#ifdef ARMSX3_IOS
+			|| prof::forced_enable_requested()
+#endif
+		);
 		prof::tick_frame();
 
 		bool pause_emulator = false;

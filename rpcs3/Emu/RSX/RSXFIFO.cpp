@@ -72,9 +72,10 @@ namespace rsx
 
 		std::string FIFO_control::debug_snapshot() const
 		{
-			return fmt::format("fifo: get=0x%06x put=0x%06x internal=0x%06x published=0x%06x remaining=%u cmd=0x%08x memwatch=0x%06x",
+			return fmt::format("fifo: get=0x%06x put=0x%06x internal=0x%06x published=0x%06x remaining=%u cmd=0x%08x cache=0x%06x+0x%x memwatch=0x%06x",
 				m_ctrl ? +m_ctrl->get : 0u, m_ctrl ? +m_ctrl->put : 0u,
-				m_internal_get, m_published_get, m_remaining_commands, m_cmd, m_memwatch_addr);
+				m_internal_get, m_published_get, m_remaining_commands, m_cmd,
+				m_cache_addr, m_cache_size, m_memwatch_addr);
 		}
 
 		void FIFO_control::restore_state(u32 cmd, u32 count)
