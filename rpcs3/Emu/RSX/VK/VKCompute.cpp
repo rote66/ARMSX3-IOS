@@ -151,7 +151,7 @@ namespace vk
 		}
 	}
 
-	void compute_task::load_program(const vk::command_buffer& cmd)
+	void compute_task::compile()
 	{
 		if (!m_program)
 		{
@@ -173,6 +173,11 @@ namespace vk
 			m_program = compiler->compile(create_info, vk::pipe_compiler::COMPILE_INLINE, {}, get_inputs());
 		}
 
+	}
+
+	void compute_task::load_program(const vk::command_buffer& cmd)
+	{
+		compile();
 		bind_resources(cmd);
 		m_program->bind(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
 	}

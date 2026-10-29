@@ -48,6 +48,7 @@ DYNAMIC_IMPORT_RENAME("Kernel32.dll", SetThreadDescriptionImport, "SetThreadDesc
 #ifdef __APPLE__
 #define _XOPEN_SOURCE
 #define __USE_GNU
+#include <dlfcn.h>
 #include <mach/thread_act.h>
 #include <mach/thread_policy.h>
 #endif
@@ -3907,16 +3908,37 @@ void thread_base::start()
 #elif defined(__APPLE__)
 	pthread_attr_t attrs;
 	pthread_t thread_id{};
+	pthread_attr_init(&attrs);
+	pthread_attr_setstacksize(&attrs, 0x800000);
+
+#ifdef ARMSX3_IOS
+	const auto ios_thread_name = m_tname.load();
+	const bool ios_is_rsx = ios_thread_name && *ios_thread_name == "rsx::thread";
+	const qos_class_t ios_qos = ios_is_rsx ? QOS_CLASS_USER_INTERACTIVE : QOS_CLASS_USER_INITIATED;
+	ensure(pthread_attr_setinheritsched(&attrs, PTHREAD_EXPLICIT_SCHED) == 0);
+	ensure(pthread_attr_set_qos_class_np(&attrs, ios_qos, 0) == 0);
+#else
 	struct sched_param sp;
 	memset(&sp, 0, sizeof(struct sched_param));
 	sp.sched_priority=99;
-	pthread_attr_init(&attrs);
-	pthread_attr_setstacksize(&attrs, 0x800000);
-	
 	pthread_attr_set_qos_class_np(&attrs, QOS_CLASS_USER_INTERACTIVE, 0);
 	pthread_attr_setschedpolicy(&attrs, SCHED_RR);
 	pthread_attr_setschedparam(&attrs, &sp);
+#endif
 	ensure(pthread_create(&thread_id, &attrs, entry_point, this) == 0);
+	pthread_attr_destroy(&attrs);
+
+#ifdef ARMSX3_IOS
+	qos_class_t actual_qos = QOS_CLASS_UNSPECIFIED;
+	int relative_priority = 0;
+	const int qos_rc = pthread_get_qos_class_np(thread_id, &actual_qos, &relative_priority);
+	int actual_policy = 0;
+	struct sched_param actual_parameters{};
+	const int policy_rc = pthread_getschedparam(thread_id, &actual_policy, &actual_parameters);
+	sys_log.notice("iOS pthread scheduling: name='%s' policy_rc=%d policy=%d priority=%d qos_rc=%d qos=%d requested_qos=%d",
+		ios_thread_name ? *ios_thread_name : std::string{}, policy_rc, actual_policy, actual_parameters.sched_priority,
+		qos_rc, static_cast<int>(actual_qos), static_cast<int>(ios_qos));
+#endif
 #else
 	pthread_t thread_id{};
 
@@ -5195,6 +5217,13 @@ void thread_ctrl::set_native_priority(int priority)
 	if (!SetThreadPriority(_this_thread, native_priority))
 	{
 		sig_log.error("SetThreadPriority() failed: %s", fmt::win_error{GetLastError(), nullptr});
+	}
+#elif defined(ARMSX3_IOS)
+	const qos_class_t qos = priority > 0 ? QOS_CLASS_USER_INTERACTIVE
+		: priority < 0 ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INITIATED;
+	if (const int error = pthread_set_qos_class_self_np(qos, 0))
+	{
+		sig_log.warning("pthread_set_qos_class_self_np(%d) failed: %d", static_cast<int>(qos), error);
 	}
 #elif defined(__ANDROID__)
 	// Nice value, not sched_priority.

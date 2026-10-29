@@ -242,8 +242,20 @@ struct JITAnnouncer : llvm::JITEventListener
 // Simple memory manager
 struct MemoryManager1 : llvm::RTDyldMemoryManager
 {
+#if defined(__APPLE__) && defined(ARCH_ARM64) && TARGET_OS_IPHONE
+	// iOS has a much tighter userspace VA budget than desktop targets. Reserving the
+	// upstream-sized 3 x 256 MiB for every RuntimeDyld instance eventually exhausts
+	// the address space during continuous-process title handoffs even while physical
+	// headroom remains. The largest instance observed across the supplied logs used
+	// only 6.41 MiB of code and 1.43 MiB of data, so 32 MiB per region still leaves a
+	// large safety margin while reducing each live instance from 768 MiB to 64 MiB VA.
+	static constexpr u64 c_max_size = 0x0200'0000;
+	static constexpr u64 c_reserve_size = c_max_size * 2;
+#else
 	// 256 MiB for code or data
 	static constexpr u64 c_max_size = 0x1000'0000;
+	static constexpr u64 c_reserve_size = c_max_size * 3;
+#endif
 
 	// Allocation unit (2M)
 	static constexpr u64 c_page_size = 2 * 1024 * 1024;
@@ -292,10 +304,15 @@ struct MemoryManager1 : llvm::RTDyldMemoryManager
 		// the legacy allow-jit/allow-unsigned-executable-memory entitlements. The
 		// mapping starts writable for RuntimeDyld; finalizeMemory() converts the
 		// used code prefix to RX before it is published for execution (Legacy W^X).
-		auto ptr = reinterpret_cast<u8*>(utils::memory_reserve(c_max_size * 3, false));
+		auto ptr = reinterpret_cast<u8*>(utils::memory_reserve(c_reserve_size, false));
 #else
-		auto ptr = reinterpret_cast<u8*>(utils::memory_reserve(c_max_size * 3, true));
+		auto ptr = reinterpret_cast<u8*>(utils::memory_reserve(c_reserve_size, true));
 #endif
+		if (!ptr)
+		{
+			fmt::throw_exception("Out of memory (LLVM JIT reserve failed: size=0x%x)", c_reserve_size);
+		}
+
 		m_code_mems = ptr;
 		// ptr += c_max_size;
 		// m_data_ro_mems = ptr;
@@ -308,7 +325,7 @@ struct MemoryManager1 : llvm::RTDyldMemoryManager
 
 		if (const u64 n = ++s_reserved_count; n % 64 == 0)
 		{
-			jit_log.notice("JIT: %u instances hold %u GiB of reserved address space", n, n * c_max_size * 3 / (1024 * 1024 * 1024));
+			jit_log.notice("JIT: %u instances reserved %u GiB of address space cumulatively", n, n * c_reserve_size / (1024 * 1024 * 1024));
 		}
 	}
 
@@ -337,9 +354,9 @@ struct MemoryManager1 : llvm::RTDyldMemoryManager
 		// instances; after a few dozen, later RWX mprotect() calls fail with ENOMEM even
 		// while process RSS is still modest. Mobile does not need the stale JIT address
 		// reservation once the engine is gone, so release it for real.
-		utils::memory_release(m_code_mems, c_max_size * 3);
+		utils::memory_release(m_code_mems, c_reserve_size);
 #else
-		utils::memory_decommit(m_code_mems, c_max_size * 3, true);
+		utils::memory_decommit(m_code_mems, c_reserve_size, true);
 #endif
 	}
 

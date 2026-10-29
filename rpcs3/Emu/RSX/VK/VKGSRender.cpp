@@ -28,6 +28,9 @@
 
 #include "util/asm.hpp"
 #include <vulkan/vulkan_core.h>
+#ifdef ARMSX3_IOS
+#include "util/sysinfo.hpp"
+#endif
 
 namespace vk
 {
@@ -627,7 +630,12 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 	null_buffer_view = std::make_unique<vk::buffer_view>(*m_device, null_buffer->value, VK_FORMAT_R8_UINT, 0, 32);
 
 	// Initialize the shader compiler stack
-#ifdef ANDROID
+#ifdef ARMSX3_IOS
+	const int preferred_compiler_threads = g_cfg.video.shader_compiler_threads_count == 0
+		? (utils::get_total_memory() <= 6ull * 1024 * 0x100000 ? 1 : 2)
+		: g_cfg.video.shader_compiler_threads_count;
+	rsx_log.notice("iOS initial shader compiler workers: %d", preferred_compiler_threads);
+#elif defined(ANDROID)
 	// Not every thread on Android. The workers are pinned to thread_class::general, which is the
 	// little cluster on big.LITTLE (see decay_num_worker_threads), so a worker per SoC thread stacks
 	// several on each little core: no faster, and each extra concurrent pipeline compile is more
@@ -1247,7 +1255,12 @@ bool VKGSRender::on_vram_exhausted(rsx::problem_severity severity)
 		if (rsx::prof::enabled()) [[unlikely]] rsx::prof::g_flush_sites[1]++; flush_command_queue(true, true);
 		g_fxo->get<vk::driver_manager_thread>().drain();
 
-		if (m_texture_cache.is_overallocated())
+		const bool evict_textures = m_texture_cache.is_overallocated()
+#ifdef ARMSX3_IOS
+			|| vk::vmm_ios_memory_severity(utils::get_avail_memory()) == rsx::problem_severity::fatal
+#endif
+			;
+		if (evict_textures)
 		{
 			// Evict some unused textures. Do not evict any active references
 			std::set<u32> exclusion_list;
@@ -1256,6 +1269,10 @@ bool VKGSRender::on_vram_exhausted(rsx::problem_severity severity)
 				for (auto i = 0ull; i < texture_array.size(); ++i)
 				{
 					const auto& tex = texture_array[i];
+					if (!tex.enabled())
+					{
+						continue;
+					}
 					const auto addr = rsx::get_address(tex.offset(), tex.location());
 					exclusion_list.insert(addr);
 				}
@@ -1267,7 +1284,7 @@ bool VKGSRender::on_vram_exhausted(rsx::problem_severity severity)
 			// Hold the secondary lock guard to prevent threads from trying to touch access violation handler stuff
 			std::lock_guard lock(m_secondary_cb_guard);
 
-			rsx_log.warning("Texture cache is overallocated. Will evict unnecessary textures.");
+			rsx_log.warning("Texture cache reclamation requested. Will evict unnecessary textures.");
 			texture_cache_relieved = m_texture_cache.evict_unused(exclusion_list);
 		}
 	}
@@ -1457,6 +1474,12 @@ void VKGSRender::on_init_thread()
 
 	GSRender::on_init_thread();
 	zcull_ctrl.reset(static_cast<::rsx::reports::ZCULL_control*>(this));
+
+#if defined(ARMSX3_IOS)
+	vk::get_compute_task<vk::cs_shuffle_16>()->compile();
+	vk::get_compute_task<vk::cs_tile_memcpy<vk::RSX_detiler_op::decode>>()->compile();
+	rsx_log.notice("iOS: precompiled texture-transfer compute pipelines");
+#endif
 
 	if (g_cfg.video.shadermode == shader_mode::async_with_interpreter ||
 		g_cfg.video.shadermode == shader_mode::interpreter_only)
@@ -2031,6 +2054,37 @@ void VKGSRender::do_local_task(rsx::FIFO::state state)
 	default:
 		break;
 	}
+
+#ifdef ARMSX3_IOS
+	if (local_mem_size && !in_begin_end && !vk::is_uninterruptible() && !is_stopped())
+	{
+		const u64 now = get_system_time();
+		if (now - m_ios_memory_check_time >= 250'000)
+		{
+			m_ios_memory_check_time = now;
+			const u64 headroom = utils::get_avail_memory();
+			const auto severity = vk::vmm_ios_memory_severity(headroom);
+			if (severity >= rsx::problem_severity::fatal || now - m_ios_memory_report_time >= 2'000'000)
+			{
+				vk::get_current_mem_allocator()->log_memory_stats();
+				m_ios_memory_report_time = now;
+			}
+			if (severity >= rsx::problem_severity::moderate)
+			{
+				rsx_log.warning("iOS mid-frame memory pressure: headroom=%lluMB severity=%u system=%lluMB textures=%lluMB surfaces=%lluMB scratch=%lluMB",
+					headroom / 0x100000, static_cast<u32>(severity),
+					vk::vmm_get_application_pool_usage(VMM_ALLOCATION_POOL_SYSTEM) / 0x100000,
+					vk::vmm_get_application_pool_usage(VMM_ALLOCATION_POOL_TEXTURE_CACHE) / 0x100000,
+					vk::vmm_get_application_pool_usage(VMM_ALLOCATION_POOL_SURFACE_CACHE) / 0x100000,
+					vk::vmm_get_application_pool_usage(VMM_ALLOCATION_POOL_SCRATCH) / 0x100000);
+				const bool relieved = on_vram_exhausted(severity);
+				rsx_log.warning("iOS mid-frame memory reclaim: headroom=%lluMB released=%d duration=%lluus",
+					utils::get_avail_memory() / 0x100000, relieved, get_system_time() - now);
+				m_ios_memory_check_time = get_system_time();
+			}
+		}
+	}
+#endif
 
 	if (m_overlay_manager)
 	{

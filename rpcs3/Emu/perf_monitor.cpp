@@ -73,13 +73,6 @@ void perf_monitor::operator()()
 				last_pause_time = pause_time;
 			}
 
-#ifdef ARMSX3_IOS
-			if (process_headroom)
-			{
-				fmt::append(msg, ", iOS Headroom: %dMB", process_headroom / (1024 * 1024));
-			}
-#endif
-
 			if (is_paused)
 			{
 				if (logged_pause >= 2)
@@ -94,6 +87,13 @@ void perf_monitor::operator()()
 
 			msg.clear();
 			fmt::append(msg, "CPU Usage: Total: %.1f%%", total_usage);
+
+#ifdef ARMSX3_IOS
+			if (process_headroom)
+			{
+				fmt::append(msg, ", iOS Headroom: %dMB", process_headroom / (1024 * 1024));
+			}
+#endif
 
 			if (!per_core_usage.empty())
 			{

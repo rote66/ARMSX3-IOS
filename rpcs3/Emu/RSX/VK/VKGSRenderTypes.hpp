@@ -18,10 +18,17 @@
 // Initial heap allocation values. The heaps are growable and will automatically increase in size to accomodate demands
 #define VK_ATTRIB_RING_BUFFER_SIZE_M 64
 #define VK_TEXTURE_UPLOAD_RING_BUFFER_SIZE_M 64
+#ifdef ARMSX3_IOS
+#define VK_UBO_RING_BUFFER_SIZE_M 4
+#define VK_TRANSFORM_CONSTANTS_BUFFER_SIZE_M 4
+#define VK_FRAGMENT_CONSTANTS_BUFFER_SIZE_M 4
+#define VK_INDEX_RING_BUFFER_SIZE_M 4
+#else
 #define VK_UBO_RING_BUFFER_SIZE_M 16
 #define VK_TRANSFORM_CONSTANTS_BUFFER_SIZE_M 16
 #define VK_FRAGMENT_CONSTANTS_BUFFER_SIZE_M 16
 #define VK_INDEX_RING_BUFFER_SIZE_M 16
+#endif
 
 #define VK_MAX_ASYNC_CB_COUNT 512
 
@@ -299,7 +306,17 @@ namespace vk
 
 		void remove_one()
 		{
-			num_waiters--;
+			const int previous = num_waiters.fetch_sub(1);
+#ifdef ARMSX3_IOS
+			if (previous == 1)
+			{
+				// Build107 caught the RSX parked for 3.7s in Local task while all guest
+				// access-violation producers together consumed only a few milliseconds.
+				// The old consumer side used utils::spin_wait(), which is LDAXR+WFE on
+				// ARM64. Explicitly wake the iOS atomic waiter when the last producer leaves.
+				num_waiters.notify_all();
+			}
+#endif
 		}
 
 		void clear_pending_flag()
@@ -315,10 +332,23 @@ namespace vk
 
 		void consumer_wait() const
 		{
+#ifdef ARMSX3_IOS
+			// Do not use the generic ARM64 spin_wait/WFE for this RSX<->fault-handler
+			// handshake on iOS. The producer path is already measured independently and
+			// completes quickly; a multi-second Local task therefore means the consumer
+			// failed to resume after num_waiters reached zero. Use the project's atomic
+			// wait engine with a short timeout so both notifications and missed wakeups are
+			// bounded, while preserving the requirement that all producers finish first.
+			while (const int observed = num_waiters.load())
+			{
+				num_waiters.wait(observed, atomic_wait_timeout{100'000});
+			}
+#else
 			utils::spin_wait(num_waiters, [](auto v)
 			{
 				return v == 0;
 			});
+#endif
 		}
 
 		void producer_wait() const

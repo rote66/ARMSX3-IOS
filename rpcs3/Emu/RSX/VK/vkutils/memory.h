@@ -93,6 +93,9 @@ namespace vk
 		virtual VkDeviceMemory get_vk_device_memory(mem_handle_t mem_handle) = 0;
 		virtual u64 get_vk_device_memory_offset(mem_handle_t mem_handle) = 0;
 		virtual f32 get_memory_usage() = 0;
+#ifdef ARMSX3_IOS
+		virtual void log_memory_stats() {}
+#endif
 
 		virtual void set_safest_allocation_flags() {}
 		virtual void set_fastest_allocation_flags() {}
@@ -123,6 +126,9 @@ namespace vk
 		VkDeviceMemory get_vk_device_memory(mem_handle_t mem_handle) override;
 		u64 get_vk_device_memory_offset(mem_handle_t mem_handle) override;
 		f32 get_memory_usage() override;
+#ifdef ARMSX3_IOS
+		void log_memory_stats() override;
+#endif
 
 		void set_safest_allocation_flags() override;
 		void set_fastest_allocation_flags() override;
@@ -206,6 +212,9 @@ namespace vk
 	void vmm_notify_memory_freed(void* handle);
 	void vmm_reset();
 	void vmm_check_memory_usage();
+#ifdef ARMSX3_IOS
+	rsx::problem_severity vmm_ios_memory_severity(u64 headroom);
+#endif
 	u64  vmm_get_application_memory_usage(const memory_type_info& memory_type);
 	u64  vmm_get_application_pool_usage(vmm_allocation_pool pool);
 	bool vmm_handle_memory_pressure(rsx::problem_severity severity);

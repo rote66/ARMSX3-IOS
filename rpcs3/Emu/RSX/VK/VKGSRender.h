@@ -229,6 +229,10 @@ private:
 	vk::flush_request_task m_flush_requests;
 
 	ullong m_last_cond_render_eval_hint = 0;
+#ifdef ARMSX3_IOS
+	u64 m_ios_memory_check_time = 0;
+	u64 m_ios_memory_report_time = 0;
+#endif
 
 	// Offloader thread deadlock recovery
 	rsx::atomic_bitmask_t<flush_queue_state> m_queue_status;

@@ -4,6 +4,9 @@
 
 #include "Emu/RSX/Utils/algorithm.hpp"
 #include "Emu/system_config.h"
+#ifdef ARMSX3_IOS
+#include "util/sysinfo.hpp"
+#endif
 
 namespace vk
 {
@@ -177,6 +180,9 @@ namespace vk
 		allocatorInfo.device = dev;
 		allocatorInfo.instance = inst;
 		allocatorInfo.vulkanApiVersion = VK_API_VERSION_1_2;
+#ifdef ARMSX3_IOS
+		allocatorInfo.preferredLargeHeapBlockSize = 16 * 0x100000ull;
+#endif
 
 		std::vector<VkDeviceSize> heap_limits;
 		const auto vram_allocation_limit = g_cfg.video.vk.vram_allocation_limit * 0x100000ull;
@@ -252,6 +258,10 @@ namespace vk
 #endif
 
 		CHECK_RESULT(vmaCreateAllocator(&allocatorInfo, &m_allocator));
+#ifdef ARMSX3_IOS
+		rsx_log.notice("iOS Vulkan allocation block preference: %lluMB",
+			allocatorInfo.preferredLargeHeapBlockSize / 0x100000);
+#endif
 
 		// Allow fastest possible allocation on start
 		set_fastest_allocation_flags();
@@ -467,6 +477,27 @@ namespace vk
 
 		return max_usage;
 	}
+
+#ifdef ARMSX3_IOS
+	void mem_allocator_vma::log_memory_stats()
+	{
+		std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+		vmaGetHeapBudgets(m_allocator, budgets.data());
+		u64 block_bytes = 0;
+		u64 allocation_bytes = 0;
+		u32 block_count = 0;
+		for (const auto& budget : budgets)
+		{
+			block_bytes += budget.statistics.blockBytes;
+			allocation_bytes += budget.statistics.allocationBytes;
+			block_count += budget.statistics.blockCount;
+		}
+		rsx_log.notice("iOS Vulkan memory: blocks=%lluMB used=%lluMB unused=%lluMB block_count=%u footprint=%lluMB headroom=%lluMB",
+			block_bytes / 0x100000, allocation_bytes / 0x100000,
+			(block_bytes - std::min(block_bytes, allocation_bytes)) / 0x100000, block_count,
+			utils::get_process_memory_usage() / 0x100000, utils::get_avail_memory() / 0x100000);
+	}
+#endif
 
 	void mem_allocator_vma::set_safest_allocation_flags()
 	{

@@ -199,6 +199,29 @@ namespace vk
 		return vmm_get_application_pool_usage_impl(pool);
 	}
 
+#ifdef ARMSX3_IOS
+	rsx::problem_severity vmm_ios_memory_severity(u64 headroom)
+	{
+		if (!headroom)
+		{
+			return rsx::problem_severity::low;
+		}
+		if (headroom <= 384 * 0x100000ull)
+		{
+			return rsx::problem_severity::fatal;
+		}
+		if (headroom <= 512 * 0x100000ull)
+		{
+			return rsx::problem_severity::severe;
+		}
+		if (headroom <= 640 * 0x100000ull)
+		{
+			return rsx::problem_severity::moderate;
+		}
+		return rsx::problem_severity::low;
+	}
+#endif
+
 	rsx::problem_severity vmm_determine_memory_load_severity()
 	{
 		reader_lock lock(g_vmm_stats.mutex);

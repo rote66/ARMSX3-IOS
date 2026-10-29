@@ -42,6 +42,7 @@ namespace vk
 
 		void create();
 		void destroy();
+		void compile();
 
 		virtual std::vector<glsl::program_input> get_inputs();
 		virtual void bind_resources(const vk::command_buffer& /*cmd*/) {}
