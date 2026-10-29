@@ -63,6 +63,13 @@ namespace vk
 
 		void unmap(bool force = false);
 
+#ifdef ARMSX3_IOS
+		// Reserve enough reusable ring space before entering a renderer region that cannot
+		// safely submit or hard-sync. This does not consume the range; it only makes sure a
+		// later alloc() made while uninterruptible cannot be forced into grow()/heap replacement.
+		bool ios_preflight_uninterruptible_alloc(usz reserve_size, usz alignment = 512);
+#endif
+
 		void sync(const vk::command_buffer& cmd);
 
 		template<int Alignment, typename T = char>

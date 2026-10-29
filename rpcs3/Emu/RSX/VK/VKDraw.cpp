@@ -7,6 +7,7 @@
 #include "VKGSRender.h"
 #include "vkutils/gpu_timer.h"
 #include "Emu/RSX/rsx_profiler.h"
+#include "Emu/System.h"
 #include "vkutils/buffer_object.h"
 #include "vkutils/chip_class.h"
 #include <vulkan/vulkan_core.h>
@@ -316,6 +317,24 @@ void VKGSRender::load_texture_env()
 	// texcache_lookup's only other site is on_access_violation, which runs on guest
 	// threads, so none of this draw-path work was ever attributed.
 	RSX_PROF_SCOPE(texcache_lookup);
+
+#ifdef ARMSX3_IOS
+	if (Emu.GetTitleID() == "BLJM60028")
+	{
+		// IMPORTANT: do this before passing *m_current_command_buffer into the texture cache.
+		// The reclaim path may submit the current CB and switch m_current_command_buffer. Build 91
+		// did this from inside upload_image_from_cpu(command_buffer&), leaving that reference bound
+		// to the old submitted CB; MoltenVK then rejected every following command with VK_NOT_READY.
+		// Here the pointer is re-read only after preflight returns, so the upload always receives
+		// the newly recording command buffer.
+		constexpr usz ios_wangan_upload_reserve = 32 * 0x100000;
+		if (!m_texture_upload_buffer_ring_info.ios_preflight_uninterruptible_alloc(ios_wangan_upload_reserve))
+		{
+			rsx_log.error("Wangan texture upload preflight could not reserve %uM; continuing without switching command buffers inside the upload path.",
+				static_cast<u32>(ios_wangan_upload_reserve / 0x100000));
+		}
+	}
+#endif
 
 	// Load textures
 	bool check_for_cyclic_refs = false;

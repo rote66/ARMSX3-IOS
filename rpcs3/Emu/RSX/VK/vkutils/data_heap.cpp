@@ -11,6 +11,7 @@
 #include "util/sysinfo.hpp"
 #include "Emu/system_config.h"
 
+#include <cstring>
 #include <memory>
 
 namespace vk
@@ -130,6 +131,52 @@ namespace vk
 		shadow.reset();
 	}
 
+#ifdef ARMSX3_IOS
+	bool data_heap::ios_preflight_uninterruptible_alloc(usz reserve_size, usz alignment)
+	{
+		if ((m_flags & heap_pool_fixed_size) || m_size < 64 * 0x100000)
+		{
+			return true;
+		}
+
+		const usz aligned_size = utils::align(reserve_size, alignment);
+		auto has_room = [&]()
+		{
+			return can_alloc_impl(utils::align(m_put_pos, alignment), aligned_size);
+		};
+
+		// If the previous texture uploads accumulated enough traffic, submit them while the
+		// renderer is still interruptible. The old prepare_alloc() hook sees these allocations
+		// only after enter_uninterruptible(), where submission is deliberately refused, so this
+		// preflight is the first point at which its accumulated byte counter can actually drain.
+		if (m_ios_bytes_since_submit >= 16 * 0x100000)
+		{
+			if (vk::try_reclaim_ring_memory())
+			{
+				m_ios_bytes_since_submit = 0;
+			}
+		}
+
+		if (has_room())
+		{
+			return true;
+		}
+
+		// We are intentionally called BEFORE enter_uninterruptible(). If asynchronous retirement
+		// has not caught up, this is the safe place to wait for the submitted work and restore the
+		// heap snapshots. Doing the same from grow() is too late: texture upload has already marked
+		// the renderer uninterruptible there, so Build 90 fell through to a 64M -> 64M replacement
+		// and MoltenVK charged roughly 500M of extra phys_footprint for the swap.
+		if (vk::reclaim_ring_memory())
+		{
+			m_ios_bytes_since_submit = 0;
+			return has_room();
+		}
+
+		return false;
+	}
+#endif
+
 	bool data_heap::grow(usz size)
 	{
 		// Create new heap. All sizes are aligned up by 64M, upto 1GiB
@@ -151,6 +198,26 @@ namespace vk
 		// rather than after it. A quarter of what is free leaves room for the copy, since the
 		// old heap is still resident while the new one is created.
 #if defined(ARMSX3_IOS)
+		// Wangan Midnight's texture upload ring is the trigger for an iOS dirty-memory
+		// blow-up, not a genuinely large per-allocation workload. In the Build 89
+		// gameplay log the 64M ring asked for an 8M allocation, hit the generic 128M
+		// mobile ceiling exactly, and therefore skipped the "over the ceiling" reclaim
+		// path below. Reallocating it to 128M made phys_footprint jump from 1418M to
+		// 1934M in half a second and it then climbed to 2195M before the process vanished.
+		//
+		// Keep this one streaming ring at its already-proven 64M initial size. Do not use
+		// heap_pool_fixed_size: prepare_alloc() intentionally keeps the normal 32M async
+		// submit cadence for this heap, and grow() can then hard-retire the submitted work
+		// only when asynchronous retirement has not caught up.
+		const bool wangan_texture_upload = Emu.GetTitleID() == "BLJM60028" &&
+			m_name && std::strcmp(m_name, "texture upload buffer") == 0;
+
+		if (wangan_texture_upload)
+		{
+			size_limit = std::min<usz>(size_limit, initial_size);
+		}
+		else
+		{
 		// iOS has a per-process dirty-memory ceiling that is much lower than the unified-memory
 		// figure exposed by MoltenVK. The old 256M mobile ceiling still allowed one streaming
 		// ring to walk 64 -> 128 -> 192 -> 256M before reclaiming. In the supplied BLJM60028
@@ -163,6 +230,7 @@ namespace vk
 		if (!(m_flags & heap_pool_fixed_size))
 		{
 			size_limit = std::min<usz>(size_limit, 128 * 0x100000);
+		}
 		}
 #elif defined(__ANDROID__)
 		// A hard ceiling, because free memory is not the constraint that matters.

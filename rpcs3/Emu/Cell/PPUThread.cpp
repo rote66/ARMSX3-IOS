@@ -5494,6 +5494,23 @@ extern void ppu_initialize()
 // bug comes back names the function. Set it in driver_env.txt.
 static bool ppu_interp_requested(u32 addr)
 {
+#ifdef ARMSX3_IOS
+	// Wangan Midnight (BLJM60028) reaches the same SaveDataTaskThread entry twice
+	// during boot. On iOS/ARM64 LLVM the first invocation runs through
+	// cellSaveDataAutoLoad2 and exits normally, while the second invocation falls
+	// straight out of the guest thread entry at 0x44fe4. RPCS3 deliberately parks
+	// a PPU thread that returns from its raw entry instead of treating it as a
+	// sys_ppu_thread_exit, so the main thread then blocks forever in join.
+	//
+	// Keep only this one guest function on the interpreter to isolate the ARM64
+	// recompiler path without changing the rest of the title's PPU backend.
+	if (addr == 0x44fe4 && Emu.GetTitleID() == "BLJM60028")
+	{
+		ppu_log.warning("iOS Wangan compatibility: interpreting PPU function 0x44fe4 (Wmm::SaveDataTaskThread)");
+		return true;
+	}
+#endif
+
 	static const std::vector<std::pair<u32, u32>> ranges = []()
 	{
 		std::vector<std::pair<u32, u32>> out;
