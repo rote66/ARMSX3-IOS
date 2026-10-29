@@ -77,6 +77,54 @@ namespace vm
 namespace
 {
 	thread_local spu_llvm_compile_context* g_spu_llvm_compile_context = nullptr;
+
+	spu_function_t make_spu_interpreter_gateway(spu_function_t interpreter)
+	{
+		return build_function_asm<spu_function_t>("spu_interpreter_gateway", [interpreter](native_asm& assembler, native_args& args)
+		{
+			using namespace asmjit;
+
+			const u32 context_offset = ::offset32(&spu_thread::hv_ctx, &rpcs3::hypervisor_context_t::regs);
+			const auto restore = assembler.newLabel();
+
+			assembler.sub(a64::sp, a64::sp, Imm(64));
+			for (u32 register_index = 8; register_index < 16; register_index += 2)
+			{
+				assembler.stp(a64::d(register_index), a64::d(register_index + 1), arm::Mem(a64::sp, (register_index - 8) * 8));
+			}
+
+			assembler.mov(a64::x14, Imm(context_offset));
+			assembler.add(a64::x14, args[0], a64::x14);
+			assembler.adr(a64::x15, restore);
+			assembler.mov(a64::x16, a64::sp);
+			assembler.stp(a64::x15, a64::x16, arm::Mem(a64::x14));
+			for (u32 register_index = 18; register_index < 30; register_index += 2)
+			{
+				assembler.stp(a64::x(register_index), a64::x(register_index + 1), arm::Mem(a64::x14, (register_index - 16) * 8));
+			}
+			assembler.str(a64::x30, arm::Mem(a64::x14, 112));
+
+			assembler.mov(a64::x19, args[0]);
+			assembler.mov(a64::x15, Imm(reinterpret_cast<u64>(interpreter)));
+			assembler.blr(a64::x15);
+			assembler.bind(restore);
+
+			assembler.mov(a64::x14, Imm(context_offset));
+			assembler.add(a64::x14, a64::x19, a64::x14);
+			assembler.ldr(a64::x16, arm::Mem(a64::x14, 8));
+			for (u32 register_index = 18; register_index < 30; register_index += 2)
+			{
+				assembler.ldp(a64::x(register_index), a64::x(register_index + 1), arm::Mem(a64::x14, (register_index - 16) * 8));
+			}
+			assembler.ldr(a64::x30, arm::Mem(a64::x14, 112));
+			for (u32 register_index = 8; register_index < 16; register_index += 2)
+			{
+				assembler.ldp(a64::d(register_index), a64::d(register_index + 1), arm::Mem(a64::x16, (register_index - 8) * 8));
+			}
+			assembler.add(a64::sp, a64::x16, Imm(64));
+			assembler.ret(a64::x30);
+		});
+	}
 }
 
 void spu_llvm_set_compile_context(spu_llvm_compile_context* context) noexcept
@@ -4523,13 +4571,11 @@ public:
 		m_interp_regs = _ptr(m_thread, get_reg_offset(0));
 
 		// Save host thread's stack pointer
-		const auto native_sp = spu_ptr(&spu_thread::hv_ctx, &rpcs3::hypervisor_context_t::regs);
 #if defined(ARCH_X64)
+		const auto native_sp = spu_ptr(&spu_thread::hv_ctx, &rpcs3::hypervisor_context_t::regs);
 		const auto rsp_name = MetadataAsValue::get(m_context, MDNode::get(m_context, {MDString::get(m_context, "rsp")}));
-#elif defined(ARCH_ARM64)
-		const auto rsp_name = MetadataAsValue::get(m_context, MDNode::get(m_context, {MDString::get(m_context, "sp")}));
-#endif
 		m_ir->CreateStore(m_ir->CreateCall(get_intrinsic<u64>(Intrinsic::read_register), {rsp_name}), native_sp);
+#endif
 
 		// Decode (shift) and load function pointer
 		const auto first = m_ir->CreateLoad(get_type<u8*>(), m_ir->CreateGEP(get_type<u8*>(), m_interp_table, m_ir->CreateLShr(m_interp_op, 32u - m_interp_magn)));
@@ -4847,6 +4893,14 @@ public:
 
 		// Register interpreter entry point
 		spu_runtime::g_interpreter = reinterpret_cast<spu_function_t>(m_jit.get_engine().getPointerToFunction(main_func));
+
+#if defined(ARCH_ARM64)
+		if (spu_runtime::g_interpreter)
+		{
+			spu_runtime::g_interpreter = make_spu_interpreter_gateway(spu_runtime::g_interpreter);
+			spu_log.notice("AArch64 SPU interpreter gateway initialized");
+		}
+#endif
 
 		for (u32 i = 0; i < spu_runtime::g_interpreter_table.size(); i++)
 		{

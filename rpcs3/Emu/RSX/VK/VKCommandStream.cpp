@@ -61,6 +61,15 @@ namespace vk
 		{
 			rsx_log.error("vkQueueSubmit returned %s. This is the first site to observe it.",
 				submit_result == VK_ERROR_DEVICE_LOST ? "VK_ERROR_DEVICE_LOST" : "an error");
+
+			if (submit_result == VK_ERROR_DEVICE_LOST)
+			{
+				// MoltenVK can report the device loss here before any fence/event/present path sees it.
+				// Build106 captured kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted
+				// immediately after a queue submission. Do not continue as though this work exists:
+				// latch the same orderly RSX shutdown used by the other device-lost observation sites.
+				rsx::request_device_lost_shutdown("submitting Vulkan work");
+			}
 		}
 
 		// Signal fence

@@ -62,6 +62,11 @@ namespace vk
 
 		VkGraphicsPipelineCreateInfo compile()
 		{
+			if (!vk::get_current_renderer()->get_depth_clamp_support())
+			{
+				m_properties.state.enable_depth_clamp(false);
+			}
+
 			m_shader_stages[0] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
 			m_shader_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
 			m_shader_stages[0].module = m_vs;
@@ -743,7 +748,7 @@ namespace vk
 			base_props.state.set_color_mask(0, true, true, true, true);
 			base_props.state.set_attachment_count(1);
 			base_props.state.enable_depth_bias(true);
-			base_props.state.enable_depth_clamp(true);
+			base_props.state.enable_depth_clamp(pdev->get_depth_clamp_support());
 			base_props.state.enable_depth_bounds_test(pdev->get_depth_bounds_support());
 			base_props.renderpass_key = vk::get_renderpass_key(surface_format);
 			pipe_properties.push_back(base_props);

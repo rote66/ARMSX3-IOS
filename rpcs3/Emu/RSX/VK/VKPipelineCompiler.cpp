@@ -256,6 +256,10 @@ namespace vk
 		// state so the provoking-vertex extension can be chained onto it, which is independent
 		// of the topology-class collapsing above.
 		VkPipelineRasterizationStateCreateInfo rs = create_info.state.rs;
+		if (!m_device->get_depth_clamp_support())
+		{
+			rs.depthClampEnable = VK_FALSE;
+		}
 		VkPipelineRasterizationProvokingVertexStateCreateInfoEXT provoking_vertex_state{};
 		if (flags & USE_LAST_PROVOKING_VERTEX)
 		{

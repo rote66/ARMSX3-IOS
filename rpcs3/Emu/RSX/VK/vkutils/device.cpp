@@ -1059,6 +1059,12 @@ namespace vk
 			enabled_features.depthBounds = VK_FALSE;
 		}
 
+		if (!pgpu->features.depthClamp)
+		{
+			rsx_log.warning("Your GPU does not support depth clamping. Graphics may not render correctly.");
+			enabled_features.depthClamp = VK_FALSE;
+		}
+
 		if (!pgpu->features.largePoints)
 		{
 			rsx_log.error("Your GPU does not support large points. Graphics may not render correctly.");

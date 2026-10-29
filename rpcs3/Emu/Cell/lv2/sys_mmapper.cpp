@@ -257,7 +257,12 @@ error_code sys_mmapper_allocate_fixed_address(ppu_thread& ppu)
 
 	sys_mmapper.warning("sys_mmapper_allocate_fixed_address()");
 
-	if (!vm::map(0xB0000000, 0x10000000, SYS_MEMORY_PAGE_SIZE_1M))
+	// sys_mmapper_map_shared_memory() now requires the target VM block to be
+	// explicitly marked as compatible with mmapper mappings. Keep the fixed
+	// 0xB0000000 area consistent with sys_mmapper_allocate_address(), otherwise
+	// allocate_fixed_address() succeeds but the immediately following map call
+	// rejects the block with CELL_EINVAL.
+	if (!vm::map(0xB0000000, 0x10000000, vm::mapping_comp | SYS_MEMORY_PAGE_SIZE_1M))
 	{
 		return CELL_EEXIST;
 	}

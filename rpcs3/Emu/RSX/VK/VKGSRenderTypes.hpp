@@ -170,6 +170,19 @@ namespace vk
 				m_submit_fence->reset();
 				vk::on_event_completed(eid_tag);
 
+				// poke() already returns managed ring memory when a submitted CB is observed as
+				// complete. The blocking wait path must do the same. Without this, a hard sync can
+				// successfully wait for the GPU and still leave every ring's GET pointer stale, so
+				// the allocator believes completed data is permanently in flight and grows/swaps the
+				// heap anyway. Build 91 exposed this directly: reclaim_ring_memory() waited, yet the
+				// 64M texture-upload ring still reported that it could not reserve reusable space.
+				if (ret == VK_SUCCESS && heap_snapshot_id)
+				{
+					data_heap_manager::restore_snapshot(heap_snapshot, heap_snapshot_id);
+					heap_snapshot.clear();
+					heap_snapshot_id = 0;
+				}
+
 				is_pending = false;
 				eid_tag = 0;
 			}
