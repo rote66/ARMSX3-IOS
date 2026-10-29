@@ -1,20 +1,27 @@
 # ARMSX3 for iOS / ARMSX3 iOS 版
 
-ARMSX3 for iOS is an experimental arm64/iPhoneOS frontend around the RPCS3 core. It reuses the
+ARMSX3 for iOS is an experimental arm64 iOS device/simulator frontend around the RPCS3 core. It reuses the
 same emulation core and, where practical, the same frontend assets and behavior as ARMSX3 on
 Android, while keeping iOS-specific lifecycle, input, audio, storage and JIT handling separate.
 
-ARMSX3 iOS 版是基于 RPCS3 Core 的实验性 arm64/iPhoneOS 前端。在可行的范围内，它复用
+ARMSX3 iOS 版是基于 RPCS3 Core 的实验性 arm64 真机/模拟器前端。在可行的范围内，它复用
 Android 版 ARMSX3 的前端资源和交互逻辑，同时针对 iOS 单独处理生命周期、输入、音频、
 存储、JIT 和系统集成。
+
+目前在ios15 se3上测试湾岸PS3通过。
 
 > **Status / 状态:** experimental. Game compatibility, performance and memory behavior can vary
 > significantly by title and device. / 目前仍属于实验阶段，不同游戏、设备的兼容性、性能和
 > 内存表现可能有明显差异。
 
+> **Development / 开发协作:** agent workflows, device-operation boundaries, simulator input,
+> validation baselines and checkpoint links are maintained in [AGENTS.md](AGENTS.md).
+> 开发代理流程、设备操作边界、模拟器输入、验证基线和历史检查点见上述指南。
+
 ## Platform / 平台
 
 - **Architecture / 架构:** arm64 only / 仅 arm64
+- **Simulator / 模拟器:** arm64 on Apple Silicon Macs / Apple Silicon Mac 上的 arm64 模拟器
 - **Deployment target / 最低系统:** iOS 15.0
 - **Renderer / 渲染器:** Vulkan through MoltenVK / Vulkan（通过 MoltenVK）
 - **CPU recompiler / CPU 重编译器:** LLVM AArch64 JIT
@@ -323,15 +330,78 @@ export ARMSX3_CMAKE="/path/to/cmake"
 export ARMSX3_CONFIGURATION=Debug
 ```
 
-### 5. Full clean rebuild / 完整干净重构建
+### 5. Apple Silicon iOS Simulator / Apple Silicon iOS 模拟器
 
-The iOS dependencies live inside the default build tree, so a **full** clean also removes those
-cross-compiled dependencies and rebuilds them from scratch:
+Build the simulator app and its own arm64 simulator LLVM, FFmpeg and MoltenVK libraries:
 
-iOS 依赖默认也位于构建目录中，因此 **完整 clean** 会同时删除交叉编译依赖，之后需要全部重建：
+构建模拟器 App，以及独立的 arm64 模拟器版 LLVM、FFmpeg 和 MoltenVK 依赖：
 
 ```sh
-rm -rf build/ios-device build/ios-output
+zsh ios/build-simulator.sh
+xcrun simctl list devices available
+zsh ios/run-simulator.sh <device-udid> "$HOME/Downloads/PS3UPDAT.PUP"
+```
+
+The runner boots the selected simulator, installs `build/ios-simulator/bin/ARMSX3.app`, copies the
+provided firmware into its sandbox, installs it if needed and boots XMB/VSH. Omit the arguments to
+use an already booted simulator and `~/Downloads/PS3UPDAT.PUP`. Simulator output is separate from
+the device build and never overwrites the IPA in `build/ios-output/`.
+
+运行脚本会启动选定的模拟器，安装 `build/ios-simulator/bin/ARMSX3.app`，将指定固件复制到 App
+沙盒中，在尚未安装时安装固件并启动 XMB/VSH。不传参数时使用已启动的模拟器和
+`~/Downloads/PS3UPDAT.PUP`。模拟器产物独立于真机构建，不会覆盖 `build/ios-output/` 中的 IPA。
+
+Simulator builds do not require the device-only `CS_DEBUGGED` authorization flag, but still execute
+the shared-arena JIT canary before core initialization. The firmware runner is enabled only by the
+simulator-only `ARMSX3_SIMULATOR_FIRMWARE` launch environment variable. Launching the app normally
+keeps the regular frontend and setup flow.
+
+模拟器构建不要求真机专用的 `CS_DEBUGGED` 授权标志，但仍须实际执行共享内存区 JIT 测试后才会
+初始化 Core。固件自动启动入口仅在模拟器下通过启动环境变量 `ARMSX3_SIMULATOR_FIRMWARE`
+启用；正常打开 App 仍保留原有前端和首次设置流程。
+
+The simulator renderer uses private textures/texel buffers with staging uploads, enables full
+image-view swizzling and disables Metal argument buffers. Unsupported depth clamping is not
+requested; rendering that relies on it can differ from a real device. Firmware boot retains the
+existing static PPU/SPU interpreter overrides, so this smoke test is not an LLVM game test.
+
+模拟器渲染使用私有纹理/纹理缓冲及暂存上传，启用完整图像通道重排，并关闭 Metal 参数缓冲。
+不会申请模拟器不支持的深度钳制；依赖该特性的画面可能与真机不同。固件启动保留既有的静态
+PPU/SPU 解释器覆盖设置，因此这项冒烟测试不等同于 LLVM 游戏测试。
+
+On first boot, complete the PS3 database rebuild and initial setup. If the core does not restart
+after the database reaches 100%, rerun the launch script; the initialized sandbox is preserved.
+
+首次启动需完成 PS3 数据库重建及初始设置。若数据库到达 100% 后核心未自动重启，重新运行
+启动脚本即可；初始化后的沙盒内容会保留。
+
+The runner prints the app sandbox and log locations. The launch console is saved in
+`build/ios-simulator/simulator.stderr.log`. Simulator testing does not replace real-device checks
+for memory limits, GPU behavior, JIT authorization or thread scheduling.
+
+运行脚本会输出 App 沙盒和日志路径；启动控制台保存在
+`build/ios-simulator/simulator.stderr.log`。模拟器测试不能代替真机内存限制、GPU 行为、JIT 授权
+及线程调度验证。
+
+#### Test scope / 测试范围
+
+Simulator input automation and the NFSMW Mar1 investigation are development workflows documented
+in [AGENTS.md](AGENTS.md). Simulator gameplay results do not establish real-device compatibility;
+the latest packaging pass, Build 117, has not been validated in a real-device game session.
+
+模拟器自动输入和 NFSMW Mar1 排查流程已迁入开发指南。模拟器入关不代表真机兼容性通过；
+最近完成打包的 Build 117 尚未经过真机游戏运行验证。详细现场与复现记录保留在 `docs/`。
+
+### 6. Full clean rebuild / 完整干净重构建
+
+For a normal clean, preserve `ios-deps/`, `_deps/absl-src/`, dependency source caches, test evidence
+and the existing IPA. See [AGENTS.md](AGENTS.md) for cleanup boundaries.
+
+常规 clean 保留已编译依赖、Abseil 源码、依赖源码缓存、测试证据和已有 IPA；清理边界见开发指南。
+下面的 **完整 clean** 会删除真机依赖，需要重新交叉编译，但不会删除交付目录：
+
+```sh
+rm -rf build/ios-device
 export ARMSX3_LLVM_TABLEGEN="$(brew --prefix llvm@22)/bin/llvm-tblgen"
 ./ios/build-dependencies.sh all
 ./ios/build-ipa.sh
