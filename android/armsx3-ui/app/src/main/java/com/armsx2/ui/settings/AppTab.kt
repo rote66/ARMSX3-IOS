@@ -209,6 +209,13 @@ fun AppTab() {
         ConfigDatabaseRow()
         GameFoldersRow()
         FrontendExportRow()
+        // Issue #188: lets a library manager check what is installed (InstalledTitlesProvider).
+        ToggleRow(
+            label = str("app.shareInstalled"),
+            value = com.armsx2.packages.ShareInstalled.enabled.value,
+            description = str("app.shareInstalled.desc"),
+            onChange = { com.armsx2.packages.ShareInstalled.set(it) },
+        )
         Surface(
             onClick = { UiNavigator.navigate(AppRoute.Language) },
             modifier = Modifier.fillMaxWidth()
@@ -485,25 +492,8 @@ fun AppTab() {
                     valueFormatter = { "$it%" },
                     onChange = com.armsx2.ui.theme.LibraryChromePreferences::setBackgroundDimming,
                 )
-                // The screensaver: this background, full screen, after a while with no input.
-                ToggleRow(
-                    label = str("app.screensaver"),
-                    value = com.armsx2.ui.home.LibraryScreensaver.enabled.value,
-                    description = str("app.screensaver.desc"),
-                    onChange = com.armsx2.ui.home.LibraryScreensaver::setEnabled,
-                )
-                if (com.armsx2.ui.home.LibraryScreensaver.enabled.value) {
-                    val minutesText = str("app.screensaver.minutes")
-                    IntSliderRow(
-                        label = str("app.screensaver.delay"),
-                        value = com.armsx2.ui.home.LibraryScreensaver.minutes.value,
-                        min = com.armsx2.ui.home.LibraryScreensaver.MIN_MINUTES,
-                        max = com.armsx2.ui.home.LibraryScreensaver.MAX_MINUTES,
-                        description = str("app.screensaver.delay.desc"),
-                        valueFormatter = { minutesText.format(it) },
-                        onChange = com.armsx2.ui.home.LibraryScreensaver::setMinutes,
-                    )
-                }
+                // The screensaver settings moved to the library's overflow menu, beside the
+                // background they show.
             }
             // Continuous RGB hue-cycle — same idea as the theme's RGB mode. While on, the fixed
             // color (presets + sliders) doesn't apply, so it's hidden.
@@ -1050,22 +1040,24 @@ private fun GameFoldersRow() {
     // always been a List<String> persisted as a JSON array, and HomeScreen re-scans on
     // LaunchedEffect(directories, ...), so adding a folder refreshes the library by itself.
     // The only thing that was missing was a way to reach it once setup had completed.
-    val picker = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocumentTree()
-    ) { uri ->
-        if (uri == null) return@rememberLauncherForActivityResult
-
-        // Persist the grant before storing the path. A SAF uri that outlives its permission
-        // reads as an empty folder rather than an error, which looks like the folder was
-        // added and silently contains nothing.
-        runCatching {
-            context.contentResolver.takePersistableUriPermission(
-                uri,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
-            )
-        }
-        MainActivityRuntime.setRomsDirs((dirs + uri.toString()).distinct())
-    }
+    // Falls back to our own browser where the device has no system folder picker (issue #186);
+    // a folder chosen there is stored as a plain path.
+    val picker = com.armsx2.ui.common.rememberFolderPicker(
+        title = str("app.gameFolders.add"),
+        onTree = { uri ->
+            // Persist the grant before storing the path. A SAF uri that outlives its permission
+            // reads as an empty folder rather than an error, which looks like the folder was
+            // added and silently contains nothing.
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                )
+            }
+            MainActivityRuntime.setRomsDirs((dirs + uri.toString()).distinct())
+        },
+        onPath = { MainActivityRuntime.setRomsDirs((dirs + it.absolutePath).distinct()) },
+    )
 
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -1089,11 +1081,16 @@ private fun GameFoldersRow() {
                 // locations a revoked grant (an unmounted card, typically) would otherwise
                 // just show half a library with no explanation.
                 val ok = remember(raw) {
-                    runCatching {
-                        context.contentResolver.persistedUriPermissions.any {
-                            it.uri.toString() == raw && it.isReadPermission
-                        }
-                    }.getOrDefault(false)
+                    if (raw.startsWith("/")) {
+                        // A folder from our own browser: a path, read through All files access.
+                        com.armsx2.ui.common.canBrowse() && java.io.File(raw).isDirectory
+                    } else {
+                        runCatching {
+                            context.contentResolver.persistedUriPermissions.any {
+                                it.uri.toString() == raw && it.isReadPermission
+                            }
+                        }.getOrDefault(false)
+                    }
                 }
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
@@ -1121,7 +1118,7 @@ private fun GameFoldersRow() {
             }
 
             Spacer(Modifier.height(4.dp))
-            OutlinedButton(onClick = { runCatching { picker.launch(null) } }, modifier = Modifier.fillMaxWidth()) {
+            OutlinedButton(onClick = picker, modifier = Modifier.fillMaxWidth()) {
                 Text(str("app.gameFolders.add"))
             }
             Spacer(Modifier.height(6.dp))

@@ -338,7 +338,8 @@ object Rpcs3Bridge {
         try {
             while (!stopRequested) {
                 if (RPCSX.getState() != EmulatorState.Stopped) {
-                    Thread.sleep(POLL_INTERVAL_MS)
+                    // Once a second out of sight: ten checks a second ran on in a locked device.
+                    Thread.sleep(if (appBackgrounded) 1000L else POLL_INTERVAL_MS)
                     continue
                 }
 
@@ -446,12 +447,31 @@ object Rpcs3Bridge {
         // pause() did not, so the pair was asymmetric and "Pause" was decorative.
         paused = true
         RPCSX.instance.pause()
+        // Motion goes off with the game. A paused game reads none, and the phone's accelerometer
+        // and gyro otherwise kept streaming fifty samples a second each into an app that had been
+        // put in the background or locked (#196).
+        sixaxis?.stop()
     }
 
     @JvmStatic
     fun resume() {
         paused = false
         RPCSX.instance.resume()
+        sixaxis?.start()
+    }
+
+    @Volatile
+    private var appBackgrounded = false
+
+    /**
+     * The app left the screen (true) or came back (false), from the activity's onStop/onStart.
+     * While out of sight the core's paused-game threads poll less, and so does boot()'s wait for
+     * the session to end (#196).
+     */
+    @JvmStatic
+    fun setAppBackgrounded(backgrounded: Boolean) {
+        appBackgrounded = backgrounded
+        runCatching { RPCSX.instance.setAppBackgrounded(backgrounded) }
     }
 
     /** Set by shutdown() to release boot()'s wait; see the loop there. */
@@ -696,6 +716,13 @@ object Rpcs3Bridge {
                 "LLVM Precompilation" -> Rpcs3Settings.setLlvmPrecompilation(asBool(value))
                 "Accurate SPU DMA" -> Rpcs3Settings.setAccurateSpuDma(asBool(value))
                 "Clocks scale" -> Rpcs3Settings.setClocksScale(asInt(value))
+                "Thread Scheduler Mode" -> Rpcs3Settings.setThreadScheduler(
+                    when (asInt(value)) {
+                        1 -> "RPCS3 Scheduler"
+                        2 -> "RPCS3 Alternative Scheduler"
+                        else -> "Operating System"
+                    },
+                )
                 "SPU XFloat Accuracy" -> Rpcs3Settings.setSpuXFloat(asInt(value))
                 "Accurate SPU Reservations" -> Rpcs3Settings.setAccurateSpuReservations(asBool(value))
                 "Accurate Cache Line Stores" -> Rpcs3Settings.setAccurateCacheLineStores(asBool(value))
@@ -754,6 +781,8 @@ object Rpcs3Bridge {
                 "Desired Audio Buffer Duration" -> Rpcs3Settings.setAudioBufferDuration(asInt(value))
                 "Renderer" -> Rpcs3Settings.setAudioRenderer(asInt(value))
                 "Cubeb Backend" -> Rpcs3Settings.setCubebBackend(asInt(value))
+                "Microphone Type" -> Rpcs3Settings.setMicrophoneType(asInt(value))
+                "Microphone Devices" -> Rpcs3Settings.setMicrophoneDevices(value)
                 else -> return false
             }
 
@@ -774,6 +803,8 @@ object Rpcs3Bridge {
 
             "PS3/Misc" -> when (key) {
                 "Silence All Logs" -> Rpcs3Settings.setSilenceAllLogs(asBool(value))
+                "Show shader compilation hint" -> Rpcs3Settings.setShaderCompilationHint(asBool(value))
+                "Show SPU compilation hint" -> Rpcs3Settings.setSpuCompilationHint(asBool(value))
                 else -> return false
             }
 
@@ -1019,6 +1050,9 @@ object Rpcs3Bridge {
     fun getTitleId(): String = runCatching { RPCSX.instance.getTitleId() }.getOrDefault("")
 
     @JvmStatic
+    fun getTitle(): String = runCatching { RPCSX.instance.getTitle() }.getOrNull().orEmpty()
+
+    @JvmStatic
     fun getVersion(): String = runCatching { RPCSX.instance.getVersion() }.getOrDefault("")
 
     @JvmStatic
@@ -1061,9 +1095,15 @@ object Rpcs3Bridge {
          *  JNI call per input event for values that never change. */
         val pressureSent = IntArray(PRESSURE_SLOTS)
 
-        /** Opposing directions cancel; 128 is centre, matching CELL_PAD. */
-        private fun axis(pos: Int, neg: Int) =
-            (128f + (dir[pos] - dir[neg]) * 127f).toInt().coerceIn(0, 255)
+        /** Opposing directions cancel; 128 is centre, matching CELL_PAD. Each side scales to its
+         *  own end, so a full push reads 0 up/left and 255 down/right, as a real DualShock 3 sends
+         *  and RPCS3's ConvertAxis gives. One 127 scale for both sides stopped full up and full
+         *  left at 1, one step short (ARMSX3 #198: full up / full left walked, the rest ran).
+         *  Rounded, so a push within half a step of either end reaches it. */
+        private fun axis(pos: Int, neg: Int): Int {
+            val v = dir[pos] - dir[neg]
+            return (128.5f + v * (if (v < 0f) 128f else 127f)).toInt().coerceIn(0, 255)
+        }
 
         fun leftX() = axis(1, 3)
         fun leftY() = axis(2, 0)
@@ -1304,7 +1344,19 @@ object Rpcs3Bridge {
         runCatching { RPCSX.instance.rpcnRemoveFriend(npid) }.getOrElse { it.message ?: "" }
 
     fun rpcnGetFriends(): String =
-        runCatching { RPCSX.instance.rpcnGetFriends() }.getOrElse { "[]" }
+        runCatching { RPCSX.instance.rpcnGetFriends() }.getOrElse { "{}" }
+
+    fun rpcnFriendsSession(open: Boolean): String =
+        runCatching { RPCSX.instance.rpcnFriendsSession(open) }.getOrElse { it.message ?: "" }
+
+    fun rpcnGetInvites(): String =
+        runCatching { RPCSX.instance.rpcnGetInvites() }.getOrElse { "[]" }
+
+    fun rpcnAcceptInvite(id: Long): String =
+        runCatching { RPCSX.instance.rpcnAcceptInvite(id) }.getOrElse { it.message ?: "" }
+
+    fun rpcnDeclineInvite(id: Long): String =
+        runCatching { RPCSX.instance.rpcnDeclineInvite(id) }.getOrElse { it.message ?: "" }
 
     fun rpcnCreateAccount(npid: String, password: String, onlineName: String, email: String): String =
         runCatching { RPCSX.instance.rpcnCreateAccount(npid, password, onlineName, email) }
@@ -1326,6 +1378,11 @@ object Rpcs3Bridge {
             .getOrElse { "Could not reach the emulator core." }
 
     @JvmStatic
+    fun rpcnSignIn(host: String, npid: String, password: String, token: String): String =
+        runCatching { RPCSX.instance.rpcnSignIn(host, npid, password, token) }
+            .getOrElse { "Could not reach the emulator core." }
+
+    @JvmStatic
     fun rpcnTestLogin(): String =
         runCatching { RPCSX.instance.rpcnTestLogin() }
             .getOrElse { "Could not reach the emulator core." }
@@ -1336,6 +1393,13 @@ object Rpcs3Bridge {
     fun captureFrame() {
         runCatching { RPCSX.instance.captureFrame() }
     }
+
+    /** Arm a frame dump: the next frame with real drawing is saved as PNGs to config/captures/.
+     *  Like a capture, it waits for a frame to be rendered, so close the pause menu first. False when
+     *  the active renderer cannot do it. */
+    @JvmStatic
+    fun dumpFrame(mode: Int): Boolean =
+        runCatching { RPCSX.instance.dumpFrame(mode) }.getOrDefault(false)
 
     @JvmStatic
     fun rpcnDeleteTrophies(): String =
@@ -1365,6 +1429,104 @@ object Rpcs3Bridge {
     @JvmStatic
     fun rpcnStatus(): String =
         runCatching { RPCSX.instance.rpcnStatus() }.getOrDefault("")
+
+    @JvmStatic
+    fun rpcnSignedIn(): Boolean =
+        runCatching { RPCSX.instance.rpcnSignedIn() }.getOrDefault(false)
+
+    @JvmStatic
+    fun setMicDevices(list: String) {
+        runCatching { RPCSX.instance.setMicDevices(list) }
+    }
+
+    @JvmStatic
+    fun micTestStart(device: String): Boolean =
+        runCatching { RPCSX.instance.micTestStart(device) }.getOrDefault(false)
+
+    @JvmStatic
+    fun micTestLevel(): Float =
+        runCatching { RPCSX.instance.micTestLevel() }.getOrDefault(-1f)
+
+    @JvmStatic
+    fun micTestStop() {
+        runCatching { RPCSX.instance.micTestStop() }
+    }
+
+    @JvmStatic
+    fun skylanderLoad(path: String): Int =
+        runCatching { RPCSX.instance.skylanderLoad(path) }.getOrDefault(-1)
+
+    @JvmStatic
+    fun skylanderRemove(slot: Int): Boolean =
+        runCatching { RPCSX.instance.skylanderRemove(slot) }.getOrDefault(false)
+
+    /** The colour the game lit the Skylanders portal, 0xRRGGBB, or 0 before it sets one. */
+    @JvmStatic
+    fun skylanderLight(): Int =
+        runCatching { RPCSX.instance.skylanderLight() }.getOrDefault(0)
+
+    @JvmStatic
+    fun infinityLoad(path: String, position: Int): Boolean =
+        runCatching { RPCSX.instance.infinityLoad(path, position) }.getOrDefault(false)
+
+    @JvmStatic
+    fun infinityRemove(position: Int): Boolean =
+        runCatching { RPCSX.instance.infinityRemove(position) }.getOrDefault(false)
+
+    @JvmStatic
+    fun dimensionsLoad(path: String, index: Int): Boolean =
+        runCatching { RPCSX.instance.dimensionsLoad(path, index) }.getOrDefault(false)
+
+    @JvmStatic
+    fun dimensionsRemove(index: Int): Boolean =
+        runCatching { RPCSX.instance.dimensionsRemove(index) }.getOrDefault(false)
+
+    @JvmStatic
+    fun skylanderCreate(path: String, id: Int, variant: Int): Boolean =
+        runCatching { RPCSX.instance.skylanderCreate(path, id, variant) }.getOrDefault(false)
+
+    @JvmStatic
+    fun infinityCreate(path: String, figure: Int, series: Int): Boolean =
+        runCatching { RPCSX.instance.infinityCreate(path, figure, series) }.getOrDefault(false)
+
+    @JvmStatic
+    fun dimensionsCreate(path: String, id: Int): Boolean =
+        runCatching { RPCSX.instance.dimensionsCreate(path, id) }.getOrDefault(false)
+
+    @JvmStatic
+    fun avatarList(): String =
+        runCatching { RPCSX.instance.avatarList() }.getOrDefault("")
+
+    @JvmStatic
+    fun avatarCurrent(): String =
+        runCatching { RPCSX.instance.avatarCurrent() }.getOrDefault("")
+
+    @JvmStatic
+    fun avatarImage(path: String): ByteArray? =
+        runCatching { RPCSX.instance.avatarImage(path) }.getOrNull()
+
+    @JvmStatic
+    fun avatarSelect(path: String): Boolean =
+        runCatching { RPCSX.instance.avatarSelect(path) }.getOrDefault(false)
+
+    @JvmStatic
+    fun avatarUseImage(png: ByteArray): Boolean =
+        runCatching { RPCSX.instance.avatarUseImage(png) }.getOrDefault(false)
+
+    @JvmStatic
+    fun usbSetPassthrough(fds: String) {
+        runCatching { RPCSX.instance.usbSetPassthrough(fds) }
+    }
+
+    /** Which real portals the running game's USB scan took: bits 1 Skylanders, 2 Infinity, 4 Dimensions. */
+    @JvmStatic
+    fun usbPassedThrough(): Int =
+        runCatching { RPCSX.instance.usbPassedThrough() }.getOrDefault(0)
+
+    /** Why a game thread died of a fatal error since the last call, or "" (GameErrorBanner). */
+    @JvmStatic
+    fun takeGameError(): String =
+        runCatching { RPCSX.instance.takeGameError() }.getOrDefault("")
 
     /** One key transition for cellKb. See RPCSX.keyboardKey. */
     @JvmStatic
@@ -1414,9 +1576,10 @@ object Rpcs3Bridge {
     @JvmStatic
     fun setStick(port: Int, left: Boolean, x: Int, y: Int) {
         val pad = pads.getOrNull(port) ?: return
-        // Absolute axis -> the two opposing deflections it implies.
+        // Absolute axis -> the two opposing deflections it implies (inverse of axis()).
         fun split(v: Int): Pair<Float, Float> {
-            val n = ((v.coerceIn(0, 255) - 128) / 127f).coerceIn(-1f, 1f)
+            val d = v.coerceIn(0, 255) - 128
+            val n = if (d < 0) d / 128f else d / 127f
             return if (n >= 0f) n to 0f else 0f to -n
         }
         val (xPos, xNeg) = split(x)
@@ -1746,8 +1909,10 @@ object Rpcs3Bridge {
      * mid-session. Callers only ask when the motor state changes, so enumerating devices is not a
      * per-frame cost.
      */
-    private fun vibrator(port: Int = 0): RumbleTarget? {
-        val dev = deviceForPort(port)
+    private fun vibrator(port: Int = 0): RumbleTarget? = vibratorFor(deviceForPort(port), handheld = port == 0)
+
+    /** [vibrator] for a given controller. [handheld]: this device's own motor may stand in. */
+    private fun vibratorFor(dev: android.view.InputDevice?, handheld: Boolean): RumbleTarget? {
         val mode = PadRouter.rumbleMode(dev?.descriptor)
         if (mode == PadRouter.RumbleMode.OFF) return null
 
@@ -1765,8 +1930,56 @@ object Rpcs3Bridge {
         // motor would just be the wrong device again.
         val wantDevice = mode == PadRouter.RumbleMode.DEVICE || NativeApp.sPhoneRumbleEnabled
         return deviceVibrator()
-            .takeIf { port == 0 && wantDevice && it?.hasVibrator() == true }
+            .takeIf { handheld && wantDevice && it?.hasVibrator() == true }
             ?.let { RumbleTarget("this device", listOf(it)) }
+    }
+
+    // ---- Remote play -----------------------------------------------------
+    //
+    // A friend playing as player 2 through remote play feels player 2's rumble on their own
+    // device: the host reads it here and sends it, and the friend's side plays it here.
+
+    /**
+     * Host: what the game has player [port]'s motors doing, packed (large << 8) | small, or 0 while
+     * paused, as the local motors are. This device's own vibration settings do not apply: the
+     * friend's side applies its own.
+     */
+    @JvmStatic
+    fun remoteRumble(port: Int): Int =
+        if (paused) 0 else runCatching { RPCSX.instance.getPadRumble(port) }.getOrDefault(0)
+
+    /** Host: whether the game is paused, for the friend's screen to say so. */
+    @JvmStatic
+    fun isPaused(): Boolean = paused
+
+    private var remoteActive: RumbleTarget? = null
+    private var remoteAnnounced: String? = null
+
+    /**
+     * Friend's side: runs this device's motors as the host asks, wherever local play would send
+     * player 1's rumble, with this device's vibration settings: the controller in use ([deviceId],
+     * -1 when none has been used yet) if it has motors, else the handheld's own. 0, 0 stops them.
+     * Main thread.
+     */
+    @JvmStatic
+    fun playRemoteRumble(deviceId: Int, large: Int, small: Int) {
+        val vib = if (rumbleEnabled && (large > 0 || small > 0)) {
+            runCatching {
+                val dev = if (deviceId >= 0) android.view.InputDevice.getDevice(deviceId) else deviceForPort(0)
+                vibratorFor(dev, handheld = true)
+            }.getOrNull()
+        } else {
+            null
+        }
+        if (vib != null && remoteAnnounced != vib.label) {
+            remoteAnnounced = vib.label
+            logRumble("remote play -> ${vib.label}")
+        }
+        remoteActive?.takeIf { !it.sameAs(vib) }?.let { runCatching { it.cancel() } }
+        remoteActive = null
+        if (vib == null) return
+        runCatching { vib.play(large, small) }
+        remoteActive = vib
     }
 
     @JvmStatic
@@ -1847,7 +2060,9 @@ object Rpcs3Bridge {
                     lastSmall[port] = wantSmall
                 }
 
-                try { Thread.sleep(30) } catch (_: InterruptedException) { break }
+                // Slower while paused, when the motors are already off and the only news is the
+                // resume: 33 polls a second otherwise ran on in a backgrounded or locked app.
+                try { Thread.sleep(if (paused) 250 else 30) } catch (_: InterruptedException) { break }
             }
             runCatching { active.forEach { it?.cancel() } }
         }.apply { isDaemon = true; name = "rumble-pump"; start() }
@@ -1912,6 +2127,7 @@ object Rpcs3Bridge {
 
     // ---- SIXAXIS motion ------------------------------------------------
 
+    @Volatile
     private var sixaxis: com.armsx2.input.Sixaxis? = null
 
     /**

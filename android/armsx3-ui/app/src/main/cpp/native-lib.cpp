@@ -1,6 +1,11 @@
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 #include <algorithm>
 #include <android/api-level.h>
 #include <android/dlext.h>
+#include <android/hardware_buffer.h>
 #include <android/log.h>
 #include <cstdio>
 #include <cstring>
@@ -11,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -24,6 +30,19 @@ struct RPCSXApi {
   bool (*overlayPadData)(int port, int digital1, int digital2, int leftStickX,
                          int leftStickY, int rightStickX, int rightStickY);
   bool (*overlayPadPressure)(int port, const int *values, int count);
+  // Remote play capture (android/src/remote_play.cpp in the core).
+  bool (*remotePlayStart)(int maxWidth, int maxHeight);
+  void (*remotePlayStop)();
+  int (*remotePlayPollVideo)(uint8_t *dst, int64_t cap, int32_t *info, int timeoutMs);
+  int (*remotePlayPollAudio)(int16_t *dst, int capFrames, int timeoutMs);
+  void (*remotePlayCounters)(uint32_t *out);
+  void (*remotePlayReleaseFrame)(int slot, uint32_t seq);
+  AHardwareBuffer *(*remotePlayHardwareBuffer)(int slot, uint32_t *generation);
+  void (*remotePlaySetHardware)(bool enabled);
+  bool (*remotePlayCanCapture)();
+  bool (*remotePlayUpnpPrepare)(char *lanAddr, int lanAddrLen);
+  int (*remotePlayUpnpMap)(int internalPort, int externalHint, int leaseSeconds, char *publicAddr, int publicAddrLen);
+  void (*remotePlayUpnpUnmap)(int externalPort);
   bool (*keyboardKey)(int androidKeyCode, int unicode, bool pressed, bool repeat);
   bool (*initialize)(std::string_view rootDir, std::string_view user);
   void (*setSocInfo)(std::string_view socInfo);
@@ -37,9 +56,12 @@ struct RPCSXApi {
   void (*kill)();
   void (*resume)();
   void (*pause)();
+  void (*setAppBackgrounded)(bool);
   void (*openHomeMenu)();
   void (*captureFrame)();
+  bool (*dumpFrame)(int mode);
   std::string (*getTitleId)();
+  std::string (*getTitle)();
   unsigned long long (*getFramePeriodNs)();
   unsigned long long (*getFrameWorkNs)();
   int (*getRsxThreadTid)();
@@ -78,6 +100,10 @@ struct RPCSXApi {
   const char *(*rpcnAddFriend)(std::string_view npid);
   const char *(*rpcnRemoveFriend)(std::string_view npid);
   const char *(*rpcnGetFriends)();
+  const char *(*rpcnFriendsSession)(bool open);
+  const char *(*rpcnGetInvites)();
+  const char *(*rpcnAcceptInvite)(uint64_t id);
+  const char *(*rpcnDeclineInvite)(uint64_t id);
   const char *(*rpcnCreateAccount)(std::string_view npid, std::string_view password,
                                    std::string_view onlineName, std::string_view email);
   const char *(*rpcnResendToken)(std::string_view npid, std::string_view password);
@@ -85,12 +111,37 @@ struct RPCSXApi {
   const char *(*rpcnResetPassword)(std::string_view npid, std::string_view token,
                                    std::string_view password);
   const char *(*rpcnTestLogin)();
+  const char *(*rpcnSignIn)(std::string_view host, std::string_view npid,
+                            std::string_view password, std::string_view token);
   const char *(*rpcnDeleteTrophies)();
   const char *(*rpcnAddHost)(std::string_view desc, std::string_view host);
   const char *(*rpcnDelHost)(std::string_view desc, std::string_view host);
   void (*rpcnResetHosts)();
   void (*rpcnSetIpv6)(bool enabled);
   const char *(*rpcnStatus)();
+  bool (*rpcnSignedIn)();
+  void (*setMicDevices)(std::string_view list);
+  bool (*micTestStart)(std::string_view device);
+  float (*micTestLevel)();
+  void (*micTestStop)();
+  int32_t (*skylanderLoad)(std::string_view path);
+  bool (*skylanderRemove)(int32_t slot);
+  int32_t (*skylanderLight)();
+  bool (*infinityLoad)(std::string_view path, int32_t position);
+  bool (*infinityRemove)(int32_t position);
+  bool (*dimensionsLoad)(std::string_view path, int32_t index);
+  bool (*dimensionsRemove)(int32_t index);
+  bool (*skylanderCreate)(std::string_view path, int32_t id, int32_t variant);
+  bool (*infinityCreate)(std::string_view path, int32_t figure, int32_t series);
+  bool (*dimensionsCreate)(std::string_view path, int32_t id);
+  const char *(*avatarList)();
+  const char *(*avatarCurrent)();
+  bool (*avatarImage)(std::string_view path, const uint8_t **data, size_t *size);
+  bool (*avatarSelect)(std::string_view path);
+  bool (*avatarUseImage)(const uint8_t *data, size_t size);
+  void (*usbSetPassthrough)(std::string_view fds);
+  int32_t (*usbPassedThrough)();
+  const char *(*takeGameError)();
   void (*settingsBeginBatch)();
   void (*settingsEndBatch)();
   bool (*installSplitPkg)(JNIEnv *env, const int *fds, int count, long progressId);
@@ -158,6 +209,18 @@ struct RPCSXLibrary : RPCSXApi {
     // clang-format off
     result.overlayPadData = reinterpret_cast<decltype(overlayPadData)>(dlsym(handle, "_rpcsx_overlayPadData"));
     result.overlayPadPressure = reinterpret_cast<decltype(overlayPadPressure)>(dlsym(handle, "_rpcsx_overlayPadPressure"));
+    result.remotePlayStart = reinterpret_cast<decltype(remotePlayStart)>(dlsym(handle, "_rpcsx_remotePlayStart"));
+    result.remotePlayStop = reinterpret_cast<decltype(remotePlayStop)>(dlsym(handle, "_rpcsx_remotePlayStop"));
+    result.remotePlayPollVideo = reinterpret_cast<decltype(remotePlayPollVideo)>(dlsym(handle, "_rpcsx_remotePlayPollVideo"));
+    result.remotePlayPollAudio = reinterpret_cast<decltype(remotePlayPollAudio)>(dlsym(handle, "_rpcsx_remotePlayPollAudio"));
+    result.remotePlayCounters = reinterpret_cast<decltype(remotePlayCounters)>(dlsym(handle, "_rpcsx_remotePlayCounters"));
+    result.remotePlayReleaseFrame = reinterpret_cast<decltype(remotePlayReleaseFrame)>(dlsym(handle, "_rpcsx_remotePlayReleaseFrame"));
+    result.remotePlayHardwareBuffer = reinterpret_cast<decltype(remotePlayHardwareBuffer)>(dlsym(handle, "_rpcsx_remotePlayHardwareBuffer"));
+    result.remotePlaySetHardware = reinterpret_cast<decltype(remotePlaySetHardware)>(dlsym(handle, "_rpcsx_remotePlaySetHardware"));
+    result.remotePlayCanCapture = reinterpret_cast<decltype(remotePlayCanCapture)>(dlsym(handle, "_rpcsx_remotePlayCanCapture"));
+    result.remotePlayUpnpPrepare = reinterpret_cast<decltype(remotePlayUpnpPrepare)>(dlsym(handle, "_rpcsx_remotePlayUpnpPrepare"));
+    result.remotePlayUpnpMap = reinterpret_cast<decltype(remotePlayUpnpMap)>(dlsym(handle, "_rpcsx_remotePlayUpnpMap"));
+    result.remotePlayUpnpUnmap = reinterpret_cast<decltype(remotePlayUpnpUnmap)>(dlsym(handle, "_rpcsx_remotePlayUpnpUnmap"));
     result.keyboardKey = reinterpret_cast<decltype(keyboardKey)>(dlsym(handle, "_rpcsx_keyboardKey"));
     result.initialize = reinterpret_cast<decltype(initialize)>(dlsym(handle, "_rpcsx_initialize"));
     result.setSocInfo = reinterpret_cast<decltype(setSocInfo)>(dlsym(handle, "_rpcsx_setSocInfo"));
@@ -170,9 +233,12 @@ struct RPCSXLibrary : RPCSXApi {
     result.kill = reinterpret_cast<decltype(kill)>(dlsym(handle, "_rpcsx_kill"));
     result.resume = reinterpret_cast<decltype(resume)>(dlsym(handle, "_rpcsx_resume"));
     result.pause = reinterpret_cast<decltype(pause)>(dlsym(handle, "_rpcsx_pause"));
+    result.setAppBackgrounded = reinterpret_cast<decltype(setAppBackgrounded)>(dlsym(handle, "_rpcsx_setAppBackgrounded"));
     result.captureFrame = reinterpret_cast<decltype(captureFrame)>(dlsym(handle, "_rpcsx_captureFrame"));
+    result.dumpFrame = reinterpret_cast<decltype(dumpFrame)>(dlsym(handle, "_rpcsx_dumpFrame"));
     result.openHomeMenu = reinterpret_cast<decltype(openHomeMenu)>(dlsym(handle, "_rpcsx_openHomeMenu"));
     result.getTitleId = reinterpret_cast<decltype(getTitleId)>(dlsym(handle, "_rpcsx_getTitleId"));
+    result.getTitle = reinterpret_cast<decltype(getTitle)>(dlsym(handle, "_rpcsx_getTitle"));
     result.getFramePeriodNs = reinterpret_cast<decltype(getFramePeriodNs)>(dlsym(handle, "_rpcsx_getFramePeriodNs"));
     result.getFrameWorkNs = reinterpret_cast<decltype(getFrameWorkNs)>(dlsym(handle, "_rpcsx_getFrameWorkNs"));
     result.getRsxThreadTid = reinterpret_cast<decltype(getRsxThreadTid)>(dlsym(handle, "_rpcsx_getRsxThreadTid"));
@@ -216,17 +282,45 @@ struct RPCSXLibrary : RPCSXApi {
     result.rpcnAddFriend = reinterpret_cast<decltype(rpcnAddFriend)>(dlsym(handle, "_rpcsx_rpcnAddFriend"));
     result.rpcnRemoveFriend = reinterpret_cast<decltype(rpcnRemoveFriend)>(dlsym(handle, "_rpcsx_rpcnRemoveFriend"));
     result.rpcnGetFriends = reinterpret_cast<decltype(rpcnGetFriends)>(dlsym(handle, "_rpcsx_rpcnGetFriends"));
+    result.rpcnFriendsSession = reinterpret_cast<decltype(rpcnFriendsSession)>(dlsym(handle, "_rpcsx_rpcnFriendsSession"));
+    result.rpcnGetInvites = reinterpret_cast<decltype(rpcnGetInvites)>(dlsym(handle, "_rpcsx_rpcnGetInvites"));
+    result.rpcnAcceptInvite = reinterpret_cast<decltype(rpcnAcceptInvite)>(dlsym(handle, "_rpcsx_rpcnAcceptInvite"));
+    result.rpcnDeclineInvite = reinterpret_cast<decltype(rpcnDeclineInvite)>(dlsym(handle, "_rpcsx_rpcnDeclineInvite"));
     result.rpcnCreateAccount = reinterpret_cast<decltype(rpcnCreateAccount)>(dlsym(handle, "_rpcsx_rpcnCreateAccount"));
     result.rpcnResendToken = reinterpret_cast<decltype(rpcnResendToken)>(dlsym(handle, "_rpcsx_rpcnResendToken"));
     result.rpcnSendResetToken = reinterpret_cast<decltype(rpcnSendResetToken)>(dlsym(handle, "_rpcsx_rpcnSendResetToken"));
     result.rpcnResetPassword = reinterpret_cast<decltype(rpcnResetPassword)>(dlsym(handle, "_rpcsx_rpcnResetPassword"));
     result.rpcnTestLogin = reinterpret_cast<decltype(rpcnTestLogin)>(dlsym(handle, "_rpcsx_rpcnTestLogin"));
+    result.rpcnSignIn = reinterpret_cast<decltype(rpcnSignIn)>(dlsym(handle, "_rpcsx_rpcnSignIn"));
     result.rpcnDeleteTrophies = reinterpret_cast<decltype(rpcnDeleteTrophies)>(dlsym(handle, "_rpcsx_rpcnDeleteTrophies"));
     result.rpcnAddHost = reinterpret_cast<decltype(rpcnAddHost)>(dlsym(handle, "_rpcsx_rpcnAddHost"));
     result.rpcnDelHost = reinterpret_cast<decltype(rpcnDelHost)>(dlsym(handle, "_rpcsx_rpcnDelHost"));
     result.rpcnResetHosts = reinterpret_cast<decltype(rpcnResetHosts)>(dlsym(handle, "_rpcsx_rpcnResetHosts"));
     result.rpcnSetIpv6 = reinterpret_cast<decltype(rpcnSetIpv6)>(dlsym(handle, "_rpcsx_rpcnSetIpv6"));
     result.rpcnStatus = reinterpret_cast<decltype(rpcnStatus)>(dlsym(handle, "_rpcsx_rpcnStatus"));
+    result.rpcnSignedIn = reinterpret_cast<decltype(rpcnSignedIn)>(dlsym(handle, "_rpcsx_rpcnSignedIn"));
+    result.setMicDevices = reinterpret_cast<decltype(setMicDevices)>(dlsym(handle, "_rpcsx_setMicDevices"));
+    result.micTestStart = reinterpret_cast<decltype(micTestStart)>(dlsym(handle, "_rpcsx_micTestStart"));
+    result.micTestLevel = reinterpret_cast<decltype(micTestLevel)>(dlsym(handle, "_rpcsx_micTestLevel"));
+    result.micTestStop = reinterpret_cast<decltype(micTestStop)>(dlsym(handle, "_rpcsx_micTestStop"));
+    result.skylanderLoad = reinterpret_cast<decltype(skylanderLoad)>(dlsym(handle, "_rpcsx_skylanderLoad"));
+    result.skylanderRemove = reinterpret_cast<decltype(skylanderRemove)>(dlsym(handle, "_rpcsx_skylanderRemove"));
+    result.skylanderLight = reinterpret_cast<decltype(skylanderLight)>(dlsym(handle, "_rpcsx_skylanderLight"));
+    result.infinityLoad = reinterpret_cast<decltype(infinityLoad)>(dlsym(handle, "_rpcsx_infinityLoad"));
+    result.infinityRemove = reinterpret_cast<decltype(infinityRemove)>(dlsym(handle, "_rpcsx_infinityRemove"));
+    result.dimensionsLoad = reinterpret_cast<decltype(dimensionsLoad)>(dlsym(handle, "_rpcsx_dimensionsLoad"));
+    result.dimensionsRemove = reinterpret_cast<decltype(dimensionsRemove)>(dlsym(handle, "_rpcsx_dimensionsRemove"));
+    result.skylanderCreate = reinterpret_cast<decltype(skylanderCreate)>(dlsym(handle, "_rpcsx_skylanderCreate"));
+    result.infinityCreate = reinterpret_cast<decltype(infinityCreate)>(dlsym(handle, "_rpcsx_infinityCreate"));
+    result.dimensionsCreate = reinterpret_cast<decltype(dimensionsCreate)>(dlsym(handle, "_rpcsx_dimensionsCreate"));
+    result.avatarList = reinterpret_cast<decltype(avatarList)>(dlsym(handle, "_rpcsx_avatarList"));
+    result.avatarCurrent = reinterpret_cast<decltype(avatarCurrent)>(dlsym(handle, "_rpcsx_avatarCurrent"));
+    result.avatarImage = reinterpret_cast<decltype(avatarImage)>(dlsym(handle, "_rpcsx_avatarImage"));
+    result.avatarSelect = reinterpret_cast<decltype(avatarSelect)>(dlsym(handle, "_rpcsx_avatarSelect"));
+    result.avatarUseImage = reinterpret_cast<decltype(avatarUseImage)>(dlsym(handle, "_rpcsx_avatarUseImage"));
+    result.usbSetPassthrough = reinterpret_cast<decltype(usbSetPassthrough)>(dlsym(handle, "_rpcsx_usbSetPassthrough"));
+    result.usbPassedThrough = reinterpret_cast<decltype(usbPassedThrough)>(dlsym(handle, "_rpcsx_usbPassedThrough"));
+    result.takeGameError = reinterpret_cast<decltype(takeGameError)>(dlsym(handle, "_rpcsx_takeGameError"));
     result.settingsSet = reinterpret_cast<decltype(settingsSet)>(dlsym(handle, "_rpcsx_settingsSet"));
     // Resolved without ensure(): a core built before frame generation existed simply has no such
     // symbol, and refusing to load it over a missing optional feature would be worse than the
@@ -312,6 +406,209 @@ extern "C" JNIEXPORT jboolean JNICALL Java_net_rpcsx_RPCSX_overlayPadData(
 
   return rpcsxLib.overlayPadData(port, digital1, digital2, leftStickX,
                                  leftStickY, rightStickX, rightStickY);
+}
+
+// Remote play. The streaming threads pull frames and audio from the core through these; the core
+// never calls back into Java for them. Every one fails soft on a core without the exports.
+extern "C" JNIEXPORT jboolean JNICALL Java_net_rpcsx_RPCSX_remotePlayStart(
+    JNIEnv *, jobject, jint maxWidth, jint maxHeight) {
+  if (rpcsxLib.remotePlayStart == nullptr) {
+    return false;
+  }
+
+  return rpcsxLib.remotePlayStart(maxWidth, maxHeight);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_net_rpcsx_RPCSX_remotePlayStop(JNIEnv *, jobject) {
+  if (rpcsxLib.remotePlayStop != nullptr) {
+    rpcsxLib.remotePlayStop();
+  }
+}
+
+// buffer: a direct ByteBuffer for an NV12 frame (Y plane, then interleaved UV, rows packed).
+// info (6 ints): width, height, slot, generation, seq, unused. Returns 2 with a hardware frame
+// (nothing written to buffer), 1 with an NV12 frame, 0 on timeout, -1 when capture is off, -2 when
+// the buffer is too small for the frame described in info.
+extern "C" JNIEXPORT jint JNICALL Java_net_rpcsx_RPCSX_remotePlayPollVideo(
+    JNIEnv *env, jobject, jobject buffer, jintArray info, jint timeoutMs) {
+  if (rpcsxLib.remotePlayPollVideo == nullptr || buffer == nullptr || info == nullptr ||
+      env->GetArrayLength(info) < 6) {
+    return -1;
+  }
+
+  auto *dst = static_cast<uint8_t *>(env->GetDirectBufferAddress(buffer));
+  const jlong cap = env->GetDirectBufferCapacity(buffer);
+  if (dst == nullptr || cap <= 0) {
+    return -1;
+  }
+
+  int32_t out[6] = {};
+  const int result = rpcsxLib.remotePlayPollVideo(dst, cap, out, timeoutMs);
+  env->SetIntArrayRegion(info, 0, 6, out);
+  return result;
+}
+
+// Remote play's hardware frames: slots the GPU fills with RGBA as AHardwareBuffers, handed to the
+// video encoder as GL textures so a frame never passes through the CPU. The two calls below that
+// touch GL need a current EGL context on the calling thread.
+
+extern "C" JNIEXPORT void JNICALL Java_net_rpcsx_RPCSX_remotePlayReleaseFrame(JNIEnv *, jobject, jint slot, jint seq) {
+  if (rpcsxLib.remotePlayReleaseFrame != nullptr) {
+    rpcsxLib.remotePlayReleaseFrame(slot, static_cast<uint32_t>(seq));
+  }
+}
+
+// Remote play online hosting: this device's address on the router's network, or null when there
+// is no router to open a port on. Blocks about two seconds the first time.
+extern "C" JNIEXPORT jstring JNICALL Java_net_rpcsx_RPCSX_remotePlayUpnpPrepare(JNIEnv *env, jobject) {
+  char lan[64] = {};
+  if (rpcsxLib.remotePlayUpnpPrepare == nullptr || !rpcsxLib.remotePlayUpnpPrepare(lan, sizeof(lan)) || lan[0] == 0) {
+    return nullptr;
+  }
+  return env->NewStringUTF(lan);
+}
+
+// "public address:router port" for UDP internalPort opened on the router, or null.
+extern "C" JNIEXPORT jstring JNICALL Java_net_rpcsx_RPCSX_remotePlayUpnpMap(
+    JNIEnv *env, jobject, jint internalPort, jint externalHint, jint leaseSeconds) {
+  char address[64] = {};
+  const int port = rpcsxLib.remotePlayUpnpMap == nullptr
+      ? 0
+      : rpcsxLib.remotePlayUpnpMap(internalPort, externalHint, leaseSeconds, address, sizeof(address));
+  if (port <= 0 || address[0] == 0) {
+    return nullptr;
+  }
+  const std::string result = std::string(address) + ":" + std::to_string(port);
+  return env->NewStringUTF(result.c_str());
+}
+
+extern "C" JNIEXPORT void JNICALL Java_net_rpcsx_RPCSX_remotePlayUpnpUnmap(JNIEnv *, jobject, jint externalPort) {
+  if (rpcsxLib.remotePlayUpnpUnmap != nullptr) {
+    rpcsxLib.remotePlayUpnpUnmap(externalPort);
+  }
+}
+
+extern "C" JNIEXPORT void JNICALL Java_net_rpcsx_RPCSX_remotePlaySetHardware(JNIEnv *, jobject, jboolean enabled) {
+  if (rpcsxLib.remotePlaySetHardware != nullptr) {
+    rpcsxLib.remotePlaySetHardware(enabled);
+  }
+}
+
+// Whether the running game can be hosted: its renderer captures frames (Vulkan only). True on a
+// core without the check, which hosted regardless.
+extern "C" JNIEXPORT jboolean JNICALL Java_net_rpcsx_RPCSX_remotePlayCanCapture(JNIEnv *, jobject) {
+  return rpcsxLib.remotePlayCanCapture == nullptr || rpcsxLib.remotePlayCanCapture();
+}
+
+namespace {
+struct RemotePlayEgl {
+  PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC getNativeClientBuffer = nullptr;
+  PFNEGLCREATEIMAGEKHRPROC createImage = nullptr;
+  PFNEGLDESTROYIMAGEKHRPROC destroyImage = nullptr;
+  PFNGLEGLIMAGETARGETTEXTURE2DOESPROC imageTargetTexture = nullptr;
+
+  bool load() {
+    if (createImage == nullptr) {
+      getNativeClientBuffer = reinterpret_cast<PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC>(eglGetProcAddress("eglGetNativeClientBufferANDROID"));
+      createImage = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(eglGetProcAddress("eglCreateImageKHR"));
+      destroyImage = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(eglGetProcAddress("eglDestroyImageKHR"));
+      imageTargetTexture = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+    }
+    return getNativeClientBuffer != nullptr && createImage != nullptr && destroyImage != nullptr &&
+           imageTargetTexture != nullptr;
+  }
+};
+
+RemotePlayEgl remotePlayEgl;
+} // namespace
+
+// Binds a hardware frame slot's buffer to texture (GL_TEXTURE_EXTERNAL_OES). Returns the EGLImage
+// to destroy later with remotePlayDestroyImage, or 0 when the slot has no buffer or the import
+// failed; the app then asks for NV12 frames instead.
+extern "C" JNIEXPORT jlong JNICALL Java_net_rpcsx_RPCSX_remotePlayImportFrame(JNIEnv *, jobject, jint slot, jint texture) {
+  if (rpcsxLib.remotePlayHardwareBuffer == nullptr || !remotePlayEgl.load()) {
+    return 0;
+  }
+
+  uint32_t generation = 0;
+  AHardwareBuffer *buffer = rpcsxLib.remotePlayHardwareBuffer(slot, &generation);
+  if (buffer == nullptr) {
+    return 0;
+  }
+
+  const EGLDisplay display = eglGetCurrentDisplay();
+  const EGLClientBuffer client = remotePlayEgl.getNativeClientBuffer(buffer);
+  const EGLint attributes[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
+  EGLImageKHR image = EGL_NO_IMAGE_KHR;
+
+  if (display != EGL_NO_DISPLAY && client != nullptr) {
+    image = remotePlayEgl.createImage(display, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, client, attributes);
+  }
+
+  // The image holds the buffer from here on.
+  AHardwareBuffer_release(buffer);
+
+  if (image == EGL_NO_IMAGE_KHR) {
+    return 0;
+  }
+
+  // Errors left over from earlier GL work on this context would read as a failed bind.
+  for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; i++) {
+  }
+
+  glBindTexture(GL_TEXTURE_EXTERNAL_OES, static_cast<GLuint>(texture));
+  remotePlayEgl.imageTargetTexture(GL_TEXTURE_EXTERNAL_OES, static_cast<GLeglImageOES>(image));
+  const bool bound = glGetError() == GL_NO_ERROR;
+  glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+
+  if (!bound) {
+    remotePlayEgl.destroyImage(display, image);
+    return 0;
+  }
+
+  return reinterpret_cast<jlong>(image);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_net_rpcsx_RPCSX_remotePlayDestroyImage(JNIEnv *, jobject, jlong image) {
+  if (image != 0 && remotePlayEgl.load()) {
+    remotePlayEgl.destroyImage(eglGetCurrentDisplay(), reinterpret_cast<EGLImageKHR>(image));
+  }
+}
+
+// out (4 ints): running totals of game frames seen while capturing, frames not read back, frames
+// handed to the app and frames replaced before the app took them. False when the core lacks it.
+extern "C" JNIEXPORT jboolean JNICALL Java_net_rpcsx_RPCSX_remotePlayCounters(
+    JNIEnv *env, jobject, jintArray out) {
+  if (rpcsxLib.remotePlayCounters == nullptr || out == nullptr || env->GetArrayLength(out) < 4) {
+    return false;
+  }
+
+  uint32_t counters[4] = {};
+  rpcsxLib.remotePlayCounters(counters);
+  jint values[4];
+  for (int i = 0; i < 4; i++) {
+    values[i] = static_cast<jint>(counters[i]);
+  }
+  env->SetIntArrayRegion(out, 0, 4, values);
+  return true;
+}
+
+// buffer: a direct ByteBuffer receiving stereo s16 at 48 kHz. Returns frames written, 0 on
+// timeout, -1 when capture is off.
+extern "C" JNIEXPORT jint JNICALL Java_net_rpcsx_RPCSX_remotePlayPollAudio(
+    JNIEnv *env, jobject, jobject buffer, jint capFrames, jint timeoutMs) {
+  if (rpcsxLib.remotePlayPollAudio == nullptr || buffer == nullptr) {
+    return -1;
+  }
+
+  auto *dst = static_cast<int16_t *>(env->GetDirectBufferAddress(buffer));
+  const jlong cap = env->GetDirectBufferCapacity(buffer);
+  if (dst == nullptr || cap < 4) {
+    return -1;
+  }
+
+  const int frames = static_cast<int>(std::min<jlong>(capFrames, cap / 4));
+  return rpcsxLib.remotePlayPollAudio(dst, frames, timeoutMs);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL Java_net_rpcsx_RPCSX_overlayPadPressure(
@@ -484,6 +781,17 @@ extern "C" JNIEXPORT void JNICALL Java_net_rpcsx_RPCSX_pause(JNIEnv *env,
   return rpcsxLib.pause();
 }
 
+extern "C" JNIEXPORT void JNICALL Java_net_rpcsx_RPCSX_setAppBackgrounded(JNIEnv *env,
+                                                                          jobject,
+                                                                          jboolean backgrounded) {
+  // Same null guard as pause: the core may not be loaded yet, and an older core lacks the export.
+  if (rpcsxLib.setAppBackgrounded == nullptr) {
+      return;
+  }
+
+  rpcsxLib.setAppBackgrounded(backgrounded == JNI_TRUE);
+}
+
 extern "C" JNIEXPORT void JNICALL Java_net_rpcsx_RPCSX_openHomeMenu(JNIEnv *env,
                                                                     jobject) {
   // The core is dlopen()ed separately and may not be up yet -- during
@@ -505,6 +813,15 @@ extern "C" JNIEXPORT void JNICALL Java_net_rpcsx_RPCSX_captureFrame(JNIEnv *env,
   return rpcsxLib.captureFrame();
 }
 
+extern "C" JNIEXPORT jboolean JNICALL Java_net_rpcsx_RPCSX_dumpFrame(JNIEnv *env,
+                                                                    jobject, jint mode) {
+  if (rpcsxLib.dumpFrame == nullptr) {
+      return false;
+  }
+
+  return rpcsxLib.dumpFrame(mode);
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_net_rpcsx_RPCSX_getTitleId(JNIEnv *env, jobject) {
   // The core is dlopen()ed separately and may not be up yet -- during
@@ -515,6 +832,16 @@ Java_net_rpcsx_RPCSX_getTitleId(JNIEnv *env, jobject) {
   }
 
   return wrap(env, rpcsxLib.getTitleId());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_net_rpcsx_RPCSX_getTitle(JNIEnv *env, jobject) {
+  // Same as getTitleId: the core may not be loaded yet.
+  if (rpcsxLib.getTitle == nullptr) {
+      return nullptr;
+  }
+
+  return wrap(env, rpcsxLib.getTitle());
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -848,10 +1175,14 @@ Java_net_rpcsx_RPCSX_uninstallGame(JNIEnv *env, jobject, jstring jpath) {
   return rpcsxLib.uninstallGame(unwrap(env, jpath));
 }
 
+// Whether a user-supplied Vulkan driver has a GPU kernel interface to drive here. adrenotools
+// loads any vendor's driver library; what decides it is the kernel side: Adreno's kgsl for Turnip,
+// or Arm's kbase (/dev/mali0) for Mali, which the community PanVK builds for Android talk to
+// directly. Only the driver screen's warning reads this.
 extern "C" JNIEXPORT jboolean JNICALL
 Java_net_rpcsx_RPCSX_supportsCustomDriverLoading(JNIEnv *env,
                                                  jobject instance) {
-  return access("/dev/kgsl-3d0", F_OK) == 0;
+  return access("/dev/kgsl-3d0", F_OK) == 0 || access("/dev/mali0", F_OK) == 0;
 }
 
 // Force the Adreno GPU to its maximum clocks, or release it back to normal scaling.
@@ -887,6 +1218,62 @@ Java_net_rpcsx_RPCSX_getVersion(JNIEnv *env, jobject) {
 }
 
 #if defined(__aarch64__)
+// Whether the driver adrenotools was asked for is the driver it opened.
+//
+// adrenotools opens the driver only when the Vulkan loader first needs one, and when that
+// fails (a library this device cannot link, a pack built against another kernel driver) it
+// logs to logcat and opens the system driver instead. The load looked successful, the emulator
+// logged "Vulkan driver bound (custom)", and Arm's own driver ran: a Mali-G720 user's PanVK
+// pack "worked", with a log identical in every Vulkan line to a run on the system driver.
+//
+// So the loader is made to open its driver now, through the cheapest call that needs one, and
+// the driver file is looked for among the files mapped into this process. By inode and name,
+// since the same file can be reached as /data/data/<pkg> or /data/user/0/<pkg>. When the maps
+// cannot be read the answer is yes, which is what every load was taken for before.
+static bool custom_driver_loaded(void *loader, const std::string &soPath) {
+  struct stat file {};
+  if (::stat(soPath.c_str(), &file) != 0) {
+    return false;
+  }
+
+  using enumerate_fn = int32_t (*)(const char *, uint32_t *, void *);
+  if (auto enumerate = reinterpret_cast<enumerate_fn>(
+          dlsym(loader, "vkEnumerateInstanceExtensionProperties"))) {
+    uint32_t count = 0;
+    enumerate(nullptr, &count, nullptr);
+  }
+
+  std::FILE *maps = std::fopen("/proc/self/maps", "re");
+  if (maps == nullptr) {
+    return true;
+  }
+
+  const std::string name = soPath.substr(soPath.find_last_of('/') + 1);
+  bool found = false;
+  char line[1024];
+
+  while (!found && std::fgets(line, sizeof(line), maps) != nullptr) {
+    // address perms offset dev inode path
+    unsigned long inode = 0;
+    int path_at = 0;
+    if (std::sscanf(line, "%*s %*s %*s %*s %lu %n", &inode, &path_at) != 1 ||
+        inode != file.st_ino) {
+      continue;
+    }
+
+    std::string_view path{line + path_at};
+    while (!path.empty() && (path.back() == '\n' || path.back() == ' ')) {
+      path.remove_suffix(1);
+    }
+
+    found = path.size() > name.size() && path.substr(path.size() - name.size()) == name &&
+            path[path.size() - name.size() - 1] == '/';
+  }
+
+  std::fclose(maps);
+  return found;
+}
+
 // Why a driver will not load, when the answer is knowable before trying.
 //
 // A community driver built against a newer NDK imports symbols versioned against a libc
@@ -1067,10 +1454,24 @@ Java_net_rpcsx_RPCSX_setCustomDriver(JNIEnv *env, jobject, jstring jpath,
               RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM, nullptr, (hookDir + "/").c_str(),
               (path + "/").c_str(), libraryName.c_str(), nullptr, nullptr);
 
-      if (loader == nullptr) {
-          __android_log_print(ANDROID_LOG_INFO, "RPCSX-UI",
-                              "Failed to load custom driver at '%s': %s",
-                              path.c_str(), ::dlerror());
+      if (loader == nullptr || !custom_driver_loaded(loader, path + "/" + libraryName)) {
+          const char *error = ::dlerror();
+          const std::string report =
+              "Custom driver '" + libraryName + "' could not be loaded on this device, so the "
+              "system driver is used instead. The reason is in logcat, under hook_impl" +
+              (error != nullptr ? std::string(": ") + error : std::string("."));
+
+          __android_log_print(ANDROID_LOG_ERROR, "RPCSX-UI", "%s", report.c_str());
+
+          if (rpcsxLib.reportDriverProblem != nullptr) {
+            rpcsxLib.reportDriverProblem(report);
+          }
+
+          // The system driver, bound as itself rather than left behind whatever adrenotools
+          // fell back to, so every later log line names the driver that actually runs. Also
+          // replaces a custom driver an earlier game left bound. false tells the caller the
+          // driver it asked for is not the one in use.
+          rpcsxLib.setCustomDriver(nullptr);
           return false;
       }
   }
@@ -1342,6 +1743,175 @@ Java_net_rpcsx_RPCSX_rpcnStatus(JNIEnv *env, jobject) {
   return env->NewStringUTF(json ? json : "");
 }
 
+extern "C" JNIEXPORT jboolean JNICALL
+Java_net_rpcsx_RPCSX_rpcnSignedIn(JNIEnv *, jobject) {
+  if (!rpcsxLib.rpcnSignedIn) return JNI_FALSE;
+  return rpcsxLib.rpcnSignedIn() ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_net_rpcsx_RPCSX_setMicDevices(JNIEnv *env, jobject, jstring list) {
+  if (!rpcsxLib.setMicDevices) return;
+
+  const char *c = list ? env->GetStringUTFChars(list, nullptr) : nullptr;
+  const std::string value = c ? c : "";
+  if (c) env->ReleaseStringUTFChars(list, c);
+
+  rpcsxLib.setMicDevices(value);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_net_rpcsx_RPCSX_micTestStart(JNIEnv *env, jobject, jstring device) {
+  if (!rpcsxLib.micTestStart) return JNI_FALSE;
+
+  const char *c = device ? env->GetStringUTFChars(device, nullptr) : nullptr;
+  const std::string value = c ? c : "";
+  if (c) env->ReleaseStringUTFChars(device, c);
+
+  return rpcsxLib.micTestStart(value) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jfloat JNICALL
+Java_net_rpcsx_RPCSX_micTestLevel(JNIEnv *, jobject) {
+  return rpcsxLib.micTestLevel ? rpcsxLib.micTestLevel() : -1.0f;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_net_rpcsx_RPCSX_micTestStop(JNIEnv *, jobject) {
+  if (rpcsxLib.micTestStop) rpcsxLib.micTestStop();
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_net_rpcsx_RPCSX_skylanderLoad(JNIEnv *env, jobject, jstring path) {
+  if (!rpcsxLib.skylanderLoad) return -1;
+
+  const char *c = path ? env->GetStringUTFChars(path, nullptr) : nullptr;
+  const std::string value = c ? c : "";
+  if (c) env->ReleaseStringUTFChars(path, c);
+
+  return rpcsxLib.skylanderLoad(value);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_net_rpcsx_RPCSX_skylanderRemove(JNIEnv *, jobject, jint slot) {
+  if (!rpcsxLib.skylanderRemove) return JNI_FALSE;
+  return rpcsxLib.skylanderRemove(slot) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_net_rpcsx_RPCSX_skylanderLight(JNIEnv *, jobject) {
+  return rpcsxLib.skylanderLight ? rpcsxLib.skylanderLight() : 0;
+}
+
+static std::string jstring_to_string(JNIEnv *env, jstring value) {
+  const char *c = value ? env->GetStringUTFChars(value, nullptr) : nullptr;
+  std::string result = c ? c : "";
+  if (c) env->ReleaseStringUTFChars(value, c);
+  return result;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_net_rpcsx_RPCSX_infinityLoad(JNIEnv *env, jobject, jstring path, jint position) {
+  if (!rpcsxLib.infinityLoad) return JNI_FALSE;
+  return rpcsxLib.infinityLoad(jstring_to_string(env, path), position) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_net_rpcsx_RPCSX_infinityRemove(JNIEnv *, jobject, jint position) {
+  if (!rpcsxLib.infinityRemove) return JNI_FALSE;
+  return rpcsxLib.infinityRemove(position) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_net_rpcsx_RPCSX_dimensionsLoad(JNIEnv *env, jobject, jstring path, jint index) {
+  if (!rpcsxLib.dimensionsLoad) return JNI_FALSE;
+  return rpcsxLib.dimensionsLoad(jstring_to_string(env, path), index) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_net_rpcsx_RPCSX_dimensionsRemove(JNIEnv *, jobject, jint index) {
+  if (!rpcsxLib.dimensionsRemove) return JNI_FALSE;
+  return rpcsxLib.dimensionsRemove(index) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_net_rpcsx_RPCSX_skylanderCreate(JNIEnv *env, jobject, jstring path, jint id, jint variant) {
+  if (!rpcsxLib.skylanderCreate) return JNI_FALSE;
+  return rpcsxLib.skylanderCreate(jstring_to_string(env, path), id, variant) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_net_rpcsx_RPCSX_infinityCreate(JNIEnv *env, jobject, jstring path, jint figure, jint series) {
+  if (!rpcsxLib.infinityCreate) return JNI_FALSE;
+  return rpcsxLib.infinityCreate(jstring_to_string(env, path), figure, series) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_net_rpcsx_RPCSX_dimensionsCreate(JNIEnv *env, jobject, jstring path, jint id) {
+  if (!rpcsxLib.dimensionsCreate) return JNI_FALSE;
+  return rpcsxLib.dimensionsCreate(jstring_to_string(env, path), id) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_net_rpcsx_RPCSX_avatarList(JNIEnv *env, jobject) {
+  if (!rpcsxLib.avatarList) return env->NewStringUTF("");
+  const char *json = rpcsxLib.avatarList();
+  return env->NewStringUTF(json ? json : "");
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_net_rpcsx_RPCSX_avatarCurrent(JNIEnv *env, jobject) {
+  if (!rpcsxLib.avatarCurrent) return env->NewStringUTF("");
+  const char *path = rpcsxLib.avatarCurrent();
+  return env->NewStringUTF(path ? path : "");
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_net_rpcsx_RPCSX_avatarImage(JNIEnv *env, jobject, jstring path) {
+  const uint8_t *data = nullptr;
+  size_t size = 0;
+  if (!rpcsxLib.avatarImage || !rpcsxLib.avatarImage(jstring_to_string(env, path), &data, &size)) return nullptr;
+  jbyteArray out = env->NewByteArray(static_cast<jsize>(size));
+  if (out) env->SetByteArrayRegion(out, 0, static_cast<jsize>(size), reinterpret_cast<const jbyte *>(data));
+  return out;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_net_rpcsx_RPCSX_avatarSelect(JNIEnv *env, jobject, jstring path) {
+  if (!rpcsxLib.avatarSelect) return JNI_FALSE;
+  return rpcsxLib.avatarSelect(jstring_to_string(env, path)) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_net_rpcsx_RPCSX_avatarUseImage(JNIEnv *env, jobject, jbyteArray png) {
+  if (!rpcsxLib.avatarUseImage || !png) return JNI_FALSE;
+  std::vector<uint8_t> bytes(static_cast<size_t>(env->GetArrayLength(png)));
+  env->GetByteArrayRegion(png, 0, static_cast<jsize>(bytes.size()), reinterpret_cast<jbyte *>(bytes.data()));
+  return rpcsxLib.avatarUseImage(bytes.data(), bytes.size()) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_net_rpcsx_RPCSX_usbSetPassthrough(JNIEnv *env, jobject, jstring fds) {
+  if (!rpcsxLib.usbSetPassthrough) return;
+
+  const char *c = fds ? env->GetStringUTFChars(fds, nullptr) : nullptr;
+  const std::string value = c ? c : "";
+  if (c) env->ReleaseStringUTFChars(fds, c);
+
+  rpcsxLib.usbSetPassthrough(value);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_net_rpcsx_RPCSX_usbPassedThrough(JNIEnv *, jobject) {
+  return rpcsxLib.usbPassedThrough ? rpcsxLib.usbPassedThrough() : 0;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_net_rpcsx_RPCSX_takeGameError(JNIEnv *env, jobject) {
+  const char *reason = rpcsxLib.takeGameError ? rpcsxLib.takeGameError() : nullptr;
+  return env->NewStringUTF(reason ? reason : "");
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_net_rpcsx_RPCSX_rpcnAddHost(JNIEnv *env, jobject, jstring desc, jstring host) {
   if (!rpcsxLib.rpcnAddHost) return rpcn_unavailable(env);
@@ -1429,10 +1999,42 @@ Java_net_rpcsx_RPCSX_rpcnRemoveFriend(JNIEnv *env, jobject, jstring npid) {
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_net_rpcsx_RPCSX_rpcnGetFriends(JNIEnv *env, jobject) {
-  if (!rpcsxLib.rpcnGetFriends) return env->NewStringUTF("[]");
+  if (!rpcsxLib.rpcnGetFriends) return env->NewStringUTF("{}");
 
   const char *msg = rpcsxLib.rpcnGetFriends();
+  return env->NewStringUTF(msg ? msg : "{}");
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_net_rpcsx_RPCSX_rpcnGetInvites(JNIEnv *env, jobject) {
+  if (!rpcsxLib.rpcnGetInvites) return env->NewStringUTF("[]");
+
+  const char *msg = rpcsxLib.rpcnGetInvites();
   return env->NewStringUTF(msg ? msg : "[]");
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_net_rpcsx_RPCSX_rpcnAcceptInvite(JNIEnv *env, jobject, jlong id) {
+  if (!rpcsxLib.rpcnAcceptInvite) return rpcn_unavailable(env);
+
+  const char *msg = rpcsxLib.rpcnAcceptInvite(static_cast<uint64_t>(id));
+  return env->NewStringUTF(msg ? msg : "");
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_net_rpcsx_RPCSX_rpcnDeclineInvite(JNIEnv *env, jobject, jlong id) {
+  if (!rpcsxLib.rpcnDeclineInvite) return rpcn_unavailable(env);
+
+  const char *msg = rpcsxLib.rpcnDeclineInvite(static_cast<uint64_t>(id));
+  return env->NewStringUTF(msg ? msg : "");
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_net_rpcsx_RPCSX_rpcnFriendsSession(JNIEnv *env, jobject, jboolean open) {
+  if (!rpcsxLib.rpcnFriendsSession) return rpcn_unavailable(env);
+
+  const char *msg = rpcsxLib.rpcnFriendsSession(open == JNI_TRUE);
+  return env->NewStringUTF(msg ? msg : "");
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -1505,6 +2107,24 @@ Java_net_rpcsx_RPCSX_rpcnResetPassword(JNIEnv *env, jobject, jstring npid, jstri
 
   const std::string n = str(npid), t = str(token), p = str(password);
   const char *msg = rpcsxLib.rpcnResetPassword(n, t, p);
+  return env->NewStringUTF(msg ? msg : "");
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_net_rpcsx_RPCSX_rpcnSignIn(JNIEnv *env, jobject, jstring host, jstring npid, jstring password,
+                                jstring token) {
+  if (!rpcsxLib.rpcnSignIn) return rpcn_unavailable(env);
+
+  auto str = [&](jstring s) -> std::string {
+    if (!s) return {};
+    const char *c = env->GetStringUTFChars(s, nullptr);
+    std::string out = c ? c : "";
+    if (c) env->ReleaseStringUTFChars(s, c);
+    return out;
+  };
+
+  const std::string h = str(host), n = str(npid), p = str(password), t = str(token);
+  const char *msg = rpcsxLib.rpcnSignIn(h, n, p, t);
   return env->NewStringUTF(msg ? msg : "");
 }
 

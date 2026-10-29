@@ -181,6 +181,7 @@ namespace rsx
 			add_checkbox(&g_cfg.core.rsx_accurate_res_access, localized_string_id::HOME_MENU_SETTINGS_ADVANCED_ACCURATE_RSX_RESERVATION_ACCESS);
 			add_dropdown(&g_cfg.core.sleep_timers_accuracy, localized_string_id::HOME_MENU_SETTINGS_ADVANCED_SLEEP_TIMERS_ACCURACY);
 			add_signed_slider(&g_cfg.core.max_spurs_threads, localized_string_id::HOME_MENU_SETTINGS_ADVANCED_MAX_SPURS_THREADS, "", 1);
+			add_unsigned_slider(&g_cfg.core.ppu_event_wakeup_delay, localized_string_id::HOME_MENU_SETTINGS_ADVANCED_PPU_EVENT_WAKE_UP_DELAY, " µs", 1);
 
 			add_unsigned_slider(&g_cfg.video.driver_wakeup_delay, localized_string_id::HOME_MENU_SETTINGS_ADVANCED_DRIVER_WAKE_UP_DELAY, " µs", 20, {}, {}, g_cfg.video.driver_wakeup_delay.min, 800);
 			add_signed_slider(&g_cfg.video.vblank_rate, localized_string_id::HOME_MENU_SETTINGS_ADVANCED_VBLANK_FREQUENCY, " Hz", 30, {}, 30);
@@ -226,6 +227,7 @@ namespace rsx
 			add_checkbox(&g_cfg.misc.show_rpcn_popups, localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_RPCN_POPUPS);
 			add_checkbox(&g_cfg.misc.show_shader_compilation_hint, localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_SHADER_COMPILATION_HINT);
 			add_checkbox(&g_cfg.misc.show_ppu_compilation_hint, localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_PPU_COMPILATION_HINT);
+			add_checkbox(&g_cfg.misc.show_spu_compilation_hint, localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_SPU_COMPILATION_HINT);
 			add_checkbox(&g_cfg.misc.show_autosave_autoload_hint, localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_AUTO_SAVE_LOAD_HINT);
 			add_checkbox(&g_cfg.misc.show_pressure_intensity_toggle_hint, localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_PRESSURE_INTENSITY_TOGGLE_HINT);
 			add_checkbox(&g_cfg.misc.show_analog_limiter_toggle_hint, localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_ANALOG_LIMITER_TOGGLE_HINT);

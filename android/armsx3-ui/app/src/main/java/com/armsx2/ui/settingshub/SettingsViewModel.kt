@@ -30,16 +30,37 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         InGameOverlay.currentSerial.value = serial
         InGameOverlay.settingsScope.value = if (serial == null) SettingsScope.Global else SettingsScope.Game
         settings.value = if (serial == null) ConfigStore.loadGlobal() else ConfigStore.resolveForGame(serial)
-        uiState.value = SettingsUiState(
-            category = if (game != null && category == SettingsCategory.General) SettingsCategory.Performance else category,
-            game = game,
-        )
+        // General is the generic "open settings" entry every menu uses, so reopen on the category
+        // last shown instead (ARMSX2 #729): changing a setting, trying it in the game and coming
+        // back used to land on General every time. A caller that asks for a specific category
+        // (the in-game Skins shortcut) still gets it. A remembered tab this scope doesn't show
+        // (Info and Mods need a game, About has none) gives way to General.
+        val remembered = lastCategory?.takeIf { category == SettingsCategory.General && shownIn(it, game != null) }
+        val start = remembered ?: category
+        val shown = if (game != null && start == SettingsCategory.General) SettingsCategory.Performance else start
+        lastCategory = shown
+        uiState.value = SettingsUiState(category = shown, game = game)
     }
 
     fun selectCategory(category: SettingsCategory) {
         // Nav tick when flipping to a different settings tab (controller bumpers, tap, or search jump).
         if (category != uiState.value.category) com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.NAV)
         uiState.value = uiState.value.copy(category = category)
+        lastCategory = category
+    }
+
+    private companion object {
+        /** The category last shown, for the life of the process. Not in the view-model's own state:
+         *  the library's settings route gets a fresh view-model on every visit. */
+        var lastCategory: SettingsCategory? = null
+
+        /** Whether the tab row shows [category] with or without a game, as SettingsCategoryBar
+         *  filters it. */
+        fun shownIn(category: SettingsCategory, forGame: Boolean): Boolean = when (category) {
+            SettingsCategory.Info, SettingsCategory.Mods -> forGame
+            SettingsCategory.About -> !forGame
+            else -> true
+        }
     }
 
     /**
@@ -56,6 +77,12 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         // General -> Performance under a game scope, so reading it here would reset the wrong
         // (or no) tab.
         if (!categoryHasResettableSettings(category)) return
+        // The running game's resolved settings before the reset, so the live push below writes
+        // only what the reset changed for it (Settings.applyChangesSince).
+        val runningKey = com.armsx2.ui.InGameOverlay.currentSerial.value
+        val runningBefore = if (MainActivityRuntime.nativeReady.value &&
+            MainActivityRuntime.eState.value != EmuState.STOPPED
+        ) runCatching { ConfigStore.resolveForGame(runningKey) }.getOrNull() else null
         val serial = uiState.value.game?.settingsKey
         if (serial != null) {
             // Per-game: drop just this tab's override keys, so those settings fall back to
@@ -84,7 +111,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 // In-game: re-apply live so the change shows immediately, then regenerate the
                 // running game's INI for the next boot (mirrors InGameOverlay.saveSettings).
                 gameSerial != null && running -> {
-                    settings.value.applyTo()
+                    pushToRunningGame(runningKey, runningBefore)
                     ConfigStore.resolveForGame(gameSerial).writeGameSettingsIni(ConfigStore.loadGlobal())
                 }
                 // From the library (no VM): the INI can't be reached through a running game, so
@@ -93,8 +120,15 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 gameSerial != null -> ConfigStore.resolveForGame(gameSerial)
                     .writeGameSettingsIni(ConfigStore.loadGlobal(), gameSerial)
                 // Global scope with a game live: re-apply the reset globals to the base layer.
-                running -> settings.value.applyTo()
+                running -> pushToRunningGame(runningKey, runningBefore)
             }
         }
+    }
+
+    /** The running game's resolved settings now, written live as only what differs from [before].
+     *  Without a [before] (none could be resolved) every key goes, as it always did. */
+    private fun pushToRunningGame(runningKey: String?, before: com.armsx2.config.Settings?) {
+        val after = ConfigStore.resolveForGame(runningKey)
+        if (before != null) after.applyChangesSince(before) else after.applyTo()
     }
 }

@@ -1134,6 +1134,16 @@ namespace utils
 			if (!mapped)
 			{
 				mapped = this->map(nullptr, prot);
+
+				if (!mapped)
+				{
+					if ((ptr = m_ptr))
+					{
+						break;
+					}
+
+					return nullptr;
+				}
 			}
 
 			// Install mapped memory

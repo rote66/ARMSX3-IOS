@@ -3,6 +3,7 @@
 
 #include "Emu/emu_callbacks.h"
 #include "Emu/System.h"
+#include "Emu/android_app_state.h"
 #include "Emu/system_config.h"
 #include "Emu/Cell/PPUModule.h"
 #include "Emu/Cell/lv2/sys_event.h"
@@ -1419,7 +1420,7 @@ error_code cellCameraReadEx(s32 dev_num, vm::ptr<CellCameraReadEx> read)
 			u64 frame_number{};
 			u64 bytes_read{};
 
-			if (!g_camera.get_camera_frame(g_camera.info.buffer.get_ptr(), width, height, frame_number, bytes_read))
+			if (!g_camera.get_camera_frame(g_camera.info.buffer ? g_camera.info.buffer.get_ptr() : nullptr, width, height, frame_number, bytes_read))
 			{
 				return CELL_CAMERA_ERROR_DEVICE_NOT_FOUND;
 			}
@@ -1665,7 +1666,11 @@ void camera_context::operator()()
 
 		if (!init || !fps || Emu.IsPausedOrReady() || g_cfg.io.camera == camera_handler::null)
 		{
-			thread_ctrl::wait_for(1000); // hack
+			// ARMSX3: 1 ms made this the busiest thread of a paused game in a locked device, 1,100
+			// wakeups a second (#196). With no camera handler (the default, and all Android has)
+			// nothing can ever stream, and a game paused out of sight cannot resume until it is back.
+			const bool long_idle = g_cfg.io.camera == camera_handler::null || (g_android_app_backgrounded && Emu.IsPaused());
+			thread_ctrl::wait_for(long_idle ? (g_android_app_backgrounded ? 250'000 : 100'000) : 1000); // hack
 			continue;
 		}
 
@@ -1998,7 +2003,7 @@ bool camera_context::on_handler_state(camera_handler_base::camera_handler_state 
 	{
 		if (!is_attached)
 		{
-			cellCamera.warning("Camera handler not attached. Sending attach event...", static_cast<int>(state));
+			cellCamera.warning("Camera handler not attached (state=%d). Sending attach event...", static_cast<int>(state));
 			is_attached = true;
 			is_attached_dirty = true;
 		}

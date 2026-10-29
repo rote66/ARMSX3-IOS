@@ -49,6 +49,7 @@ private:
 		case localized_string_id::RSX_OVERLAYS_COMPILING_SHADERS_OPENGL_BUILD: return tr("Building variant %0...").arg(std::forward<Args>(args)...);
 		case localized_string_id::RSX_OVERLAYS_COMPILING_SHADERS_OPENGL_LINK: return tr("Linking variant %0...").arg(std::forward<Args>(args)...);
 		case localized_string_id::RSX_OVERLAYS_COMPILING_PPU_MODULES: return tr("Compiling PPU Modules");
+		case localized_string_id::RSX_OVERLAYS_COMPILING_SPU_CODE: return tr("Compiling SPU Code");
 		case localized_string_id::RSX_OVERLAYS_MSG_DIALOG_YES: return tr("Yes", "Message Dialog");
 		case localized_string_id::RSX_OVERLAYS_MSG_DIALOG_NO: return tr("No", "Message Dialog");
 		case localized_string_id::RSX_OVERLAYS_MSG_DIALOG_CANCEL: return tr("Back", "Message Dialog");
@@ -270,6 +271,7 @@ private:
 		case localized_string_id::HOME_MENU_SETTINGS_ADVANCED_SLEEP_TIMERS_ACCURACY: return tr("Sleep Timers Accuracy", "Advanced");
 		case localized_string_id::HOME_MENU_SETTINGS_ADVANCED_RSX_MEMORY_TILING: return tr("Handle RSX Memory Tiling", "Advanced");
 		case localized_string_id::HOME_MENU_SETTINGS_ADVANCED_MAX_SPURS_THREADS: return tr("Max SPURS Threads", "Advanced");
+		case localized_string_id::HOME_MENU_SETTINGS_ADVANCED_PPU_EVENT_WAKE_UP_DELAY: return tr("PPU Event Wake-Up Delay", "Advanced");
 		case localized_string_id::HOME_MENU_SETTINGS_ADVANCED_DRIVER_WAKE_UP_DELAY: return tr("Driver Wake-Up Delay", "Advanced");
 		case localized_string_id::HOME_MENU_SETTINGS_ADVANCED_VBLANK_FREQUENCY: return tr("VBlank Frequency", "Advanced");
 		case localized_string_id::HOME_MENU_SETTINGS_ADVANCED_VBLANK_NTSC: return tr("VBlank NTSC Fixup", "Advanced");
@@ -278,6 +280,7 @@ private:
 		case localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_RPCN_POPUPS: return tr("Show RPCN Popups", "Overlays");
 		case localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_SHADER_COMPILATION_HINT: return tr("Show Shader Compilation Hint", "Overlays");
 		case localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_PPU_COMPILATION_HINT: return tr("Show PPU Compilation Hint", "Overlays");
+		case localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_SPU_COMPILATION_HINT: return tr("Show SPU Compilation Hint", "Overlays");
 		case localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_AUTO_SAVE_LOAD_HINT: return tr("Show Autosave/Autoload Hint", "Overlays");
 		case localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_PRESSURE_INTENSITY_TOGGLE_HINT: return tr("Show Pressure Intensity Toggle Hint", "Overlays");
 		case localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_ANALOG_LIMITER_TOGGLE_HINT: return tr( "Show Analog Limiter Toggle Hint", "Overlays");

@@ -264,6 +264,7 @@ class GameLibraryRepository(private val context: Context) {
         val reprobeImages = probedSchema < DiscGamesSchemaVersion &&
             MainActivityRuntime.eState.value == com.armsx2.EmuState.STOPPED
         reprobeFallback.clear()
+        owesProbes = false
 
         // A serial is an identity: two different games cannot hold the same one. When two cached
         // entries do, at least one of them is wrong.
@@ -345,15 +346,22 @@ class GameLibraryRepository(private val context: Context) {
 
         val collected = linkedMapOf<String, GameInfo>()
         userPlaylistDiscs.clear()
+        listedDirectories.clear()
         android.util.Log.i(ScanTag, "scan start: ${directories.size} dir(s), rawStorage=${canUseRawStorage()}")
         directories.forEach { rawUri ->
             val uri = runCatching { rawUri.toUri() }.getOrNull() ?: return@forEach
-            val posix = MainActivityRuntime.resolveTreeUriToPosix(rawUri)
+            // A folder chosen in our own browser (devices without the system folder picker) is
+            // stored as a plain path rather than a tree URI.
+            val posix = MainActivityRuntime.resolveTreeUriToPosix(rawUri) ?: rawUri.takeIf { it.startsWith("/") }
             val rawRoot = if (canUseRawStorage()) posix?.let(::File) else null
             android.util.Log.i(ScanTag, "dir=$rawUri -> posix=$posix isDir=${rawRoot?.isDirectory}")
             if (rawRoot?.isDirectory == true) {
                 shieldFromMediaScanner(rawRoot)
                 scanRawDirectory(rawRoot, collected, 0)
+            } else if (rawUri.startsWith("/")) {
+                // A path has no document tree to fall back to: All files access is the only way
+                // to read it.
+                android.util.Log.w(ScanTag, "  $rawUri is a folder path and All files access is not granted; skipped")
             } else {
                 // SAF fallback. Games found this way are LISTED but the core cannot boot them:
                 // it opens games with ordinary file IO and a document tree has no path to open.
@@ -412,6 +420,7 @@ class GameLibraryRepository(private val context: Context) {
                 // Only once the re-probe has actually run. Skipped because a game was loaded, it
                 // is still owed, and the next scan tries again.
                 if (reprobeImages) MainActivityRuntime.prefs.edit { putInt(ProbedSchemaKey, ScanSchemaVersion) }
+                MainActivityRuntime.prefs.edit { putBoolean(ProbesOwedKey, owesProbes) }
             }
     }
 
@@ -517,6 +526,7 @@ class GameLibraryRepository(private val context: Context) {
         depth: Int,
     ) {
         if (depth > MaxScanDepth) return
+        listedDirectories += directory.uri.toString() to runCatching { directory.lastModified() }.getOrDefault(0L)
         val children = runCatching { directory.listFiles() }.getOrNull() ?: return
         // Asked only once a child is named like one of a data folder's own folders: listing the
         // tree again for every directory would double the cost of scanning a large SAF folder.
@@ -655,6 +665,7 @@ class GameLibraryRepository(private val context: Context) {
      * still have the debris. A direct child here is a title or it is not listed.
      */
     private fun scanInstalledTitles(directory: File, output: MutableMap<String, GameInfo>) {
+        listedDirectories += directory.absolutePath to directory.lastModified()
         val children = runCatching { directory.listFiles() }.getOrNull() ?: return
         children.forEach { file ->
             if (!file.isDirectory) return@forEach
@@ -696,6 +707,7 @@ class GameLibraryRepository(private val context: Context) {
         depth: Int,
     ) {
         if (depth > MaxScanDepth) return
+        listedDirectories += directory.absolutePath to directory.lastModified()
         val children = runCatching { directory.listFiles() }.getOrNull() ?: return
         val dataFolder by lazy { isDataFolder(directory) }
         children.forEach { file ->
@@ -1238,6 +1250,15 @@ class GameLibraryRepository(private val context: Context) {
         android.util.Log.i(ScanTag, "  probeDiscInfo('$label') -> $raw")
         if (raw == null) return reprobeFallback.remove(path)?.also { discInfoCache[path] = it }
 
+        // The core mounts nothing while it is booting, running or compiling, and the firmware
+        // compile that follows setup is long enough that a new user's first scan lands in it.
+        // Nothing is wrong with the disc, so nothing is cached for it: the scan records that it
+        // owes a probe, and the library scans again once the core is idle (HomeViewModel).
+        if (runCatching { JSONObject(raw).optBoolean("busy") }.getOrDefault(false)) {
+            owesProbes = true
+            return reprobeFallback.remove(path)
+        }
+
         val info = runCatching {
             val o = JSONObject(raw)
             val id = o.optString("titleId")
@@ -1301,10 +1322,70 @@ class GameLibraryRepository(private val context: Context) {
 
     private val discInfoCache = HashMap<String, DiscInfo>()
 
+    /** Set by probeDisc when the core was too busy to mount an image; see [probesOwed]. */
+    @Volatile
+    private var owesProbes = false
+
+    /**
+     * True when the last scan met a busy core and listed discs it could not read, with no title
+     * ID and so no title or cover. Kept in preferences, so an app closed before the rescan still
+     * owes it on the next launch.
+     */
+    fun probesOwed(): Boolean = MainActivityRuntime.prefs.getBoolean(ProbesOwedKey, false)
+
     /** What the cache knew about an image this scan chose to re-probe, by probe path. Used only
      *  if the probe comes back empty -- a boot can start mid-scan, and the probe refuses to
      *  mount then -- so a failed re-probe never demotes a game to a filename guess. */
     private val reprobeFallback = HashMap<String, DiscInfo>()
+
+    /**
+     * Every directory the scan listed, with its modification time, read before it was listed.
+     * Adding, removing or renaming a file changes its directory's time, so comparing these later
+     * is how the library notices a disc swapped in a folder it already knew (an .iso replaced
+     * by its .chd) without walking the folders again. The cache key only follows the folder list.
+     */
+    private val listedDirectories = mutableListOf<Pair<String, Long>>()
+
+    /**
+     * Whether anything the last scan listed has changed since: a directory's time moved, or one
+     * that was missing then (a card not yet mounted reads 0) is there now. Stats only the
+     * recorded directories, so it is cheap enough to ask on every return to the library. True
+     * for a cache saved before directories were recorded, so that one scan records them.
+     */
+    fun changedSinceScan(): Boolean {
+        val listed = MainActivityRuntime.prefs.getString(ListedDirectoriesKey, null)
+            ?.let { runCatching { JSONArray(it) }.getOrNull() }
+            ?: return true
+        for (index in 0 until listed.length()) {
+            val entry = listed.optJSONArray(index) ?: return true
+            val where = entry.optString(0)
+            val recorded = entry.optLong(1)
+            val now = if (where.startsWith("content:")) {
+                runCatching { DocumentFile.fromSingleUri(context, where.toUri())?.lastModified() }.getOrNull() ?: 0L
+            } else {
+                File(where).lastModified()
+            }
+            // Gone now. A deleted folder changed the one that held it, which says so itself, and a
+            // card that is not mounted is no reason to rescan its games out of the library.
+            if (now == 0L) continue
+            if (now != recorded) {
+                android.util.Log.i(ScanTag, "changed since the last scan: '$where'")
+                return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * Entries whose file is gone while the folder that held it is still there: a disc deleted,
+     * or replaced by another. Only games on a path. A missing folder is more likely a card that
+     * is not mounted yet than games that were deleted, so those stay.
+     */
+    fun missingGames(games: List<GameInfo>): Set<String> = games.mapNotNull { game ->
+        if (game.uri.scheme != "file") return@mapNotNull null
+        val file = File(game.uri.path ?: return@mapNotNull null)
+        game.uri.toString().takeIf { !file.exists() && file.parentFile?.isDirectory == true }
+    }.toSet()
 
     private fun saveCache(directories: List<String>, games: List<GameInfo>) {
         val array = JSONArray()
@@ -1324,9 +1405,12 @@ class GameLibraryRepository(private val context: Context) {
                 put("drmFree", game.drmFree)
             })
         }
+        val listed = JSONArray()
+        listedDirectories.forEach { (where, time) -> listed.put(JSONArray().put(where).put(time)) }
         MainActivityRuntime.prefs.edit {
             putString("gamesCacheKey", cacheKey(directories))
                 .putString("gamesCache", array.toString())
+                .putString(ListedDirectoriesKey, listed.toString())
             }
     }
 
@@ -1383,7 +1467,10 @@ class GameLibraryRepository(private val context: Context) {
         const val DiscGamesSchemaVersion = 9
         /** The scanner version whose disc-image probe has run over this library. */
         const val ProbedSchemaKey = "gamesProbedSchema"
+        const val ProbesOwedKey = "library.probesOwed"
         const val ScanTag = "ARMSX3-Scan"
+        /** The directories the last scan listed, with their times (see [changedSinceScan]). */
+        const val ListedDirectoriesKey = "gamesCacheDirs"
         /** Staging name for an extracted icon, renamed once the title ID is known. */
         const val PendingIcon = "__pending"
         const val MaxScanDepth = 12

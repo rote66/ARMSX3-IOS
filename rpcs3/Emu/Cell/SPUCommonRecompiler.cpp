@@ -19,6 +19,7 @@
 #include "util/shared_ptr.hpp"
 
 #include "Emu/Cell/Modules/cellSync.h"
+#include "Emu/Cell/timers.hpp"
 
 #include "SPUThread.h"
 #include "SPUAnalyser.h"
@@ -1240,6 +1241,14 @@ void spu_cache::initialize(bool build_existing_cache)
 
 	// Read cache
 	auto func_list = cache.get();
+
+	// Remove duplicates (the runtime treats equal programs as the same function anyway)
+	std::sort(func_list.begin(), func_list.end());
+	func_list.erase(std::unique(func_list.begin(), func_list.end()), func_list.end());
+
+	// Build the biggest programs first, so that they don't end up running alone at the end
+	std::stable_sort(func_list.begin(), func_list.end(), FN(x.data.size() > y.data.size()));
+
 	atomic_t<usz> fnext{};
 	atomic_t<u8> fail_flag{0};
 
@@ -1264,6 +1273,21 @@ void spu_cache::initialize(bool build_existing_cache)
 	}
 	else if (!build_existing_cache)
 	{
+		return;
+	}
+	else if (!g_cfg.core.spu_cache && !is_debug)
+	{
+		// ARMSX3: SPU Cache off leaves the saved list unbuilt as well, so every function compiles
+		// when it is first run. Upstream only stops adding to the list and still builds whatever
+		// it already holds, so for a game that had one, turning the option off changed nothing.
+		// Blades of Time (BLUS30833) needs it off for real: with its whole list built before the
+		// game starts, its JobMgr#1 thread reads a null pointer 0.1 s in and the emulator
+		// freezes, on every boot after the first.
+		if (!func_list.empty())
+		{
+			spu_log.notice("SPU Cache is off: %u saved SPU functions in %s are not built", func_list.size(), loc);
+		}
+
 		return;
 	}
 	else if (!compile_discovered_data)
@@ -1969,9 +1993,11 @@ spu_runtime::spu_runtime()
 		const u32 xfloat = static_cast<u32>(g_cfg.core.spu_xfloat_accuracy.get());
 		const u32 block_size = static_cast<u32>(g_cfg.core.spu_block_size.get());
 		const u32 clocks_scale = static_cast<u32>(g_cfg.core.clocks_scale.get()); // gates the RdDec fast path
+		const u32 mfc_shuffling = static_cast<u32>(g_cfg.core.mfc_transfers_shuffling.get()); // MFC shuffle checks and queue limit
 		fold(xfloat);
 		fold(block_size);
 		fold(clocks_scale);
+		fold(mfc_shuffling);
 
 		const u32 flags =
 			(static_cast<u32>(g_cfg.core.use_accurate_dfma.get())         << 0) |
@@ -2820,6 +2846,46 @@ spu_recompiler_base::~spu_recompiler_base()
 {
 }
 
+#ifdef ARCH_ARM64
+// Pause Game During SPU Compilation, a per-game setting (off unless a game's entry turns it on).
+//
+// On a PS3 SPU code is already machine code, so an SPU answers the PPU within microseconds. Here
+// code an SPU reaches for the first time is compiled on the spot, which on a phone takes tens to
+// hundreds of milliseconds, and the rest of the game keeps running meanwhile. Blitz: The League II
+// cannot take that: its PPU hands work to three raw SPUs, runs ahead while one of them compiles,
+// and the raw SPUs end in stop 0x1300 with their interrupt handlers' sys_mutex_lock failing
+// (ESRCH); the install, or the boot, then waits forever. It only happened while a raw SPU was
+// compiling new code, and a run with that code already cached went through (Odin 3, 10-19).
+// Holding every other guest thread for the length of the compile makes it take no time as far as
+// the game's threads can tell. The guest clock still moves: the JITs bake the timebase offset, so
+// winding it back is not safe.
+static spu_function_t compile_spu_llvm_paused(spu_thread& spu, const spu_program& program)
+{
+	static thread_local bool t_logged = false;
+	const u64 start = get_system_time();
+
+	// When another thread is already suspending everyone, it runs this for us with our compiler
+	// while we are parked, so the compiler is still only used by one thread at a time.
+	const auto func = cpu_thread::suspend_all(&spu, {}, [&]
+	{
+		return compile_spu_llvm_with_retry(spu.jit, program);
+	});
+
+	const u64 took = get_system_time() - start;
+
+	if (!std::exchange(t_logged, true))
+	{
+		spu_log.success("Pause Game During SPU Compilation: the game paused %u us while this SPU compiled 0x%05x.", took, program.entry_point);
+	}
+	else if (took >= 100'000)
+	{
+		spu_log.warning("Pause Game During SPU Compilation: the game paused %u ms while this SPU compiled 0x%05x.", took / 1000, program.entry_point);
+	}
+
+	return func;
+}
+#endif
+
 void spu_recompiler_base::dispatch(spu_thread& spu, void*, u8* rip)
 {
 	// If code verification failed from a patched patchpoint, clear it with a dispatcher jump
@@ -2933,7 +2999,7 @@ void spu_recompiler_base::dispatch(spu_thread& spu, void*, u8* rip)
 #endif
 	auto program = spu.jit->analyse(spu._ptr<u32>(0), spu.pc);
 #ifdef ARCH_ARM64
-	const auto func = compile_spu_llvm_with_retry(spu.jit, program);
+	const auto func = g_cfg.core.spu_compile_pause ? compile_spu_llvm_paused(spu, program) : compile_spu_llvm_with_retry(spu.jit, program);
 #else
 	const auto func = spu.jit->compile(std::move(program));
 #endif
@@ -9573,10 +9639,56 @@ spu_program spu_recompiler_base::analyse(const be_t<u32>* ls, u32 entry_point, s
 		// The whitelist is keyed by guest-code hash, and CellSpurs is Sony's shared library, so an
 		// entry added for one game turns on for every game that links the same routine. Anything
 		// listed here is confined to the title it was measured on until it has been disassembled.
-		const auto pattern_is_title_gated = [](std::string_view h) -> std::string_view
+		// The Elder Scrolls V: Skyrim, measured on the Legendary Edition (BLUS31202). Its SPURS jobs run these PUTLLC loops
+		// constantly, and each refused one took the global writer_lock barrier: ~600k barriers a second,
+		// up to 108 ms a second of PPU waits and single waits of 47 ms, felt as hitches and audio stutter
+		// (Odin 3, 2026-10-27). Each was disassembled from the game's SPU cache and is case 1 below: one
+		// quadword loaded, changed and stored back, nothing else in the 128-byte line read in the loop or
+		// right after it. Refused on the same check: KcM83pJwMk (reads one quadword, writes another),
+		// 29fH7T6a4g and ZoxgLMFeg2 (read another quadword of the line right after the commit), and 620o.
+		// Gated to Skyrim because several are shared atomic helpers whose other callers are unchecked.
+		// Every release is listed: the original (patched to 1.09) and the Legendary Edition are the same
+		// engine build, and a release whose SPU code differs at all matches none of these hashes.
+		static constexpr std::string_view s_skyrim_titles[] =
 		{
-			if (h == "620oYSe8uQqq9eTkhWfMqoEXX0us"sv) return "BLUS30736"sv; // Soulcalibur V
-			return {};
+			"BLUS31202"sv, "BLES01885"sv, "BLES01886"sv, // Legendary Edition
+			"BLUS30778"sv, "BLES01329"sv, "BLES01330"sv, // the original release
+		};
+
+		static constexpr std::string_view s_skyrim_patterns[] =
+		{
+			"7CYy1Z90VX7dZFY6kVj8K9GNoF7j"sv, // OR into two halfwords
+			"UFURPWe0PJn33pQrnA1uCvs90Cp2"sv, // 32-bit decrement, returns the old value
+			"6QJXWujvpQZ5ELepgGjGkbT8Q5L9"sv, // 32-bit add, returns the old value
+			"TGbz6z8agWq0Cj8imx7t842cVr35"sv, // 32-bit increment, returns the old value
+			"foMGepN0zGHPhhxahvcQXqittkZo"sv, // 32-bit OR, returns the old value
+			"5usgHpKNU2ZCNdy2NUxV4VF7e9uK"sv, // 16-bit increment
+			"3YiHWkYZG4n4GAN9qr8FMLg9S3LM"sv, // saturating byte add
+			"0ufxr18soJFU57mPncwUtGaLKHCJ"sv, // saturating byte add
+			"3VV9Sfbt67RVQpb2kZngKTh4qS8q"sv, // byte bit set
+			"PdRpiE1AFai4RJ9LgEZ8xXrsecQT"sv, // 32-bit field update
+			"sbne73ERLK7k4sALrpEEZQUTGas8"sv, // byte store unless the byte is 0xff
+			"mGg3dYWtVpn3tLcdx2ygsKEpvuqf"sv, // byte store
+			"0wHeUEWZCT14w6FM7od6KX1LKm5z"sv, // 64-bit add when the rest of the quadword is zero, 7 copies:
+			"2mFGbVHMzS04gt9grTZ772JA96EW"sv,
+			"G5HMcMfinTzqUMuKYue2Ea3iiwE7"sv,
+			"NAZKHqqTQurTF66K4X20YbNeyERN"sv,
+			"Ym49FkT7PE9SZpGKWSyzZCRHFuCY"sv,
+			"i8ZH5UuruSu5enEQX3KuhaUMP3GZ"sv,
+			"s2m83ehX3XuAeQv8KJcdkqVGEdMM"sv,
+		};
+
+		const auto is_skyrim_pattern = [](std::string_view h)
+		{
+			return std::find(std::begin(s_skyrim_patterns), std::end(s_skyrim_patterns), h) != std::end(s_skyrim_patterns);
+		};
+
+		// Whether a gated pattern may run in the title being compiled; ungated ones run everywhere.
+		const auto pattern_allowed_in_title = [&](std::string_view h, std::string_view title) -> bool
+		{
+			if (h == "620oYSe8uQqq9eTkhWfMqoEXX0us"sv) return title == "BLUS30736"sv; // Soulcalibur V
+			if (is_skyrim_pattern(h)) return std::find(std::begin(s_skyrim_titles), std::end(s_skyrim_titles), title) != std::end(s_skyrim_titles);
+			return true;
 		};
 
 		// The whitelist runs in BOTH reservation modes.
@@ -9678,17 +9790,12 @@ spu_program spu_recompiler_base::analyse(const be_t<u32>* ls, u32 entry_point, s
 				"WA0WuYLrZXrcc6Jyw5EMgYRV2bwo"sv,
 			};
 
-			allow_pattern = std::any_of(allowed_patterns.begin(), allowed_patterns.end(), FN(pattern_hash == x));
+			allow_pattern = std::any_of(allowed_patterns.begin(), allowed_patterns.end(), FN(pattern_hash == x)) || is_skyrim_pattern(pattern_hash);
 
-			if (allow_pattern)
+			if (allow_pattern && !pattern_allowed_in_title(pattern_hash, Emu.GetTitleID()))
 			{
-				if (const auto only_title = pattern_is_title_gated(pattern_hash);
-					!only_title.empty() && Emu.GetTitleID() != only_title)
-				{
-					// Admitted on measured benefit, not proven safety, so it stays on the one
-					// title it was measured on.
-					allow_pattern = false;
-				}
+				// A gated pattern stays on the titles it was checked or measured on.
+				allow_pattern = false;
 			}
 		}
 

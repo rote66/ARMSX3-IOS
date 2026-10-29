@@ -202,6 +202,12 @@ data class Ps3Settings(
     /** cubeb backend: 0 auto, 1 aaudio, 2 opensl, 3 audiotrack. Auto reaches AAudio on
      *  anything modern; opensl trades latency for far fewer underruns on weak devices. */
     val audioCubebBackend: Int = 0,
+    /** Index into Rpcs3Settings.MIC_TYPES: 0 Off, 1 Standard, 2 SingStar, 3 Real SingStar, 4 Rocksmith. */
+    val micType: Int = 0,
+    /** A MicDevices name, or "Default" for the microphone Android picks (a USB one when plugged in). */
+    val micDevice1: String = "Default",
+    /** SingStar's second singer, the same kind of name; empty for none. */
+    val micDevice2: String = "",
     /** Pin Adreno to max clocks: removes DVFS ramp-up stutter in GPU-bound scenes, costs heat
      *  and battery. Off by default, matching the RPCSX fork this came from. */
     val gpuTurbo: Boolean = false,
@@ -209,6 +215,9 @@ data class Ps3Settings(
      *  log heavily, but it also destroys the only artifact a bug report can carry, so it is
      *  off by default and the UI says so plainly. */
     val silenceAllLogs: Boolean = false,
+    // On-screen notices while shaders and SPU code compile during play (core Miscellaneous).
+    val showShaderCompileHint: Boolean = true,
+    val showSpuCompileHint: Boolean = true,
     val netEnabled: Boolean = false,
     /** Net/PSN status: 0 = Disconnected, 1 = Simulated, 2 = RPCN.
      *
@@ -1033,8 +1042,13 @@ data class Settings(
      *  field→EmuCore-key mapping for the export — no duplicated key list. */
     private fun put(section: String, key: String, type: String, value: String) {
         val sink = emitSink
-        if (sink != null) sink(section, key, type, value)
-        else NativeApp.setSetting(section, key, type, value)
+        if (sink != null) {
+            sink(section, key, type, value)
+            return
+        }
+        // An in-game change writes only the keys it changed: see applyChangesSince.
+        if (liveBaselineByThread.get()?.get(section + '\u0000' + key) == value) return
+        NativeApp.setSetting(section, key, type, value)
     }
 
     /**
@@ -1072,6 +1086,36 @@ data class Settings(
         }
     }
 
+    /**
+     * [applyTo] for a game that is already running: writes only the keys whose value differs from
+     * [before], so a change made in game leaves everything else as the game booted with it.
+     *
+     * A running game's core config is more than these settings. Its RPCS3 database entry and our
+     * local entries were layered on at boot, and none of that is in a Settings, so writing every
+     * key put the general values back over them. Changing the OSD colour in Arkham City switched
+     * the Write Color Buffers, Write Depth Buffer and Asynchronous Texture Streaming its database
+     * entry turns on back off mid-game: 30 fps fell to 16 and the audio broke up. The live calls
+     * after the persisted keys (FPS cap, volume, OSD flags and so on) still run as before.
+     *
+     * [before] and this must both be the running game's resolved settings
+     * (ConfigStore.resolveForGame), from before and after the change was saved.
+     */
+    fun applyChangesSince(before: Settings) {
+        val baseline = HashMap<String, String>()
+        emitSink = { section, key, _, value -> baseline[section + '\u0000' + key] = value }
+        try {
+            before.applyTo()
+        } finally {
+            emitSink = null
+        }
+        liveBaselineByThread.set(baseline)
+        try {
+            applyTo()
+        } finally {
+            liveBaselineByThread.set(null)
+        }
+    }
+
     private fun applyToInner() {
         // Speedhacks
         // PS3 core settings, routed by Rpcs3Bridge to the RPCS3 config tree.
@@ -1088,6 +1132,10 @@ data class Settings(
         put("PS3/Core", "Accurate SPU DMA", "bool", ps3.accurateSpuDma.toString())
         put("Savestate", "Compatible Savestate Mode", "bool", ps3.savestateCompatibleMode.toString())
         put("PS3/Core", "Clocks scale", "int", ps3.clocksScale.toString())
+        // Performance > Thread Scheduler. It only ever reached Rpcs3Bridge.setAffinityMode, ARMSX2's
+        // affinity hook, which is a stub here, so on ARMSX3 the row never did anything and the core
+        // kept its own default (Operating System, the row's default too).
+        put("PS3/Core", "Thread Scheduler Mode", "enum", affinityMode.toString())
         // From upscaleFloat, which is the control that exists.
         //
         // ps3.resolutionScale has no writer anywhere in the UI, so it sits at its default of
@@ -1106,6 +1154,8 @@ data class Settings(
         put("PS3/Video", "Stretch To Display Area", "bool", (displayFitMode == 1).toString())
         put("PS3/Video", "Display Aspect Override", "int", ps3.displayAspect.coerceIn(0, 4000).toString())
         put("PS3/Misc", "Silence All Logs", "bool", ps3.silenceAllLogs.toString())
+        put("PS3/Misc", "Show shader compilation hint", "bool", ps3.showShaderCompileHint.toString())
+        put("PS3/Misc", "Show SPU compilation hint", "bool", ps3.showSpuCompileHint.toString())
         put("PS3/Overlay", "Enabled", "bool", ps3.overlayEnabled.toString())
         put("PS3/Overlay", "Detail level", "enum", ps3.overlayDetail.toString())
         put("PS3/Overlay", "Enable Framerate Graph", "bool", ps3.overlayFramerateGraph.toString())
@@ -1129,7 +1179,7 @@ data class Settings(
         put("PS3/Video", "Frame Generation Target Rate", "int", ps3.frameGenTargetRate.toString())
         // Temporary: the value reaches the core as 0 whatever the UI is set to, and all six
         // plumbing sites read correctly. This says what the object being applied actually holds.
-        android.util.Log.i("FRAMEGEN", "applyTo: targetRate=${ps3.frameGenTargetRate} mult=${ps3.frameGeneration}")
+        if (emitSink == null) android.util.Log.i("FRAMEGEN", "applyTo: targetRate=${ps3.frameGenTargetRate} mult=${ps3.frameGeneration}")
         put("PS3/Video", "Write Color Buffers", "bool", ps3.writeColorBuffers.toString())
         put("PS3/Video", "Write Depth Buffer", "bool", ps3.writeDepthBuffer.toString())
         put("PS3/Video", "Read Color Buffers", "bool", ps3.readColorBuffers.toString())
@@ -1151,6 +1201,10 @@ data class Settings(
         put("PS3/Audio", "Enable Buffering", "bool", ps3.audioBuffering.toString())
         put("PS3/Audio", "Desired Audio Buffer Duration", "int", ps3.audioBufferMs.toString())
         put("PS3/Audio", "Cubeb Backend", "int", ps3.audioCubebBackend.toString())
+        put("PS3/Audio", "Microphone Type", "enum", ps3.micType.toString())
+        // SingStar takes a second device for the second singer; the core skips an empty one
+        put("PS3/Audio", "Microphone Devices", "string",
+            listOfNotNull(ps3.micDevice1, ps3.micDevice2.takeIf { ps3.micType == 2 }).filter { it.isNotEmpty() }.joinToString("@@@"))
         put("PS3/Net", "Internet enabled", "enum", ps3.netEnabled.toString())
         put("PS3/Net", "PSN status", "enum", ps3.psnStatus.toString())
         put("PS3/Net", "UPNP Enabled", "bool", ps3.upnpEnabled.toString())
@@ -1237,9 +1291,10 @@ data class Settings(
         // EmulationSpeedOptions::SanityCheck (0.05..10.0).
         put("Framerate", "NominalScalar", "float",
             (nominalSpeedPercent.coerceIn(10, 1000) / 100f).toString())
-        // Live-apply: the setSetting above only persists; the running frame
-        // pacer needs a direct re-pace (mirrors speedhackLimitermode).
-        if (emitSink == null) NativeApp.setNominalSpeed(nominalSpeedPercent.coerceIn(10, 1000))
+        // No NativeApp.setNominalSpeed here. It writes Core@@Clocks scale, which ps3.clocksScale
+        // already wrote above, and running after it, it put this field's 100 back over every
+        // Emulated Clock Speed the user chose (issue #203). The in-game Speed Limit % row edits
+        // ps3.clocksScale now, so nothing else needs this field.
         // Max presented-FPS cap — independent of the Speed Limit % above. Caps
         // the display rate by dropping presents on the GS thread (emulation keeps
         // full speed, NominalScalar untouched); 0 = off. See GSRenderer::VSync.
@@ -1817,6 +1872,23 @@ data class Settings(
         NativeApp.gameIniCommitWrite()
     }
 
+    /**
+     * Every core node [applyTo] would write for these settings, path to the JSON value settingsSet
+     * takes, with nothing written. The field to node mapping is applyTo's own, run through the
+     * bridge with the writes recorded (Rpcs3Settings.recordWrites) rather than kept as a table.
+     *
+     * The persisted pushes only, as for the INI export: the live pokes after them (FPS cap, OSD
+     * flags, the forced Vblank Rate) are skipped while [emitSink] is set.
+     */
+    fun coreWrites(): Map<String, String> = com.armsx3.Rpcs3Settings.recordWrites {
+        emitSink = { section, key, type, value -> com.armsx3.Rpcs3Bridge.setSetting(section, key, type, value) }
+        try {
+            applyTo()
+        } finally {
+            emitSink = null
+        }
+    }
+
     /** Writes every EmuCore/GS key (display + renderer + hardware/upscaling
      *  fixes) into the native BASE settings layer. Pure persistence — no live
      *  pokes, no commit. Shared by [applyTo] (cold start / restart) and
@@ -2116,6 +2188,9 @@ data class Settings(
         put("ps3ResolutionScale", ps3.resolutionScale)
         put("ps3MsaaMode", ps3.msaaMode)
         put("ps3AudioCubebBackend", ps3.audioCubebBackend)
+        put("ps3MicType", ps3.micType)
+        put("ps3MicDevice1", ps3.micDevice1)
+        put("ps3MicDevice2", ps3.micDevice2)
         put("ps3ShaderMode", ps3.shaderMode)
         put("ps3BlendingMode", ps3.blendingMode)
         put("ps3FrameGeneration", ps3.frameGeneration)
@@ -2125,6 +2200,8 @@ data class Settings(
         put("ps3WriteColorBuffers", ps3.writeColorBuffers)
         put("ps3GpuTurbo", ps3.gpuTurbo)
         put("ps3SilenceAllLogs", ps3.silenceAllLogs)
+        put("ps3ShowShaderCompileHint", ps3.showShaderCompileHint)
+        put("ps3ShowSpuCompileHint", ps3.showSpuCompileHint)
         put("ps3WriteDepthBuffer", ps3.writeDepthBuffer)
         put("ps3ReadColorBuffers", ps3.readColorBuffers)
         put("ps3ReadDepthBuffer", ps3.readDepthBuffer)
@@ -2421,9 +2498,20 @@ data class Settings(
         /** When non-null, [put] routes persisted-key emits here instead of the
          *  native base layer. Set transiently by [writeGameSettingsIni] to
          *  capture the key set for the sparse per-game INI export without
-         *  touching the base layer or re-poking the running VM. */
+         *  touching the base layer or re-poking the running VM.
+         *
+         *  Per thread: [coreWrites] runs these captures from the All Core Settings screen, and a
+         *  capture on one thread must not divert a real apply running on another into its sink. */
+        private val emitSinkByThread = ThreadLocal<((String, String, String, String) -> Unit)?>()
+
+        /** While set on this thread, [put] skips every key whose value equals this map's
+         *  ("section\u0000key" to value). Per thread like [emitSink]: see [applyChangesSince]. */
+        private val liveBaselineByThread = ThreadLocal<Map<String, String>?>()
+
         @JvmStatic
-        internal var emitSink: ((String, String, String, String) -> Unit)? = null
+        internal var emitSink: ((String, String, String, String) -> Unit)?
+            get() = emitSinkByThread.get()
+            set(value) = emitSinkByThread.set(value)
 
         /** One-tap "Low-End" performance snapshot applied on top of [base].
          *  Only cheap, safe-for-most levers that already exist as fields:
@@ -2472,6 +2560,9 @@ data class Settings(
                     resolutionScale = json.optInt("ps3ResolutionScale", def.ps3.resolutionScale),
                     msaaMode = json.optInt("ps3MsaaMode", def.ps3.msaaMode),
                     audioCubebBackend = json.optInt("ps3AudioCubebBackend", def.ps3.audioCubebBackend),
+                    micType = json.optInt("ps3MicType", def.ps3.micType),
+                    micDevice1 = json.optString("ps3MicDevice1", def.ps3.micDevice1),
+                    micDevice2 = json.optString("ps3MicDevice2", def.ps3.micDevice2),
                     shaderMode = json.optInt("ps3ShaderMode", def.ps3.shaderMode),
                     blendingMode = json.optInt("ps3BlendingMode", def.ps3.blendingMode),
                     frameGeneration = json.optInt("ps3FrameGeneration", def.ps3.frameGeneration),
@@ -2481,6 +2572,8 @@ data class Settings(
                     writeColorBuffers = json.optBoolean("ps3WriteColorBuffers", def.ps3.writeColorBuffers),
                     gpuTurbo = json.optBoolean("ps3GpuTurbo", def.ps3.gpuTurbo),
                     silenceAllLogs = json.optBoolean("ps3SilenceAllLogs", def.ps3.silenceAllLogs),
+                    showShaderCompileHint = json.optBoolean("ps3ShowShaderCompileHint", def.ps3.showShaderCompileHint),
+                    showSpuCompileHint = json.optBoolean("ps3ShowSpuCompileHint", def.ps3.showSpuCompileHint),
                     writeDepthBuffer = json.optBoolean("ps3WriteDepthBuffer", def.ps3.writeDepthBuffer),
                     readColorBuffers = json.optBoolean("ps3ReadColorBuffers", def.ps3.readColorBuffers),
                     readDepthBuffer = json.optBoolean("ps3ReadDepthBuffer", def.ps3.readDepthBuffer),
@@ -2813,6 +2906,9 @@ data class Settings(
             if (current.ps3.resolutionScale != base.ps3.resolutionScale) j.put("ps3ResolutionScale", current.ps3.resolutionScale)
             if (current.ps3.msaaMode != base.ps3.msaaMode) j.put("ps3MsaaMode", current.ps3.msaaMode)
             if (current.ps3.audioCubebBackend != base.ps3.audioCubebBackend) j.put("ps3AudioCubebBackend", current.ps3.audioCubebBackend)
+            if (current.ps3.micType != base.ps3.micType) j.put("ps3MicType", current.ps3.micType)
+            if (current.ps3.micDevice1 != base.ps3.micDevice1) j.put("ps3MicDevice1", current.ps3.micDevice1)
+            if (current.ps3.micDevice2 != base.ps3.micDevice2) j.put("ps3MicDevice2", current.ps3.micDevice2)
             if (current.ps3.shaderMode != base.ps3.shaderMode) j.put("ps3ShaderMode", current.ps3.shaderMode)
             if (current.ps3.blendingMode != base.ps3.blendingMode) j.put("ps3BlendingMode", current.ps3.blendingMode)
             if (current.ps3.frameGeneration != base.ps3.frameGeneration) j.put("ps3FrameGeneration", current.ps3.frameGeneration)
@@ -2822,6 +2918,8 @@ data class Settings(
             if (current.ps3.writeColorBuffers != base.ps3.writeColorBuffers) j.put("ps3WriteColorBuffers", current.ps3.writeColorBuffers)
             if (current.ps3.gpuTurbo != base.ps3.gpuTurbo) j.put("ps3GpuTurbo", current.ps3.gpuTurbo)
             if (current.ps3.silenceAllLogs != base.ps3.silenceAllLogs) j.put("ps3SilenceAllLogs", current.ps3.silenceAllLogs)
+            if (current.ps3.showShaderCompileHint != base.ps3.showShaderCompileHint) j.put("ps3ShowShaderCompileHint", current.ps3.showShaderCompileHint)
+            if (current.ps3.showSpuCompileHint != base.ps3.showSpuCompileHint) j.put("ps3ShowSpuCompileHint", current.ps3.showSpuCompileHint)
             if (current.ps3.writeDepthBuffer != base.ps3.writeDepthBuffer) j.put("ps3WriteDepthBuffer", current.ps3.writeDepthBuffer)
             if (current.ps3.readColorBuffers != base.ps3.readColorBuffers) j.put("ps3ReadColorBuffers", current.ps3.readColorBuffers)
             if (current.ps3.readDepthBuffer != base.ps3.readDepthBuffer) j.put("ps3ReadDepthBuffer", current.ps3.readDepthBuffer)
@@ -3130,6 +3228,9 @@ data class Settings(
                     resolutionScale = if (overrides.has("ps3ResolutionScale")) overrides.getInt("ps3ResolutionScale") else base.ps3.resolutionScale,
                     msaaMode = if (overrides.has("ps3MsaaMode")) overrides.getInt("ps3MsaaMode") else base.ps3.msaaMode,
                     audioCubebBackend = if (overrides.has("ps3AudioCubebBackend")) overrides.getInt("ps3AudioCubebBackend") else base.ps3.audioCubebBackend,
+                    micType = if (overrides.has("ps3MicType")) overrides.getInt("ps3MicType") else base.ps3.micType,
+                    micDevice1 = if (overrides.has("ps3MicDevice1")) overrides.getString("ps3MicDevice1") else base.ps3.micDevice1,
+                    micDevice2 = if (overrides.has("ps3MicDevice2")) overrides.getString("ps3MicDevice2") else base.ps3.micDevice2,
                     shaderMode = if (overrides.has("ps3ShaderMode")) overrides.getInt("ps3ShaderMode") else base.ps3.shaderMode,
                     blendingMode = if (overrides.has("ps3BlendingMode")) overrides.getInt("ps3BlendingMode") else base.ps3.blendingMode,
                     frameGeneration = if (overrides.has("ps3FrameGeneration")) overrides.getInt("ps3FrameGeneration") else base.ps3.frameGeneration,
@@ -3139,6 +3240,8 @@ data class Settings(
                     writeColorBuffers = if (overrides.has("ps3WriteColorBuffers")) overrides.getBoolean("ps3WriteColorBuffers") else base.ps3.writeColorBuffers,
                     gpuTurbo = if (overrides.has("ps3GpuTurbo")) overrides.getBoolean("ps3GpuTurbo") else base.ps3.gpuTurbo,
                     silenceAllLogs = if (overrides.has("ps3SilenceAllLogs")) overrides.getBoolean("ps3SilenceAllLogs") else base.ps3.silenceAllLogs,
+                    showShaderCompileHint = if (overrides.has("ps3ShowShaderCompileHint")) overrides.getBoolean("ps3ShowShaderCompileHint") else base.ps3.showShaderCompileHint,
+                    showSpuCompileHint = if (overrides.has("ps3ShowSpuCompileHint")) overrides.getBoolean("ps3ShowSpuCompileHint") else base.ps3.showSpuCompileHint,
                     writeDepthBuffer = if (overrides.has("ps3WriteDepthBuffer")) overrides.getBoolean("ps3WriteDepthBuffer") else base.ps3.writeDepthBuffer,
                     readColorBuffers = if (overrides.has("ps3ReadColorBuffers")) overrides.getBoolean("ps3ReadColorBuffers") else base.ps3.readColorBuffers,
                     readDepthBuffer = if (overrides.has("ps3ReadDepthBuffer")) overrides.getBoolean("ps3ReadDepthBuffer") else base.ps3.readDepthBuffer,

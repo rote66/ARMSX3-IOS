@@ -90,6 +90,12 @@ import kotlin.math.roundToInt
  *  SCREEN_ASPECTS in RendererTab minus the Custom entry (no slider in the quick menu). */
 private val IN_GAME_SCREEN_ASPECTS = listOf(0, 1333, 1600, 1778, 2000, 2167, 2222, 2333)
 
+/** The Friends panel's nav layer: only its controls answer the pad while it is open. */
+private const val FRIENDS_NAV_LAYER = "menu.friends"
+
+/** The toy portal panel's nav layer, the same way. */
+private const val PORTAL_NAV_LAYER = "menu.portal"
+
 @Composable
 fun EmulationMenuScreen(viewModel: EmulationMenuViewModel = viewModel()) {
     val state = viewModel.state.value
@@ -97,6 +103,15 @@ fun EmulationMenuScreen(viewModel: EmulationMenuViewModel = viewModel()) {
     var shown by remember { mutableStateOf(false) }
     var dismissing by remember { mutableStateOf(false) }
     var friendsOpen by remember { mutableStateOf(false) }
+    var portalOpen by remember { mutableStateOf(false) }
+    // The emulated portals are attached to every game, and only the toys-to-life series look at them;
+    // Portal shows unless switched off in USB Devices settings
+    val portalEntry = remember { com.armsx2.input.ToyPortals.menuEnabled() }
+    // A friend waiting to be let in is answered in the hosting panel, which sits with Friends: the
+    // menu opens there, whether it was opened for the question or was already open.
+    val hostStatus by com.armsx2.remoteplay.RemotePlayHost.status
+    val asking = hostStatus is com.armsx2.remoteplay.RemotePlayHost.Status.Asking
+    LaunchedEffect(asking) { if (asking) friendsOpen = true }
     val closeMenu: () -> Unit = remember(viewModel, scope) {
         {
             if (!dismissing) {
@@ -137,14 +152,48 @@ fun EmulationMenuScreen(viewModel: EmulationMenuViewModel = viewModel()) {
     // The nav registry is shared between the menu and the panel, so ownership has to be explicit:
     // the selection is cleared on both edges, because a selection left pointing at a control on
     // the other side of the transition highlights something the user cannot see.
+    // The panel also claims its own nav layer while open: the menu stays composed behind it, and
+    // without a layer a move could pick one of the menu's controls.
     DisposableEffect(friendsOpen) {
-        if (friendsOpen) {
-            EmulationMenuInputController.overlayDismiss = { friendsOpen = false }
-            com.armsx2.ui.settings.SettingsControllerNav.clearSelection()
-        }
+        if (!friendsOpen) return@DisposableEffect onDispose {}
+        EmulationMenuInputController.overlayDismiss = { friendsOpen = false }
+        val nav = com.armsx2.ui.settings.SettingsControllerNav
+        val previous = nav.activeLayer.value
+        nav.activeLayer.value = FRIENDS_NAV_LAYER
+        nav.clearSelection()
         onDispose {
             EmulationMenuInputController.overlayDismiss = null
-            com.armsx2.ui.settings.SettingsControllerNav.clearSelection()
+            nav.activeLayer.value = previous
+            nav.clearSelection()
+        }
+    }
+    // The portal panel takes the pad the same way.
+    val portalScroll = rememberScrollState()
+    DisposableEffect(portalOpen) {
+        if (!portalOpen) return@DisposableEffect onDispose {}
+        // A spot's chooser or the figure maker in the panel steps back first
+        EmulationMenuInputController.overlayDismiss = {
+            val back = ToyPortalBack.handler
+            if (back != null) back() else portalOpen = false
+        }
+        EmulationMenuInputController.overlayEdgeScroll = { dy ->
+            scope.launch { portalScroll.animateScrollTo(if (dy > 0) portalScroll.maxValue else 0) }
+        }
+        val nav = com.armsx2.ui.settings.SettingsControllerNav
+        val previous = nav.activeLayer.value
+        nav.activeLayer.value = PORTAL_NAV_LAYER
+        nav.clearSelection()
+        onDispose {
+            EmulationMenuInputController.overlayDismiss = null
+            EmulationMenuInputController.overlayEdgeScroll = null
+            nav.activeLayer.value = previous
+            nav.clearSelection()
+        }
+    }
+    LaunchedEffect(portalOpen) {
+        if (portalOpen) {
+            delay(260)
+            if (portalOpen) com.armsx2.ui.settings.SettingsControllerNav.move(1)
         }
     }
     // Highlight the panel's first control once it has actually composed. Selecting in the same
@@ -159,7 +208,13 @@ fun EmulationMenuScreen(viewModel: EmulationMenuViewModel = viewModel()) {
     // Back closes the friends overlay first when it is up. Without this, opening Friends and
     // pressing Back would dismiss the entire pause menu and resume the game, which is not what
     // anyone means by "go back" from a panel sitting on top of another panel.
-    BackHandler(onBack = { if (friendsOpen) friendsOpen = false else closeMenu() })
+    BackHandler(onBack = {
+        when {
+            friendsOpen -> friendsOpen = false
+            portalOpen -> portalOpen = false
+            else -> closeMenu()
+        }
+    })
 
     state.pendingHardcore?.let { enabling ->
         androidx.compose.runtime.DisposableEffect(Unit) {
@@ -216,6 +271,7 @@ fun EmulationMenuScreen(viewModel: EmulationMenuViewModel = viewModel()) {
                         compact = true,
                         modifier = Modifier.fillMaxSize(),
                         onOpenFriends = { friendsOpen = true },
+                        onOpenPortal = if (portalEntry) { { portalOpen = true } } else null,
                     )
                 }
             } else {
@@ -241,6 +297,7 @@ fun EmulationMenuScreen(viewModel: EmulationMenuViewModel = viewModel()) {
                             compact = false,
                             modifier = Modifier.fillMaxSize(),
                             onOpenFriends = { friendsOpen = true },
+                            onOpenPortal = if (portalEntry) { { portalOpen = true } } else null,
                         )
                     }
                     Surface(
@@ -291,28 +348,110 @@ fun EmulationMenuScreen(viewModel: EmulationMenuViewModel = viewModel()) {
                 shadowElevation = 24.dp,
             ) {
                 Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-                    Row(
-                        Modifier.fillMaxWidth().padding(start = 16.dp, end = 10.dp, top = 14.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                    androidx.compose.runtime.CompositionLocalProvider(
+                        com.armsx2.ui.settings.LocalNavLayer provides FRIENDS_NAV_LAYER,
                     ) {
-                        Text(
-                            str("friends.title"),
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
+                        Row(
+                            Modifier.fillMaxWidth().padding(start = 16.dp, end = 10.dp, top = 14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                str("friends.title"),
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                            )
+                            // Between the title and Close: who you are, on RPCN (with the avatar games
+                            // show for you) and on Discord.
+                            Row(
+                                Modifier.weight(1f).padding(horizontal = 12.dp),
+                                horizontalArrangement = Arrangement.spacedBy(14.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                com.armsx2.ui.friends.RpcnSelfChip(Modifier.weight(1f, fill = false), caption = "RPCN")
+                                if (com.armsx2.DiscordPresence.available()) {
+                                    com.armsx2.ui.friends.SelfChip(Modifier.weight(1f, fill = false), caption = "Discord")
+                                }
+                            }
+                            TextButton(
+                                onClick = { friendsOpen = false },
+                                modifier = Modifier.controllerFocusable(
+                                    "menu.friends.close",
+                                    onConfirm = { friendsOpen = false },
+                                ),
+                            ) { Text(str("action.close")) }
+                        }
+                        // Hosting sits with Friends: there is no room for another tab in this menu.
+                        com.armsx2.remoteplay.RemotePlayHostPanel(
+                            Modifier.padding(start = 12.dp, end = 12.dp, top = 10.dp, bottom = 10.dp),
                         )
-                        // Between the title and Close: whose Discord this is.
-                        com.armsx2.ui.friends.SelfChip(
-                            Modifier.weight(1f).padding(horizontal = 12.dp),
+                        com.armsx2.ui.friends.RpcnFriendsPanel(
+                            Modifier.padding(horizontal = 12.dp).padding(bottom = 10.dp),
+                            inGame = true,
                         )
-                        TextButton(
-                            onClick = { friendsOpen = false },
-                            modifier = Modifier.controllerFocusable(
-                                "menu.friends.close",
-                                onConfirm = { friendsOpen = false },
-                            ),
-                        ) { Text(str("action.close")) }
+                        if (com.armsx2.DiscordPresence.available()) {
+                            com.armsx2.ui.friends.FriendsPanel(Modifier.padding(horizontal = 12.dp))
+                        }
                     }
-                    com.armsx2.ui.friends.FriendsPanel(Modifier.padding(horizontal = 12.dp))
+                }
+            }
+        }
+
+        // The toy portals, as their own panel over the menu, for the same reasons as Friends
+        AnimatedVisibility(
+            visible = portalOpen,
+            enter = fadeIn(tween(160, easing = EaseOut)),
+            exit = fadeOut(tween(140, easing = EaseIn)),
+        ) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.72f))
+                    .clickable { portalOpen = false },
+            )
+        }
+        AnimatedVisibility(
+            visible = portalOpen,
+            enter = fadeIn(tween(190, easing = EaseOut)),
+            exit = fadeOut(tween(150, easing = EaseIn)),
+            modifier = Modifier.align(Alignment.Center),
+        ) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth(if (compact) 0.94f else 0.6f)
+                    .widthIn(max = 620.dp)
+                    .fillMaxHeight(0.9f)
+                    .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Vertical)),
+                shape = RoundedCornerShape(24.dp),
+                color = MaterialTheme.colorScheme.surface,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
+                shadowElevation = 24.dp,
+            ) {
+                Column(Modifier.fillMaxSize().verticalScroll(portalScroll)) {
+                    // The right stick scrolls it, as it does Settings
+                    com.armsx2.ui.settings.ControllerAutoScroll(portalScroll)
+                    androidx.compose.runtime.CompositionLocalProvider(
+                        com.armsx2.ui.settings.LocalNavLayer provides PORTAL_NAV_LAYER,
+                    ) {
+                        Row(
+                            Modifier.fillMaxWidth().padding(start = 16.dp, end = 10.dp, top = 14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                str("portal.button"),
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.weight(1f),
+                            )
+                            TextButton(
+                                onClick = { portalOpen = false },
+                                modifier = Modifier.controllerFocusable(
+                                    "menu.portal.close",
+                                    onConfirm = { portalOpen = false },
+                                ),
+                            ) { Text(str("action.close")) }
+                        }
+                        ToyPortalPanel(Modifier.padding(start = 16.dp, end = 10.dp, top = 6.dp, bottom = 16.dp))
+                    }
                 }
             }
         }
@@ -326,6 +465,7 @@ private fun MenuPage(
     compact: Boolean,
     modifier: Modifier,
     onOpenFriends: () -> Unit,
+    onOpenPortal: (() -> Unit)?,
 ) {
     val tabScrollStates = remember {
         EmulationMenuTab.visible.associateWith {
@@ -363,7 +503,7 @@ private fun MenuPage(
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 when (state.tab) {
-                    EmulationMenuTab.Session -> SessionPane(state, viewModel)
+                    EmulationMenuTab.Session -> SessionPane(state, viewModel, onOpenPortal)
                     EmulationMenuTab.Graphics -> GraphicsPane(state, viewModel)
                     // The full Fixes settings tab, live-applying via InGameOverlay's
                     // shared Settings state (same as the rest of the overlay); its
@@ -617,34 +757,33 @@ private fun MenuHeader(
             Modifier.align(Alignment.CenterVertically),
         )
 
-        // Friends, in the header where it is always visible, with the online count on it. A build
-        // without the SDK has nothing to show, so it does not take up header space there.
-        if (com.armsx2.DiscordPresence.available()) {
-            Spacer(Modifier.width(8.dp))
-            Surface(
-                onClick = onOpenFriends,
-                modifier = Modifier.controllerFocusable(
-                    "menu.friends",
-                    RoundedCornerShape(14.dp),
-                    onConfirm = onOpenFriends,
-                ),
-                shape = RoundedCornerShape(14.dp),
-                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
-            ) {
-                Box(Modifier.padding(horizontal = 11.dp, vertical = 9.dp)) {
-                    com.armsx2.ui.friends.FriendsGlyphWithBadge(
-                        color = MaterialTheme.colorScheme.onSurface,
-                        glyphSize = 19.sp,
-                    )
-                }
+        // Friends, in the header where it is always visible, with the online count on it. Shown
+        // even where Discord is not available: remote play hosting lives behind it too, and
+        // hosting does not need Discord. The Discord parts inside hide themselves there.
+        Spacer(Modifier.width(8.dp))
+        Surface(
+            onClick = onOpenFriends,
+            modifier = Modifier.controllerFocusable(
+                "menu.friends",
+                RoundedCornerShape(14.dp),
+                onConfirm = onOpenFriends,
+            ),
+            shape = RoundedCornerShape(14.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
+        ) {
+            Box(Modifier.padding(horizontal = 11.dp, vertical = 9.dp)) {
+                com.armsx2.ui.friends.FriendsGlyphWithBadge(
+                    color = MaterialTheme.colorScheme.onSurface,
+                    glyphSize = 19.sp,
+                )
             }
         }
     }
 }
 
 @Composable
-private fun SessionPane(state: EmulationMenuUiState, viewModel: EmulationMenuViewModel) {
+private fun SessionPane(state: EmulationMenuUiState, viewModel: EmulationMenuViewModel, onOpenPortal: (() -> Unit)?) {
     // Which disc card is open: null, change, or swap. Swap is offered only while the game can take
     // one, which the core reports as it runs; see DiscSection.
     var discCard by remember { mutableStateOf<Boolean?>(null) }
@@ -659,6 +798,10 @@ private fun SessionPane(state: EmulationMenuUiState, viewModel: EmulationMenuVie
             add(MenuAction(str("action.swapDisc"), str("action.swapDisc.detail"), "⇄", null) {
                 discCard = if (discCard == true) null else true
             })
+        }
+        // Skylanders, Disney Infinity and LEGO Dimensions figures (ToyPortalPanel)
+        if (onOpenPortal != null) {
+            add(MenuAction(str("portal.button"), "Skylanders, Disney Infinity, LEGO Dimensions", "\u25CE", null, onOpenPortal))
         }
         add(MenuAction(str("action.close"), MainActivityRuntime.currentGame.value?.title.orEmpty(), "■", Danger) {
             MainActivityRuntime.closeGame()
@@ -733,6 +876,24 @@ private fun SessionPane(state: EmulationMenuUiState, viewModel: EmulationMenuVie
             viewModel.updateSettings {
                 it.copy(ps3 = it.ps3.copy(overlayBodyColor = com.armsx2.ui.settings.OSD_COLORS[next]))
             }
+        }
+        Spacer(Modifier.height(6.dp))
+        // The compile notices, here because this is where someone turns off what is on screen.
+        // Plain switches with their own callbacks, like the rest of this card, so they cannot shift
+        // the action grid's controller dispatch above.
+        MenuSwitchRow(
+            str("overlay.shaderHint.label"),
+            state.settings.ps3.showShaderCompileHint,
+            description = str("overlay.shaderHint.desc"),
+        ) { v ->
+            viewModel.updateSettings { it.copy(ps3 = it.ps3.copy(showShaderCompileHint = v)) }
+        }
+        MenuSwitchRow(
+            str("overlay.spuHint.label"),
+            state.settings.ps3.showSpuCompileHint,
+            description = str("overlay.spuHint.desc"),
+        ) { v ->
+            viewModel.updateSettings { it.copy(ps3 = it.ps3.copy(showSpuCompileHint = v)) }
         }
         Spacer(Modifier.height(6.dp))
         // Where the overlay sits. Only the All Settings tab had this, which made it unreachable
@@ -1057,7 +1218,7 @@ private fun PerformancePane(state: EmulationMenuUiState, viewModel: EmulationMen
     SectionCard(str("perf.speedLimit.label")) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
-                if (settings.frameLimitEnable) "${settings.nominalSpeedPercent}%" else str("setup.toggle.off"),
+                if (settings.frameLimitEnable) "${settings.ps3.clocksScale}%" else str("setup.toggle.off"),
                 modifier = Modifier.weight(1f),
                 color = MaterialTheme.colorScheme.primary,
                 style = MaterialTheme.typography.titleMedium,
@@ -1071,12 +1232,16 @@ private fun PerformancePane(state: EmulationMenuUiState, viewModel: EmulationMen
             )
         }
         Spacer(Modifier.height(8.dp))
+        // Emulated Clock Speed, the same setting as the row in PS3 CPU below. The core takes it
+        // at boot only (a running game's clock would jump), so it comes with Apply & Restart.
         HorizontalOptionRow(
             options = listOf(50, 75, 90, 100, 110, 125, 150, 200).map { it to "$it%" },
-            selected = settings.nominalSpeedPercent,
+            selected = settings.ps3.clocksScale,
             keyPrefix = str("perf.speedLimit.label"),
             onSelect = viewModel::setSpeed,
         )
+        Spacer(Modifier.height(8.dp))
+        CompactAction(str("backend.applyRestart"), "↻", Modifier.fillMaxWidth(), MainActivityRuntime::restart)
     }
     HorizontalOptions(
         title = str("perf.displayFpsCap.label"),
@@ -1121,70 +1286,8 @@ private fun PerformancePane(state: EmulationMenuUiState, viewModel: EmulationMen
     // The PS3's processors, not the PS2's. EE/IOP/VU0/VU1/Fastmem are PCSX2
     // recompiler toggles for silicon that does not exist here.
     // Frame generation first: it is the one setting here that changes the framerate rather than
-    // how fast the emulator runs, so it is what someone opening this menu mid-game is looking for.
-    // Not in the play build: libarmsx3_lsfg.so is not bundled there, so this would be inert.
-    if (com.armsx2.BuildConfig.FRAME_GENERATION) {
-        SectionCard(str("perf.framegen.title")) {
-            HorizontalOptions(
-                title = str("perf.framegen.label"),
-                options = listOf(
-                    str("perf.framegen.off"), str("perf.framegen.x2"),
-                    str("perf.framegen.x3"), str("perf.framegen.x4"),
-                ).mapIndexed { index, label -> index to label },
-                selected = settings.ps3.frameGeneration,
-                onSelect = { v -> viewModel.updateSettings { it.copy(ps3 = it.ps3.copy(frameGeneration = v)) } },
-            )
-
-            // The rest of frame generation, which until now only existed in the main settings
-            // screen. Someone who opens this menu mid-game is here to change exactly these:
-            // the multiplier alone cannot answer "it is generating, but the picture is unsteady"
-            // (target rate) or "it is generating, but too expensive" (flow scale, performance).
-            HorizontalOptions(
-                title = str("perf.framegen.targetRate.label"),
-                options = listOf(0 to str("perf.framegen.off"), 60 to "60 Hz", 90 to "90 Hz", 120 to "120 Hz"),
-                selected = settings.ps3.frameGenTargetRate,
-                onSelect = { v ->
-                    android.util.Log.i("FRAMEGEN", "pause menu: target rate chip -> $v")
-                    viewModel.updateSettings { it.copy(ps3 = it.ps3.copy(frameGenTargetRate = v)) }
-                },
-            )
-            // Motion detail is continuous, so it gets a slider rather than three stops -- the
-            // useful values are wherever the picture stops improving on a given game, not a set
-            // someone picked in advance. 25 is the floor the core clamps to.
-            Column(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 6.dp)) {
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        str("perf.framegen.flowScale.label"),
-                        style = MaterialTheme.typography.titleSmall,
-                        color = MaterialTheme.colorScheme.onSurface,
-                    )
-                    Text(
-                        "${settings.ps3.frameGenFlowScale}%",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
-                }
-                Slider(
-                    value = settings.ps3.frameGenFlowScale.coerceIn(25, 100).toFloat(),
-                    onValueChange = { v ->
-                        viewModel.updateSettings {
-                            it.copy(ps3 = it.ps3.copy(frameGenFlowScale = Math.round(v).coerceIn(25, 100)))
-                        }
-                    },
-                    valueRange = 25f..100f,
-                )
-            }
-            MenuSwitchRow(
-                str("perf.framegen.performance.label"),
-                settings.ps3.frameGenPerformance,
-            ) { v -> viewModel.updateSettings { it.copy(ps3 = it.ps3.copy(frameGenPerformance = v)) } }
-        }
-        Spacer(Modifier.height(10.dp))
-    }
+    // how fast the emulator runs. Only the github build draws it.
+    FrameGenCard(settings, viewModel)
     SectionCard(str("perf.ps3cpu.title")) {
         HorizontalOptions(
             title = str("perf.ppuDecoder.label"),
@@ -1260,6 +1363,21 @@ private fun PerformancePane(state: EmulationMenuUiState, viewModel: EmulationMen
         ) {
             armed = true
             Rpcs3Bridge.captureFrame()
+        }
+        Spacer(Modifier.height(6.dp))
+        // The frame as pictures, pass by pass if asked (Settings, Advanced, Developer tools).
+        // 0 = not yet, 1 = armed, 2 = the renderer cannot dump frames.
+        var dumpState by remember { mutableStateOf(0) }
+        MenuButtonRow(
+            title = str("capture.frameDump"),
+            description = when (dumpState) {
+                1 -> str("capture.frameDump.armed")
+                2 -> str("capture.frameDump.unsupported")
+                else -> str("capture.frameDump.detail")
+            },
+            glyph = if (dumpState == 1) "●" else "▦",
+        ) {
+            dumpState = if (Rpcs3Bridge.dumpFrame(com.armsx2.DevTools.frameDumpMode)) 1 else 2
         }
     }
     SectionCard(str("tab.overlay")) {
@@ -1366,6 +1484,9 @@ private fun ControlsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
     // Sits with the touch layout because it's the same job: what the on-screen pad LOOKS
     // like, right after where it's laid out. Full-screen like Controller mapping.
     CompactAction(str("tab.skins"), "◈", Modifier.fillMaxWidth(), viewModel::openSkins)
+    Spacer(Modifier.height(6.dp))
+    // Hotkeys, under Skins: All Settings' Hotkeys page, opened straight over the game.
+    CompactAction(str("tab.hotkeys"), "⌘", Modifier.fillMaxWidth(), viewModel::openHotkeys)
     // Motion / gyroscope controls in-game (mode, sensitivity, smoothing, invert). Global scope
     // to match the rumble toggle above; the per-game scope lives in All Settings › Controls.
     com.armsx2.ui.settings.GyroSection()
@@ -1813,7 +1934,7 @@ private fun DiscSection(viewModel: EmulationMenuViewModel, swap: Boolean) {
 }
 
 @Composable
-private fun SectionCard(title: String, content: @Composable ColumnScope.() -> Unit) {
+internal fun SectionCard(title: String, content: @Composable ColumnScope.() -> Unit) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(17.dp),
@@ -1829,7 +1950,7 @@ private fun SectionCard(title: String, content: @Composable ColumnScope.() -> Un
 }
 
 @Composable
-private fun <T> HorizontalOptions(
+internal fun <T> HorizontalOptions(
     title: String,
     options: List<Pair<T, String>>,
     selected: T,
@@ -1920,7 +2041,7 @@ private fun OptionChip(label: String, selected: Boolean, controllerId: String? =
 }
 
 @Composable
-private fun MenuSwitchRow(
+internal fun MenuSwitchRow(
     title: String,
     checked: Boolean,
     enabled: Boolean = true,

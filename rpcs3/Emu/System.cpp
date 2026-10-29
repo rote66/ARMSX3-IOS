@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "VFS.h"
+#include "Emu/android_app_state.h"
 #include "Utilities/bin_patch.h"
 #include "Emu/Memory/vm.h"
 #include "Emu/emu_callbacks.h"
@@ -30,6 +31,7 @@
 
 #include "Emu/title.h"
 #include "Emu/IdManager.h"
+#include "Emu/NP/arkham_revived.h"
 #include "Emu/RSX/Capture/rsx_replay.h"
 #include "Emu/RSX/Overlays/overlay_message.h"
 #include "Emu/RSX/Overlays/BigPicture/overlay_big_picture.h"
@@ -52,6 +54,12 @@
 
 #include <memory>
 #include <shared_mutex>
+
+#ifndef _WIN32
+#include <cerrno>
+#include <cstring>
+#include <unistd.h>
+#endif
 
 #include "Utilities/JIT.h"
 
@@ -92,6 +100,7 @@ extern std::pair<shared_ptr<lv2_overlay>, CellError> ppu_load_overlay(const ppu_
 extern bool ppu_load_rel_exec(const ppu_rel_object&);
 
 extern void send_close_home_menu_cmds();
+extern bool savedata_commit_by_copy(const std::string& from, const std::string& to); // ARMSX3, cellSaveData.cpp
 
 extern void signal_system_cache_can_stay();
 
@@ -918,22 +927,17 @@ void Emulator::Init()
 
 			if (fs::is_dir(pending))
 			{
-				// Finalize interrupted saving
-				if (!fs::rename(pending, save_path + desired, false))
+				// Finalize interrupted saving. Android storage can refuse the rename outright (errno
+				// 1, EPERM) on every launch, so the save is copied into place instead, as
+				// savedata_op does when the same rename fails mid-save (cellSaveData.cpp).
+				if (const fs::error rename_error = fs::rename(pending, save_path + desired, false) ? fs::error::ok : fs::g_tls_error;
+					rename_error != fs::error::ok && !savedata_commit_by_copy(pending, save_path + desired))
 				{
-					// Not fatal, and saying so was actively misleading: the loop continues, the
-					// emulator starts, and only this one save is left half-finished. Reported as a
-					// crash on Android because a fatal line in logcat reads like one.
-					//
-					// It is also permanent when it happens here rather than transient. Android
-					// storage can refuse a directory rename outright -- errno 1, EPERM -- and
-					// nothing about starting the emulator again changes that, so this fires on
-					// every launch and looks like a fault that is getting worse. The message says
-					// what to do instead of repeating an alarm.
+					// Not fatal: the loop continues, the emulator starts, and only this one save is
+					// left unfinished. The .working_ folder holds the newest copy of it, so the
+					// message does not suggest deleting that.
 					sys_log.error("Could not finish an interrupted save: %s (%s). The game will "
-						"start; that one save is left as it was. If this repeats every launch, "
-						"delete the .working_ and .backup_ folders for it under "
-						"dev_hdd0/home/%s/savedata/.", pending, fs::g_tls_error, m_usr);
+						"start; the newest copy of that save is still in that folder.", pending, rename_error);
 					continue;
 				}
 
@@ -1104,7 +1108,7 @@ bool Emulator::BootRsxCapture(const std::string& path)
 	g_cfg.video.disable_on_disk_shader_cache.set(true);
 
 	vm::init();
-	vm::reserve_map(vm::main, 0, 0x1FFF0000, vm::page_64k_size);
+	vm::reserve_map(vm::main, 0x10000, 0x1FFF0000, vm::page_64k_size);
 	g_fxo->init(false);
 
 	// Initialize progress dialog
@@ -1165,7 +1169,7 @@ bool Emulator::BootBigPictureMode()
 	g_cfg.video.disable_on_disk_shader_cache.set(true);
 
 	vm::init();
-	vm::reserve_map(vm::main, 0, 0x1FFF0000, vm::page_64k_size);
+	vm::reserve_map(vm::main, 0x10000, 0x1FFF0000, vm::page_64k_size);
 	g_fxo->init(false);
 
 	// Initialize progress dialog
@@ -1285,7 +1289,7 @@ game_boot_result Emulator::BootGame(const std::string& path, const std::string& 
 	m_db_config = db_config;
 
 	// Handle files and special paths inside Load unmodified
-	if (direct || !fs::is_dir(path) || fs::get_optical_raw_device(path))
+	if (direct || !fs::is_dir(path) || is_iso_file(path))
 	{
 		m_path = path;
 
@@ -1972,7 +1976,7 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 			if (m_title_id.size() < 3 && m_title_id.find_first_not_of('.') == umax)
 			{
 				// Do not allow if TITLE_ID result in path redirection
-				sys_log.fatal("Game directory not found using GAMEID token. (m_path='%s', title_id='%s')", m_title_id);
+				sys_log.fatal("Game directory not found using GAMEID token. (m_path='%s', title_id='%s')", m_path, m_title_id);
 				return game_boot_result::invalid_file_or_folder;
 			}
 
@@ -2411,6 +2415,9 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 			// Load patches from different locations
 			g_fxo->get<patch_engine>().append_global_patches();
 			g_fxo->get<patch_engine>().append_title_patches(m_title_id);
+
+			// ARMSX3: Batman: Arkham Origins multiplayer reaches Arkham: Revived (Emu/NP/arkham_revived.h)
+			arkham_revived::prepare(m_title_id);
 		}
 
 		// Set bdvd_dir
@@ -2454,7 +2461,7 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 			g_emu_callbacks.on_ready();
 			ensure(g_fxo->init<main_ppu_module<lv2_obj>>());
 			vm::init();
-			vm::reserve_map(vm::main, 0, 0x1FFF0000, vm::page_64k_size);
+			vm::reserve_map(vm::main, 0x10000, 0x1FFF0000, vm::page_64k_size);
 			m_force_boot = false;
 
 			// Force LLVM recompiler
@@ -3657,9 +3664,15 @@ bool Emulator::Pause(bool freeze_emulation, bool show_resume_message)
 		{
 			while (*msg_ref && GetStatus(false) == status)
 			{
-				// Refresh Native UI
-				rsx::set_native_ui_flip();
-				thread_ctrl::wait_for(33'000);
+				// ARMSX3: out of sight there is nothing to draw it on, so no redraw and 4 checks a
+				// second instead of 30 (#196)
+				if (!g_android_app_backgrounded)
+				{
+					// Refresh Native UI
+					rsx::set_native_ui_flip();
+				}
+
+				thread_ctrl::wait_for(g_android_app_backgrounded ? 250'000 : 33'000);
 			}
 
 			msg_ref->release(0);
@@ -5142,7 +5155,7 @@ game_boot_result Emulator::AddGame(std::string path, bool is_iso)
 	fmt::trim_back(path, fs::delim);
 
 	// Handle files directly
-	if (!fs::is_dir(path) || fs::get_optical_raw_device(path))
+	if (!fs::is_dir(path) || is_iso_file(path))
 	{
 		return AddGameToYml(path, is_iso);
 	}
@@ -5645,33 +5658,85 @@ bool Emulator::IsValidSfb(const std::string& path)
 	return false;
 }
 
-void Emulator::SaveSettings(std::string_view settings, const std::string& title_id)
+// Writes the whole config and flushes it to the device. Empty on success, else what failed.
+//
+// ARMSX3: fs::file's write and sync treat any failure as fatal. Leaving the app saves the
+// settings, and with the SD card full the write got ENOSPC and took the whole app down. A config
+// that cannot be saved is not worth that: the caller logs it and the old file stays.
+static std::string write_config_file(const fs::file& file, std::string_view data)
 {
-	std::string config_name;
+#ifdef _WIN32
+	file.write(data.data(), data.size());
+	return {};
+#else
+	const int fd = file.get_handle();
+	usz done = 0;
 
-	if (title_id.empty())
+	while (done < data.size())
 	{
-		config_name = fs::get_config_dir(true) + "config.yml";
+		const auto written = ::write(fd, data.data() + done, data.size() - done);
+
+		if (written < 0 && errno == EINTR)
+		{
+			continue;
+		}
+
+		if (written <= 0)
+		{
+			return fmt::format("write failed: %s", written < 0 ? std::strerror(errno) : "nothing written");
+		}
+
+		done += written;
 	}
-	else
+
+	if (::fsync(fd) != 0)
 	{
-		config_name = rpcs3::utils::get_custom_config_path(title_id);
+		return fmt::format("sync failed: %s", std::strerror(errno));
 	}
+
+	return {};
+#endif
+}
+
+static std::string settings_file_path(const std::string& title_id)
+{
+	return title_id.empty() ? fs::get_config_dir(true) + "config.yml" : rpcs3::utils::get_custom_config_path(title_id);
+}
+
+bool Emulator::SaveSettingsFile(std::string_view settings, const std::string& title_id)
+{
+	const std::string config_name = settings_file_path(title_id);
 
 	// Save config atomically
 	fs::pending_file temp(config_name);
 	if (!temp.file)
 	{
 		sys_log.error("Could not save config to %s (failed to create temporary file) (error=%s)", config_name, fs::g_tls_error);
+		return false;
 	}
-	else
+
+	if (const std::string failed = write_config_file(temp.file, settings); !failed.empty())
 	{
-		temp.file.write(settings.data(), settings.size());
-		if (!temp.commit())
-		{
-			sys_log.error("Could not save config to %s (failed to commit) (error=%s)", config_name, fs::g_tls_error);
-		}
+		// Not committed, so the config on disk stays as it was.
+		sys_log.error("Could not save config to %s (%s)", config_name, failed);
+		return false;
 	}
+
+	if (!temp.commit())
+	{
+		sys_log.error("Could not save config to %s (failed to commit) (error=%s)", config_name, fs::g_tls_error);
+		return false;
+	}
+
+	return true;
+}
+
+void Emulator::SaveSettings(std::string_view settings, const std::string& title_id)
+{
+	const std::string config_name = settings_file_path(title_id);
+
+	// A failed save leaves the file as it was. The settings still apply below.
+	SaveSettingsFile(settings, title_id);
 
 	// Check if the running config/title is the same as the edited config/title.
 	if (config_name == g_cfg.name || title_id == Emu.GetTitleID())

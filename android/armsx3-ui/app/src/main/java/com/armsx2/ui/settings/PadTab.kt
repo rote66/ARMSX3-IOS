@@ -274,9 +274,22 @@ fun PadTab(state: MutableState<Settings>) {
             // usually whatever presses something first. Pins are stored per controller (by
             // descriptor, so they survive reconnects) and set once, rather than raced for at the
             // start of every session.
+            //
+            // Or every controller on player 1, for one person who docks the handheld: its own
+            // controls and the pad it is docked with then both play, with nothing to reassign.
+            val allToPlayer1 = remember(refreshToken.intValue) { com.armsx2.input.PadRouter.allToPlayer1 }
+            ToggleRow(
+                str("pad.allToPlayer1.label"),
+                allToPlayer1,
+                description = str("pad.allToPlayer1.description"),
+                notDefault = allToPlayer1,
+            ) {
+                com.armsx2.input.PadRouter.setAllToPlayer1(it)
+                refreshToken.intValue++
+            }
             val pads = remember(refreshToken.intValue) { com.armsx2.input.PadRouter.connectedPads() }
             if (pads.isNotEmpty()) {
-                HelpText(str("pad.assign.help"))
+                if (!allToPlayer1) HelpText(str("pad.assign.help"))
                 val slotLabels = listOf(str("pad.assign.auto")) +
                     (0 until com.armsx2.input.PadRouter.MAX_PADS).map { str("pad.player${it + 1}") }
                 val rumbleModes = com.armsx2.input.PadRouter.RumbleMode.entries
@@ -288,7 +301,7 @@ fun PadTab(state: MutableState<Settings>) {
                 )
                 pads.forEach { pad ->
                     val pinnedPort = com.armsx2.input.PadRouter.pins()[pad.descriptor]
-                    SegmentedRow(
+                    if (!allToPlayer1) SegmentedRow(
                         label = pad.name,
                         options = slotLabels,
                         selectedIndex = pinnedPort?.plus(1) ?: 0,
@@ -542,7 +555,7 @@ fun PadTab(state: MutableState<Settings>) {
         }
 
         CollapsibleSection(str("pad.section.buttonMapping"), initiallyExpanded = false) {
-            ControllerMappings.actions.forEach { action ->
+            ControllerMappings.buttonActions.forEach { action ->
                 val physical = ControllerMappings.physicalForScope(action, editPlayer.intValue, editSerial)
                 PadBindingRow(
                     action = action,
@@ -617,6 +630,32 @@ fun PadTab(state: MutableState<Settings>) {
                     "${str("action.reset")} · $who${if (editSerial != null) " · ${str("scope.game")}" else ""}",
                     color = Colors.pasx2_blue, fontSize = 16.sp, fontWeight = FontWeight.Bold,
                 )
+            }
+        }
+        // SIXAXIS motion on buttons (MotionButtons): bound the same way as the buttons above, for
+        // the same player and scope, but kept apart because they move the motion sensors instead
+        // of pressing anything. No turbo: a held motion already lasts while held.
+        CollapsibleSection(str("pad.section.motion"), initiallyExpanded = false) {
+            Text(
+                str("pad.motion.help"),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 14.sp,
+                modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+            )
+            ControllerMappings.motionActions.forEach { action ->
+                val physical = ControllerMappings.physicalForScope(action, editPlayer.intValue, editSerial)
+                PadBindingRow(
+                    action = action,
+                    physical = physical,
+                    capturing = capture.value == action,
+                    onClick = { capture.value = action },
+                    onClear = {
+                        ControllerMappings.clearAction(action, editPlayer.intValue, editSerial)
+                        if (capture.value == action) capture.value = null
+                        refreshToken.intValue++
+                    },
+                )
+                SettingsDivider()
             }
         }
         // Named mapping profiles (#186). Sits right under the mapping rows because it
@@ -770,6 +809,14 @@ fun PadTab(state: MutableState<Settings>) {
                 onChange = { TouchControls.setMultiTouchRadius(it / 100f) },
             )
             SettingsDivider()
+            // L1/L2/R1/R2 touch areas cut to their artwork: without it the shoulder squares and
+            // their multi-touch circles reach far past the wide sprites.
+            ToggleRow(
+                str("pad.tightShoulders.label"),
+                TouchControls.tightShoulders.value,
+                description = str("pad.tightShoulders.description"),
+            ) { TouchControls.setTightShoulders(it) }
+            SettingsDivider()
             // How hard the pressure modifier presses. There was a PRESSURE button (on-screen and
             // bindable as "Pressure Modifier (hold)") but no way to choose the amount, so it was
             // permanently stuck at the hardcoded 50%. Range is 5..100: 0 would collide with the
@@ -811,6 +858,13 @@ private fun UsbDeviceSection(refreshToken: MutableState<Int>) {
     val devices = remember { com.armsx2.input.UsbDevices.available() }
     CollapsibleSection(str("pad.usb.section"), initiallyExpanded = false) {
         HelpText(str("pad.usb.help"))
+        SettingsDivider()
+        // The emulated toy portals are attached whatever this says; it only hides Portal in the menu
+        val portalMenu = remember { mutableStateOf(com.armsx2.input.ToyPortals.menuEnabled()) }
+        ToggleRow(str("portal.menu.label"), portalMenu.value, description = str("portal.menu.description")) {
+            portalMenu.value = it
+            com.armsx2.input.ToyPortals.setMenuEnabled(it)
+        }
         for (port in 0..1) {
             SettingsDivider()
             val current = com.armsx2.input.UsbDevices.portType[port].value
@@ -1145,7 +1199,7 @@ private fun StickTargetPickerDialog(
                 }
                 Spacer(Modifier.height(6.dp))
                 Text(str("pad.stickTarget.hotkeys"), color = Colors.pasx2_blue, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-                ControllerMappings.SysHotkey.entries.filter { it.supported }.forEach { h ->
+                ControllerMappings.hotkeysInDisplayOrder.filter { it.supported }.forEach { h ->
                     val hc = ControllerMappings.stickCodeForHotkey(h)
                     StickPickItem("Hotkey: ${h.label}", current == hc) { onPick(hc) }
                 }
@@ -1233,6 +1287,19 @@ internal fun GyroSection(
                 },
             )
         }
+        // The same choice for Steering, which only ever drove the left stick (ARMSX2 #592). Same
+        // order and values as Aim's row; Left stays the default.
+        if (gyroMode == ControllerMappings.GYRO_STEER) {
+            SegmentedRow(
+                label = str("pad.gyro.steerStick.label"),
+                options = listOf(str("pad.gyro.aimStick.right"), str("pad.gyro.aimStick.left")),
+                selectedIndex = ControllerMappings.gyroSteerStickScope(editSerial),
+                onChange = {
+                    ControllerMappings.setGyroSteerStick(it, editSerial)
+                    refreshToken.intValue++
+                },
+            )
+        }
         // Report which sensor the mode will actually use. Aim prefers a real gyroscope and
         // steering the game rotation vector, but both fall back to the accelerometer, which
         // essentially every device has — so "unavailable" is now genuinely rare. Say when
@@ -1254,17 +1321,55 @@ internal fun GyroSection(
             }
         }
         SettingsDivider()
-        IntSliderRow(
-            label = str("pad.gyro.sensitivity.label"),
-            value = ControllerMappings.gyroSensitivityScope(editSerial),
-            min = 25,
-            max = 300,
-            valueFormatter = { "${it}%" },
-            onChange = {
-                ControllerMappings.setGyroSensitivity(it, editSerial)
-                refreshToken.intValue++
-            },
-        )
+        // One slider for both axes, or one per axis (ARMSX2 #592), where 0% turns that axis off
+        // and Steering reads tipping forward and back as Y.
+        val gyroSplit = ControllerMappings.gyroSplitAxesScope(editSerial)
+        ToggleRow(
+            str("pad.gyro.splitAxes.label"),
+            gyroSplit,
+            description = str("pad.gyro.splitAxes.description"),
+        ) {
+            ControllerMappings.setGyroSplitAxes(it, editSerial)
+            refreshToken.intValue++
+        }
+        SettingsDivider()
+        if (gyroSplit) {
+            IntSliderRow(
+                label = str("pad.gyro.sensitivityX.label"),
+                value = ControllerMappings.gyroSensitivityXScope(editSerial),
+                min = 0,
+                max = 300,
+                valueFormatter = { "${it}%" },
+                onChange = {
+                    ControllerMappings.setGyroSensitivityX(it, editSerial)
+                    refreshToken.intValue++
+                },
+            )
+            SettingsDivider()
+            IntSliderRow(
+                label = str("pad.gyro.sensitivityY.label"),
+                value = ControllerMappings.gyroSensitivityYScope(editSerial),
+                min = 0,
+                max = 300,
+                valueFormatter = { "${it}%" },
+                onChange = {
+                    ControllerMappings.setGyroSensitivityY(it, editSerial)
+                    refreshToken.intValue++
+                },
+            )
+        } else {
+            IntSliderRow(
+                label = str("pad.gyro.sensitivity.label"),
+                value = ControllerMappings.gyroSensitivityScope(editSerial),
+                min = 25,
+                max = 300,
+                valueFormatter = { "${it}%" },
+                onChange = {
+                    ControllerMappings.setGyroSensitivity(it, editSerial)
+                    refreshToken.intValue++
+                },
+            )
+        }
         SettingsDivider()
         IntSliderRow(
             label = str("pad.gyro.smoothing.label"),
@@ -1326,8 +1431,11 @@ internal fun MacrosSection(
         )
         listOf(TouchButtonId.MACRO1, TouchButtonId.MACRO2, TouchButtonId.MACRO3, TouchButtonId.MACRO4).forEach { mid ->
             val buttons = TouchControls.macroCodes(mid)
+            // Two or more real buttons: only then does an order mean anything (ARMSX2 #746).
+            val canOrder = buttons.count { it != TouchControls.MACRO_CODE_PRESSURE } >= 2
+            val inOrder = canOrder && TouchControls.macroInOrder(mid)
             val summary = if (buttons.isEmpty()) str("pad.macro.notSet")
-            else buttons.joinToString(" + ") { TouchControls.macroTargetFor(it)?.label ?: "?" }
+            else buttons.joinToString(if (inOrder) " → " else " + ") { TouchControls.macroTargetFor(it)?.label ?: "?" }
             val physCode = TouchControls.macroPhysicalCode(mid)
             val capturingThis = macroCapture?.value == mid
             Row(
@@ -1421,6 +1529,19 @@ internal fun MacrosSection(
                     onChange = { TouchControls.setMacroPressure(mid, it) },
                 )
             }
+            // Press in order (ARMSX2 #746): the buttons go down one after another, in the order
+            // they were picked in the editor, for inputs that need one held before the next arrives.
+            // Its own controller id per macro: the label-based default would be the same for M1-M4,
+            // and the D-pad would then highlight every copy and toggle whichever registered last.
+            if (canOrder) {
+                ToggleRow(
+                    label = str("pad.macro.inOrder.label"),
+                    value = inOrder,
+                    description = str("pad.macro.inOrder.description"),
+                    controllerId = "pad-macro-inorder-${mid.name}",
+                    onChange = { TouchControls.setMacroInOrder(mid, it) },
+                )
+            }
             SettingsDivider()
         }
         macroDialogFor.value?.let { mid ->
@@ -1456,8 +1577,13 @@ private fun MacroConfigDialog(
                     color = Color(0xFFBBBBBB), fontSize = 15.sp,
                 )
                 Spacer(Modifier.height(8.dp))
+                // With Press in order on, number the picked buttons, since the order is now
+                // what the macro does (ARMSX2 #746).
+                val numbered = TouchControls.macroInOrder(macroId)
+                val sequence = selected.filter { it != TouchControls.MACRO_CODE_PRESSURE }
                 TouchControls.macroAssignableTargets.forEach { t ->
                     val on = t.code in selected
+                    val step = if (numbered) sequence.indexOf(t.code) else -1
                     Row(
                         Modifier
                             .fillMaxWidth()
@@ -1472,7 +1598,10 @@ private fun MacroConfigDialog(
                             fontSize = 16.sp,
                         )
                         Spacer(Modifier.width(12.dp))
-                        Text(t.label, color = MaterialTheme.colorScheme.onSurface, fontSize = 14.sp)
+                        Text(
+                            if (step >= 0) "${step + 1}. ${t.label}" else t.label,
+                            color = MaterialTheme.colorScheme.onSurface, fontSize = 14.sp,
+                        )
                     }
                 }
             }

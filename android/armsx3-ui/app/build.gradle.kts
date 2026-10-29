@@ -34,8 +34,8 @@ android {
         // agree -- an APK that installs below its core's target is a dlopen failure at boot.
         minSdk = (project.findProperty("armsx3.minSdk") as String?)?.toInt() ?: 33
         targetSdk = 37
-        versionCode = 76
-        versionName = "1.0.5"
+        versionCode = 100
+        versionName = "1.4.2"
 
         // ARMSX2's UI reads these. STORAGE_ALL_FILES gates the all-files storage path in
         // onboarding; IN_APP_UPDATER gates the in-app GitHub-release updater.
@@ -49,6 +49,11 @@ android {
         buildConfigField("boolean", "STORAGE_ALL_FILES", "true")
         buildConfigField("boolean", "IN_APP_UPDATER", "true")
         buildConfigField("boolean", "FRAME_GENERATION", "true")
+
+        // The URI scheme Discord sign-in returns through. github keeps the SDK's default,
+        // discord-<application id>, so DISCORD_AUTH_SCHEME is empty; play overrides both below.
+        manifestPlaceholders["discordAuthScheme"] = "discord-1534624714989764829"
+        buildConfigField("String", "DISCORD_AUTH_SCHEME", "\"\"")
 
         ndk {
             // The core is arm64-only.
@@ -94,6 +99,17 @@ android {
             buildConfigField("boolean", "STORAGE_ALL_FILES", "false")
             buildConfigField("boolean", "IN_APP_UPDATER", "false")
             buildConfigField("boolean", "FRAME_GENERATION", "false")
+
+            // Its own Discord sign-in scheme. With both builds installed, the Discord app handed
+            // the sign-in result to the github copy, which claims the same default scheme and had
+            // no sign-in waiting, so the play copy never finished. It has to start with
+            // "discord-": the SDK's AuthenticationActivity ignores any other callback scheme
+            // (CALLBACK_SCHEME_PREFIX), so a scheme like com.armsx3.play would never complete.
+            // The redirect discord-1534624714989764829-play:/authorize/callback is registered for
+            // the application in the Discord developer portal; without it Discord answers
+            // "Invalid OAuth2 redirect_uri".
+            manifestPlaceholders["discordAuthScheme"] = "discord-1534624714989764829-play"
+            buildConfigField("String", "DISCORD_AUTH_SCHEME", "\"discord-1534624714989764829-play\"")
 
             // Frame generation is excluded by SOURCE SET, not by a packaging filter: a
             // packaging block inside a flavor is not honoured and silently applied to both,
@@ -207,6 +223,20 @@ android {
     }
 }
 
+// The github APKs compress the app's dex files as well, the way the native libraries above already
+// are: a sideloaded APK is downloaded exactly as built, so this takes about 4 MB off the download.
+// Android unpacks the code at install, which costs about as much on the device, and it is the
+// packaging every app used before AGP started storing dex uncompressed. The play build keeps them
+// uncompressed: Play compresses every download itself, so there it would only grow the install.
+// Set per variant because a packaging block inside a flavor applies to both (see productFlavors).
+androidComponents {
+    onVariants { variant ->
+        if (variant.flavorName == "github") {
+            variant.packaging.dex.useLegacyPackaging.set(true)
+        }
+    }
+}
+
 // ARMSX3: fail the build if the bundled ANGLE libraries are not there.
 //
 // This check exists because of a specific, expensive bug in ARMSX2: the repo's
@@ -287,6 +317,9 @@ dependencies {
     // The net.rpcsx binding layer persists library and firmware state with
     // kotlinx-serialization.
     implementation(libs.kotlinxSerializationJson)
+
+    // Remote play (com.armsx2.remoteplay): video, audio and player 2's input between two devices.
+    implementation(libs.streamWebrtc)
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

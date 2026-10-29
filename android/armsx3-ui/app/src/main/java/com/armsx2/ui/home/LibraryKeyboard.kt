@@ -61,6 +61,9 @@ object LibraryKeyboard {
     /** Empty-buffer hint; caller-set so the same keyboard serves library + settings search. */
     private val placeholder = mutableStateOf("Search games…")
 
+    /** Shows dots instead of what is typed: a password (RPCN sign-in). */
+    private val masked = mutableStateOf(false)
+
     // Special keys carry multi-char labels; letter keys are single chars.
     const val SPACE = "space"
     const val BACKSPACE = "⌫"
@@ -68,12 +71,16 @@ object LibraryKeyboard {
     const val DONE = "done"
     const val SHIFT = "shift"
 
+    // It also takes remote play's join address, so it carries the symbols an address and a host
+    // name need: "." and ":" (a port), plus "/" "-" "_". They sit where a physical keyboard puts
+    // them where possible (". /" after "m") and fill the short rows, so the grid keeps its five
+    // rows and still fits a landscape handheld.
     val rows: List<List<String>> = listOf(
         listOf("1", "2", "3", "4", "5", "6", "7", "8", "9", "0"),
         listOf("q", "w", "e", "r", "t", "y", "u", "i", "o", "p"),
-        listOf("a", "s", "d", "f", "g", "h", "j", "k", "l"),
-        listOf(SHIFT, "z", "x", "c", "v", "b", "n", "m"),
-        listOf(SPACE, BACKSPACE, CLEAR, DONE),
+        listOf("a", "s", "d", "f", "g", "h", "j", "k", "l", ":"),
+        listOf(SHIFT, "z", "x", "c", "v", "b", "n", "m", ".", "/"),
+        listOf("-", "_", SPACE, BACKSPACE, CLEAR, DONE),
     )
 
     /** Use the Android system IME instead of these on-screen keys. Opt-in: the built-in keyboard
@@ -98,10 +105,11 @@ object LibraryKeyboard {
         return useSystemIme.value
     }
 
-    fun open(initial: String, onChange: (String) -> Unit, placeholder: String = "Search games…") {
+    fun open(initial: String, onChange: (String) -> Unit, placeholder: String = "Search games…", masked: Boolean = false) {
         text.value = initial
         this.onChange = onChange
         this.placeholder.value = placeholder
+        this.masked.value = masked
         // Re-read on every open so the preference needs no wiring into app startup, and so a
         // change made in Settings takes effect the next time the keyboard is summoned.
         refreshUseSystemIme()
@@ -149,7 +157,7 @@ object LibraryKeyboard {
     fun backspace() = pressKey(BACKSPACE)
 
     private fun weightOf(key: String): Float = when (key) {
-        SPACE -> 4f
+        SPACE -> 3f
         DONE -> 2f
         BACKSPACE, CLEAR, SHIFT -> 1.6f
         else -> 1f
@@ -188,12 +196,14 @@ object LibraryKeyboard {
                     return@Column
                 }
                 Text(
-                    text = text.value.ifEmpty { placeholder.value },
+                    text = if (masked.value && text.value.isNotEmpty()) "\u2022".repeat(text.value.length)
+                    else text.value.ifEmpty { placeholder.value },
                     color = if (text.value.isEmpty()) MaterialTheme.colorScheme.onSurfaceVariant
                     else MaterialTheme.colorScheme.onSurface,
                     fontSize = 18.sp,
                     maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+                    // Keep the END visible: that is where typing happens.
+                    overflow = TextOverflow.StartEllipsis,
                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
                 )
                 rows.forEachIndexed { r, keys ->
@@ -240,7 +250,13 @@ object LibraryKeyboard {
             },
             placeholder = { Text(placeholder.value) },
             singleLine = true,
-            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+            visualTransformation = if (masked.value) androidx.compose.ui.text.input.PasswordVisualTransformation()
+            else androidx.compose.ui.text.input.VisualTransformation.None,
+            keyboardOptions = KeyboardOptions(
+                imeAction = ImeAction.Search,
+                keyboardType = if (masked.value) androidx.compose.ui.text.input.KeyboardType.Password
+                else androidx.compose.ui.text.input.KeyboardType.Text,
+            ),
             keyboardActions = KeyboardActions(onSearch = { ime?.hide(); close() }),
             modifier = Modifier.fillMaxWidth().focusRequester(focus),
         )

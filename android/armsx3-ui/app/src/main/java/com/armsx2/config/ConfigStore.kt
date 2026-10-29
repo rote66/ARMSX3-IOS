@@ -93,26 +93,21 @@ object ConfigStore {
     // The relaxed-ZCULL default was recorded as a raw core override as well, and the OFF
     // migration above only ever corrected the curated field.
     private const val KEY_RELAXED_ZCULL_OVERRIDE_PURGED = "config.migrated.relaxedZcullOverridePurged"
-    // Per-title core settings that differ from the safe global default, seeded once into the
-    // title's own override so the global stays conservative. Keyed by serial; other regions of
-    // the same game need their own entry.
-    private const val KEY_PER_GAME_SEED = "config.migrated.perGameSeedV1"
-    private val PER_GAME_SEED: Map<String, Map<String, Any>> = mapOf(
-        // Spider-Man: Web of Shadows. Its SPURS reservation traffic serialises behind the global
-        // exclusive vm::writer_lock taken by every reservation_op, which no amount of CPU can
-        // help: measured all six SPU threads and several PPUs yielding at the same rate, 18.8% of
-        // total CPU in sched_yield. Turning accurate reservations off routes SPURS through the
-        // lock-free path in SPUThread.cpp and dropped vm::writer_lock from 8.06% to 0.96%.
-        //
-        // Deliberately per-game and not a global default. It is off-spec, upstream defaults it
-        // on, and Sonic Unleashed fails EARLIER with it off, so it is not safe to apply blindly.
-        "BLUS30218" to mapOf("ps3AccurateSpuRsv" to false),    )
+    // Takes back the one per-title seed there was: Accurate SPU Reservations off for Spider-Man:
+    // Web of Shadows (BLUS30218), seeded once in August because it cut vm::writer_lock time from
+    // 8.06% to 0.96% then. The seed sat in the title's own settings, where All Core Settings
+    // could neither show where it came from nor take it back, and it was blamed for black screens
+    // on 09-29 that were really a broken build (a cpu_thread layout change against the PPU cache).
+    // Off is still right for this title; it lives in ConfigDatabase.LOCAL_OVERRIDES now, as a
+    // database entry with its own per-game toggle. This only cleans up installs that got the seed.
+    private const val KEY_WOS_RSV_SEED_UNDONE = "config.migrated.wosRsvSeedUndone"
     // The VRAM limit is a hard heap cap, not an eviction threshold; too low fails allocations.
     private const val KEY_VRAM_LIMIT_1024 = "config.migrated.vramCap2048b"
     private const val KEY_AFFINITY_ON = "config.migrated.affinityScheduler"
     // ...and back off it: the mask it enables confines six SPU threads to four cores.
     private const val KEY_AFFINITY_OS = "config.migrated.affinitySchedulerOff"
     private const val KEY_TIMESTRETCH_OFF = "config.migrated.audioTimeStretchOff"
+    private const val KEY_SHADER_PRECISION_LOW = "config.migrated.shaderPrecisionLow"
     // Scaling Mode row changed meaning; a stored 0 used to resolve to Bilinear, now Nearest.
     private const val KEY_CAS_MODE_BILINEAR = "config.migrated.casModeBilinear"
     // Mirror of the settings, written INTO the data folder so a later fresh install that
@@ -149,11 +144,16 @@ object ConfigStore {
     // fix and a bigger one; this makes per-game settings work in the meantime.
     private fun aliasKey(stem: String) = "config.serialalias.$stem"
 
+    // A PS3 title id, BLUS30538 or NPJB00337. A key shaped like one is the library's own serial,
+    // never a filename stem, so it never needs an alias.
+    private val TITLE_ID = Regex("^[A-Z]{4}-?[0-9]{5}$")
+
     /** Record the core-reported serial for a title whose library entry had none. */
     fun rememberSerial(settingsKey: String?, serial: String?) {
         val stem = settingsKey?.takeIf { it.isNotBlank() } ?: return
         val real = serial?.takeIf { it.isNotBlank() } ?: return
         if (stem == real) return
+        if (TITLE_ID.matches(stem)) return
         if (MainActivityRuntime.prefs.getString(aliasKey(stem), null) == real) return
         MainActivityRuntime.prefs.edit { putString(aliasKey(stem), real) }
     }
@@ -192,6 +192,11 @@ object ConfigStore {
     /** The key per-game settings should actually be stored and resolved under. */
     fun effectiveKey(settingsKey: String?): String? {
         val stem = settingsKey?.takeIf { it.isNotBlank() } ?: return settingsKey
+        // Every alias whose stem is a title id was recorded by the launch reading the PREVIOUS
+        // game's serial (MainActivityRuntime.start, fixed), so it points at another game: The
+        // Idolm@ster 2 read and saved Batman: Arkham City's settings. Ignored, every title linked
+        // that way is back on its own settings; the stale entries are just never read.
+        if (TITLE_ID.matches(stem)) return stem
         return runCatching { MainActivityRuntime.prefs.getString(aliasKey(stem), null) }
             .getOrNull()?.takeIf { it.isNotBlank() } ?: stem
     }
@@ -311,23 +316,19 @@ object ConfigStore {
             MainActivityRuntime.prefs.edit { putBoolean(KEY_RELAXED_ZCULL_OFF, true) }
         }
 
-        // Seed the per-title core settings once. Only fields the title does not already carry
-        // are written, so a deliberate change is never overwritten.
-        if (!MainActivityRuntime.prefs.getBoolean(KEY_PER_GAME_SEED, false)) {
+        // Web of Shadows' seeded Accurate SPU Reservations off, taken back out of its per-game
+        // settings so it follows global (on). Only an off value goes; on is left alone.
+        if (!MainActivityRuntime.prefs.getBoolean(KEY_WOS_RSV_SEED_UNDONE, false)) {
             runCatching {
-                for ((serial, fields) in PER_GAME_SEED) {
-                    val existing = loadOverrides(serial) ?: JSONObject()
-                    var changed = false
-                    for ((key, value) in fields) {
-                        if (!existing.has(key)) {
-                            existing.put(key, value)
-                            changed = true
-                        }
-                    }
-                    if (changed) saveOverrides(serial, existing)
+                val serial = "BLUS30218"
+                val stored = loadOverrides(serial)
+                android.util.Log.i("ARMSX3-Config", "Web of Shadows reservations cleanup: per-game settings $stored")
+                if (stored != null && stored.has("ps3AccurateSpuRsv") && !stored.optBoolean("ps3AccurateSpuRsv", true)) {
+                    stored.remove("ps3AccurateSpuRsv")
+                    if (stored.length() == 0) clearOverrides(serial) else saveOverrides(serial, stored)
                 }
             }
-            MainActivityRuntime.prefs.edit { putBoolean(KEY_PER_GAME_SEED, true) }
+            MainActivityRuntime.prefs.edit { putBoolean(KEY_WOS_RSV_SEED_UNDONE, true) }
         }
 
         // Bring stored VRAM caps up to 3072.
@@ -369,20 +370,18 @@ object ConfigStore {
             MainActivityRuntime.prefs.edit { putBoolean(KEY_TUNING_OVERRIDES_PURGED, true) }
         }
 
-        // Drop per-title Accurate SPU Reservations values, except the one title that needs it.
+        // Drop per-title Accurate SPU Reservations values.
         //
         // Turning it off was tried per-title as well as globally while debugging 0.5, and off is
         // off-spec: it forces the SPURS scheduler to HLE and bypasses the reservation lock, so a
         // title left that way desyncs and its SPU threads end up executing whatever they land on.
         // Batman: Arkham City carried it off this way and died with "Unknown STOP code: 0x0".
         //
-        // Web of Shadows keeps it, since it is the title the setting was measured on and it is
-        // the one that gains from it.
+        // Web of Shadows was exempt here once; KEY_WOS_RSV_SEED_UNDONE above takes its value out.
         if (!MainActivityRuntime.prefs.getBoolean(KEY_PERGAME_RSV_CLEARED, false)) {
             runCatching {
                 for (key in MainActivityRuntime.prefs.all.keys.toList()) {
                     if (!key.startsWith("config.game.")) continue
-                    if (key == keyForGame("BLUS30218")) continue
 
                     val serial = key.removePrefix("config.game.")
                     val stored = loadOverrides(serial) ?: continue
@@ -591,8 +590,7 @@ object ConfigStore {
             // marks itself done, so anything recorded afterwards survived it.
             //
             // Global scope ONLY, deliberately. This is correcting the baseline everyone inherited,
-            // not overruling a per-title decision -- Web of Shadows (BLUS30218) is kept off on
-            // purpose, and forgetEverywhere() would take that with it.
+            // not overruling a per-title decision.
             runCatching {
                 CoreSettingOverrides.forget(SettingsScope.Global, null, "Core@@Accurate SPU Reservations")
             }
@@ -614,6 +612,25 @@ object ConfigStore {
                 CoreSettingOverrides.record(SettingsScope.Global, null, "Core@@Save LLVM logs", "false")
             }
             MainActivityRuntime.prefs.edit { putBoolean(KEY_LLVM_LOGS_OFF_2, true) }
+        }
+
+        // Move everyone to Shader Precision Low, once.
+        //
+        // Low is the Android default since 1.0.8: phone GPUs run fp16 at up to twice the fp32 rate,
+        // and Low is what lets the PS3's half-precision shader math use it. It used to also run
+        // math the RSX does at full precision in half (Metal Gear Solid V drew a flat sky); the
+        // fragment decompiler now keeps that in fp32, so Low is correct where it counts.
+        //
+        // A new default alone reaches nobody who already has a config.yml, since every setting
+        // is written out, High included. There is no telling a deliberate High from the old
+        // default, so everyone moves once and the core settings screen takes it back.
+        //
+        // Global tier only. A title someone set to High on purpose keeps it.
+        if (!MainActivityRuntime.prefs.getBoolean(KEY_SHADER_PRECISION_LOW, false)) {
+            runCatching {
+                CoreSettingOverrides.record(SettingsScope.Global, null, "Video@@Shader Precision", JSONObject.quote("Low"))
+            }
+            MainActivityRuntime.prefs.edit { putBoolean(KEY_SHADER_PRECISION_LOW, true) }
         }
 
         // Put Vblank Rate back to 60, which is both upstream's default and what a PS3
@@ -954,6 +971,82 @@ object ConfigStore {
     }
 
     /**
+     * Reset whichever curated fields in this tier hold any of the core nodes [paths] off the value
+     * the tier would otherwise give them: taken out of the title's overrides in Game scope, so they
+     * follow global again, or put back to stock in Global scope. Returns the keys it reset.
+     *
+     * For Forget on All Core Settings. A node can be held by two stores at once, a core edit
+     * recorded on that screen and the curated field one of the normal screens writes, and Forget
+     * only ever dropped the first. Web of Shadows had Accurate SPU Reservations off both ways:
+     * Forget dropped the core edit, the re-push after it wrote the title's own false straight back,
+     * and the switch stayed off.
+     */
+    fun resetFieldsWriting(scope: SettingsScope, serial: String?, paths: Collection<String>): Set<String> {
+        val (base, changes) = tierLayers(scope, serial) ?: return emptySet()
+        val keys = fieldsWriting(paths, base, changes)
+        if (keys.isEmpty()) return emptySet()
+        val title = serial?.trim().orEmpty()
+        if (scope == SettingsScope.Game && title.isNotEmpty()) {
+            keys.forEach { changes.remove(it) }
+            if (changes.length() == 0) clearOverrides(title) else saveOverrides(title, changes)
+        } else {
+            val stockJson = base.toJson()
+            val reset = JSONObject()
+            keys.forEach { if (stockJson.has(it)) reset.put(it, stockJson.get(it)) }
+            saveGlobal(Settings.merge(loadGlobal(), reset))
+        }
+        return keys
+    }
+
+    /**
+     * The core nodes this tier's curated fields hold off the value the tier would otherwise give
+     * them, i.e. the nodes [resetFieldsWriting] has something to reset for. All Core Settings
+     * offers Reset on these, since a value set on a normal screen has no Forget of its own there.
+     */
+    fun nodesHeldBy(scope: SettingsScope, serial: String?): Set<String> {
+        val (base, changes) = tierLayers(scope, serial) ?: return emptySet()
+        if (changes.length() == 0) return emptySet()
+        val baseline = base.coreWrites()
+        return Settings.merge(base, changes).coreWrites().filter { (path, value) -> baseline[path] != value }.keys
+    }
+
+    /** A tier as the curated fields it changes and what they sit on: the title's overrides over
+     *  global in Game scope, global's differences from stock over stock otherwise. */
+    private fun tierLayers(scope: SettingsScope, serial: String?): Pair<Settings, JSONObject>? {
+        val title = serial?.trim().orEmpty()
+        if (scope == SettingsScope.Game && title.isNotEmpty()) {
+            val overrides = loadOverrides(title) ?: return null
+            return loadGlobal() to overrides
+        }
+        val stock = Settings()
+        return stock to Settings.diff(stock, loadGlobal())
+    }
+
+    /**
+     * The keys of [changes] that decide any of [paths] when layered over [base], found by running
+     * the curated push dry ([Settings.coreWrites]) rather than from a field to node table.
+     *
+     * A key counts if taking it out moves the node, or if it alone moves the node off [base]'s
+     * value. The second is for a key another one masks: two fields that write one node, the later
+     * winning, show nothing when the masked one is taken out on its own, and leaving it in would
+     * bring its value back the moment the other goes.
+     */
+    private fun fieldsWriting(paths: Collection<String>, base: Settings, changes: JSONObject): Set<String> {
+        val keys = changes.keys().asSequence().toList()
+        if (keys.isEmpty()) return emptySet()
+        val baseline = base.coreWrites()
+        val current = Settings.merge(base, changes).coreWrites()
+        // Only the nodes this tier actually moves. Usually none, which costs two dry runs.
+        val moved = paths.filter { current[it] != baseline[it] }
+        if (moved.isEmpty()) return emptySet()
+        return keys.filterTo(LinkedHashSet()) { key ->
+            val without = Settings.merge(base, JSONObject(changes.toString()).apply { remove(key) }).coreWrites()
+            val alone = Settings.merge(base, JSONObject().put(key, changes.get(key))).coreWrites()
+            moved.any { without[it] != current[it] || alone[it] != baseline[it] }
+        }
+    }
+
+    /**
      * Resolve effective Settings for a VM launch:
      *   per-game override (if present) ∘ global ∘ defaults.
      *
@@ -986,7 +1079,19 @@ object ConfigStore {
      * ([previous]), or by already being pinned — and only [clearOverrides] unpins it.
      */
     fun save(scope: SettingsScope, serial: String?, updated: Settings, previous: Settings? = null) {
-        if (scope == SettingsScope.Game && serial != null) {
+        if (scope == SettingsScope.Game && serial != null && previous != null) {
+            // The caller says what it changed: store that, and keep the overrides already there.
+            //
+            // `updated` is the caller's whole copy of the settings, and the in-game menu takes its
+            // copy when it opens. Anything changed in global Settings after that (UPnP, turned on
+            // while Arkham Origins was running) still has its old value in the copy, so comparing
+            // the copy with global, as below, stored that old value as the game's own, and it beat
+            // global from then on. Only what this save changed belongs to the game.
+            val overrides = loadOverrides(serial)?.let { JSONObject(it.toString()) } ?: JSONObject()
+            val changed = Settings.diff(previous, updated)
+            changed.keys().forEach { key -> overrides.put(key, changed.get(key)) }
+            saveOverrides(serial, overrides)
+        } else if (scope == SettingsScope.Game && serial != null) {
             val global = loadGlobal()
             val overrides = Settings.diff(global, updated)
             // Every field, so a pinned key can be given its CURRENT value even when that

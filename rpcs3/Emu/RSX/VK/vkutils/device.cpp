@@ -228,16 +228,17 @@ namespace vk
 		optional_features_support.synchronization_2        = device_extensions.is_supported(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
 		optional_features_support.unrestricted_depth_range = device_extensions.is_supported(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
 #ifdef __ANDROID__
-		// Probed for the log only. Frame generation no longer shares images by AHardwareBuffer,
-		// and this extension is NOT requested at vkCreateDevice -- see the note there.
-		optional_features_support.external_memory_ahb      = device_extensions.is_supported(VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME);
+		// Remote play's frame sharing. Both or neither, and requested at vkCreateDevice whenever
+		// true -- see the note there.
+		optional_features_support.external_memory_ahb      = device_extensions.is_supported(VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME) &&
+			device_extensions.is_supported(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
 		optional_features_support.vulkan_memory_model      = !!vk12_info.vulkanMemoryModel;
 		optional_features_support.null_descriptor          = !!robustness2_info.nullDescriptor;
 
 		// Reported unconditionally because these decide whether frame generation can exist at all
 		// on this device, and the answer is otherwise invisible until something fails much later.
 		rsx_log.notice("Vulkan: frame generation requirements -- vulkanMemoryModel: %s, nullDescriptor: %s"
-			" (AHardwareBuffer external memory, no longer required: %s)",
+			" (AHardwareBuffer external memory, for remote play: %s)",
 			optional_features_support.vulkan_memory_model ? "yes" : "NO",
 			optional_features_support.null_descriptor ? "yes" : "NO",
 			optional_features_support.external_memory_ahb ? "yes" : "no");
@@ -256,9 +257,33 @@ namespace vk
 			custom_border_color_support.require_border_color_remap = get_driver_vendor() != driver_vendor::AMD;
 		}
 
-		// v3dv and PanVK support BC1-BC3 which is all we require, support is reported as false since not all formats are supported
-		optional_features_support.texture_compression_bc = features.textureCompressionBC
-				|| get_driver_vendor() == driver_vendor::V3DV || get_driver_vendor() == driver_vendor::PANVK;
+		// v3dv and PanVK can sample BC1-BC3, which is all we require, while reporting the feature as
+		// false because the rest of BC is missing. Ask for those formats instead of trusting the
+		// driver's name: PanVK built for Android Mali (on Arm's kbase kernel driver) has no BC at
+		// all, and taking it on trust would hand the GPU DXT textures it cannot sample instead of
+		// decoding them on the CPU.
+		optional_features_support.texture_compression_bc = features.textureCompressionBC;
+
+		if (!features.textureCompressionBC &&
+			(get_driver_vendor() == driver_vendor::V3DV || get_driver_vendor() == driver_vendor::PANVK))
+		{
+			bool bc1_3_sampled = true;
+
+			for (const VkFormat format : { VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC1_RGBA_SRGB_BLOCK,
+				VK_FORMAT_BC2_UNORM_BLOCK, VK_FORMAT_BC2_SRGB_BLOCK, VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC3_SRGB_BLOCK })
+			{
+				VkFormatProperties props{};
+				vkGetPhysicalDeviceFormatProperties(dev, format, &props);
+				bc1_3_sampled = bc1_3_sampled && (props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
+			}
+
+			optional_features_support.texture_compression_bc = bc1_3_sampled;
+
+			if (!bc1_3_sampled)
+			{
+				rsx_log.notice("Vulkan: this driver cannot sample BC1-BC3; DXT textures are decoded on the CPU.");
+			}
+		}
 
 		// Texel buffer UAB is reported to the trigger for some driver crashes on older NV cards
 		if (get_driver_vendor() == driver_vendor::NVIDIA &&
@@ -899,21 +924,22 @@ namespace vk
 			requested_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
 		}
 
-		// VK_ANDROID_external_memory_android_hardware_buffer is deliberately NOT requested.
+#ifdef __ANDROID__
+		// AHardwareBuffer sharing, for ARMSX3 remote play: captured frames go to the video encoder
+		// without a copy through the CPU (VKPresent.cpp).
 		//
-		// It used to be, for frame generation: framegen ran on its own VkDevice behind a dlopen'd
-		// library and an AHardwareBuffer was the only currency the two devices shared. The passes
-		// run on OUR device now (RSX/VK/FrameGen/*, and shared_image::create in VKFrameGen.cpp
-		// allocates a plain device-local VkImage), so nothing in this process ever imports or
-		// exports an AHardwareBuffer.
-		//
-		// Enabling it anyway was not free. Its dependency list includes VK_EXT_queue_family_foreign,
-		// which -- unlike sampler_ycbcr_conversion, external_memory and dedicated_allocation -- was
-		// never promoted to core in ANY Vulkan version, so requesting AHB at the apiVersion 1.2 this
-		// build asks for (instance.cpp) violates VUID-vkCreateDevice-ppEnabledExtensionNames-01387.
-		// Drivers do not enforce that VUID, so vkCreateDevice still succeeded and the only symptom
-		// was a validation-layer error. If an AHB sharing path ever comes back, restore the push AND
-		// add VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME next to it, guarded by its own is_supported().
+		// It was requested once before, for frame generation, and dropped when framegen moved onto
+		// this device. That request violated VUID-vkCreateDevice-ppEnabledExtensionNames-01387:
+		// VK_EXT_queue_family_foreign, one of its dependencies, was never promoted to core and was
+		// not requested with it. Drivers did not enforce the VUID, so the only symptom was a
+		// validation-layer error. It is requested alongside now, and external_memory_ahb is only
+		// true when the device offers both.
+		if (pgpu->optional_features_support.external_memory_ahb)
+		{
+			requested_extensions.push_back(VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME);
+			requested_extensions.push_back(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
+		}
+#endif
 
 		if (pgpu->optional_features_support.external_memory_host)
 		{

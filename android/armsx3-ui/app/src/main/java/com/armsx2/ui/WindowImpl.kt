@@ -32,6 +32,8 @@ enum class InGameScreen {
     Settings, CoreSettings, Achievements, Controls, Skins, Textures, SaveState, LoadState,
     // PS3 trophies for the RUNNING title (the library's Trophies screen, scoped).
     Trophies,
+    // All Settings' Hotkeys page, from the quick menu's Controller tab.
+    Hotkeys,
 }
 
 object WindowImpl {
@@ -191,6 +193,13 @@ object WindowImpl {
                             game = MainActivityRuntime.currentGame.value,
                             onBack = dismiss,
                         )
+                        // Same for Hotkeys, from the quick menu's Controller tab: binding one is
+                        // something you find you need mid-game, like the Pressure Modifier toggle.
+                        InGameScreen.Hotkeys -> com.armsx2.ui.settingshub.SettingsScreen(
+                            initialCategory = com.armsx2.navigation.SettingsCategory.Hotkeys,
+                            game = MainActivityRuntime.currentGame.value,
+                            onBack = dismiss,
+                        )
                         // Texture packs were only reachable via All Settings -> Renderer,
                         // which is the worst place for them: the pack folder must match the
                         // RUNNING game's serial, so the screen is only meaningful with a game
@@ -246,6 +255,10 @@ object WindowImpl {
                 // and here rather than at the call site because a prompt raised from inside a
                 // scrolling settings tab would clip to that tab and scroll away with it.
                 com.armsx2.ui.common.GlobalConfirm.Host()
+
+                // An install another app asked for (issue #188). Last, so it covers everything,
+                // and here because the request can arrive while any screen is open.
+                com.armsx2.ui.packages.ExternalInstallHost()
             }
         }
     }

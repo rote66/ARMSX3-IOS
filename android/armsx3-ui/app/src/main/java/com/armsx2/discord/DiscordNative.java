@@ -76,8 +76,12 @@ public final class DiscordNative {
     /** Create the client; a non-empty token skips the browser and connects directly. Idempotent. */
     public static native void start(String savedToken);
 
-    /** Full browser authorization. Needs an Activity bound via DiscordSocialSdkInit first. */
-    public static native void authorize();
+    /**
+     * Full browser authorization. Needs an Activity bound via DiscordSocialSdkInit first.
+     * customScheme is the URI scheme the sign-in returns through; empty means the SDK's default,
+     * discord-&lt;application id&gt;.
+     */
+    public static native void authorize(String customScheme);
 
     /** The freshly-issued token, exactly once, so the caller can persist it. Empty otherwise. */
     public static native String takeToken();
@@ -89,8 +93,11 @@ public final class DiscordNative {
     public static native String error();
 
     /** Publish what is running. Empty title = back in the library. raPresence is
-     *  RetroAchievements' own rich-presence line, or empty when RA is off. */
-    public static native void setPlaying(String serial, String title, String coverUrl, String raPresence);
+     *  RetroAchievements' own rich-presence line, or empty when RA is off. remotePlayParty is the
+     *  party id of a remote play session with both players in, or empty outside one. With
+     *  showGameInStatus off, the status reads "Playing ARMSX3" instead of the game. */
+    public static native void setPlaying(String serial, String title, String coverUrl, String raPresence,
+            String remotePlayParty, boolean showGameInStatus);
 
     /** Friends in ARMSX2, as name/game/serial/avatar records. */
     public static native String friends();

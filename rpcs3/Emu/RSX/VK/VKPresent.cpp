@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "VKCommandStream.h"
 #include "VKGSRender.h"
 #include "VKFrameGen.h"
 #include "vkutils/buffer_object.h"
@@ -21,8 +22,25 @@
 #include "util/asm.hpp"
 #include "util/video_provider.h"
 
+#include <bit>
+
+#ifdef __ANDROID__
+#include <android/hardware_buffer.h>
+#endif
+
 extern atomic_t<bool> g_user_asked_for_screenshot;
 extern atomic_t<recording_mode> g_recording_mode;
+// android/src/remote_play.cpp
+extern atomic_t<u32> g_remote_play_max_size;
+extern atomic_t<u32> g_remote_play_frames;
+extern atomic_t<u32> g_remote_play_skipped;
+extern atomic_t<bool> g_remote_play_hardware;
+
+namespace vk
+{
+	// Set in swapchain.cpp: whether the WSI images can be read back (TRANSFER_SRC).
+	extern bool g_swapchain_transfer_src;
+}
 
 namespace
 {
@@ -64,11 +82,33 @@ bool VKGSRender::reinitialize_swapchain()
 
 	if (m_surface_lost)
 	{
+		// Not while the emulator is stopping. Leaving a game closes its screen, so Android destroys
+		// the window while the renderer is still drawing its last frames, and the surface is lost
+		// mid-stop. handle() cannot wait for a new window then and hands back the one it already
+		// had, which is the window being destroyed: building a surface on it failed with
+		// VK_ERROR_NATIVE_WINDOW_IN_USE_KHR, a fatal error, on every exit that hit this window.
+		// Seen on an Odin 3 and in issue #180 (Galaxy S25 Ultra): "surface event 2", "Stopping
+		// emulator...", then the fatal in make_WSI_surface. Nothing is shown again once stopping.
+		if (Emu.IsStopped())
+		{
+			swapchain_unavailable = true;
+			return false;
+		}
+
 		// handle() blocks until the app hands us a live native window again, so
 		// this parks here for as long as the user is away and resumes the moment
 		// they come back.
 		if (auto* wsi = dynamic_cast<vk::swapchain_WSI*>(m_swapchain.get()))
 		{
+			const display_handle_t window = m_frame->handle();
+
+			// The same case, starting while handle() waited.
+			if (Emu.IsStopped())
+			{
+				swapchain_unavailable = true;
+				return false;
+			}
+
 			rsx_log.warning("Surface was lost; rebuilding it from the current native window.");
 
 			// ORDER MATTERS. The swapchain has to be destroyed before the surface
@@ -76,7 +116,7 @@ bool VKGSRender::reinitialize_swapchain()
 			// swapchain still references, and doing it the other way round faulted
 			// inside the driver on the very next present.
 			wsi->destroy_swapchain_only();
-			wsi->replace_surface(m_instance.recreate_surface(m_frame->handle()));
+			wsi->replace_surface(m_instance.recreate_surface(window));
 		}
 
 		// A NEW surface is new state, so the SUBOPTIMAL latch from the old one must not carry
@@ -166,6 +206,9 @@ bool VKGSRender::reinitialize_swapchain()
 	// present it to, so drop it rather than carry a pointer into freed contexts.
 	m_deferred_present_frame = nullptr;
 	m_framegen_blit_cb_count = 0;
+
+	// Read with the same setting init() reads to pick the present mode. See m_swapchain_framegen.
+	m_swapchain_framegen = g_cfg.video.frame_generation != frame_generation_mode::off;
 
 	// Rebuild swapchain. Old swapchain destruction is handled by the init_swapchain call
 	if (!m_swapchain->init(m_swapchain_dims.width, m_swapchain_dims.height))
@@ -360,29 +403,130 @@ vk::command_buffer_chunk* VKGSRender::present_generated_frame(VkImage src)
 	vk::change_image_layout(*cmd, target, VK_IMAGE_LAYOUT_UNDEFINED,
 		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, range);
 
-	VkImageBlit region = {};
-	region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-	region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-	region.srcOffsets[1] = { s32(m_swapchain_dims.width), s32(m_swapchain_dims.height), 1 };
-	region.dstOffsets[1] = { s32(m_swapchain_dims.width), s32(m_swapchain_dims.height), 1 };
+	// The generated image was written by the passes on this same queue, submitted before this, so
+	// it is complete by the time this runs. The opposite direction -- the next generation
+	// overwriting it while this blit is still reading it -- is guarded by the caller, which waits
+	// for this command buffer before the next generation.
+	if (vk::frame_gen::generated_at_game_resolution())
+	{
+		// Captured from the game image (vk::frame_gen::capture_game_frame): put it on screen the
+		// way flip() put the real frame, then draw the overlays on it afresh, so a generated frame
+		// looks exactly like a real one except for the interpolated game image itself.
+		const areai& area = m_framegen_present_area;
 
-	// The generated image was written by framegen's device and waited on with its device idle, so
-	// it is complete by the time we get here; no cross-device semaphore exists to use instead. The
-	// opposite direction -- framegen overwriting this image while this blit is still reading it --
-	// is guarded by the caller, which waits for this command buffer before the next generation.
-	vkCmdBlitImage(*cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		// NEAREST: source and destination are the same size, so linear filtering buys nothing and
-		// costs a filtered sampling pass instead of the fast copy path.
-		target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_NEAREST);
+		// The acquired image is undefined, so whatever the blit leaves uncovered is cleared to
+		// black, on the same test flip() uses for the real frame.
+		if (area.x1 || area.y1 || u32(area.x2) < m_swapchain->get_width() || u32(area.y2) < m_swapchain->get_height())
+		{
+			VkClearColorValue clear_black {};
+			vkCmdClearColorImage(*cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear_black, 1, &range);
 
-	vk::change_image_layout(*cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, range);
+			vk::insert_image_memory_barrier(*cmd, target,
+				VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, range);
+		}
+
+		VkImageBlit region = {};
+		region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		region.srcOffsets[1] = { s32(vk::frame_gen::generated_width()), s32(vk::frame_gen::generated_height()), 1 };
+		region.dstOffsets[0] = { area.x1, area.y1, 0 };
+		region.dstOffsets[1] = { area.x2, area.y2, 1 };
+
+		vkCmdBlitImage(*cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, m_framegen_filter);
+
+		if (m_overlay_manager && m_overlay_manager->has_visible())
+		{
+			vk::change_image_layout(*cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, range);
+
+			const auto key = vk::get_renderpass_key(m_swapchain->get_surface_format());
+			const VkRenderPass single_target_pass = vk::get_renderpass(*m_device, key);
+			ensure(single_target_pass != VK_NULL_HANDLE);
+
+			auto* fbo = vk::get_framebuffer(*m_device, m_swapchain_dims.width, m_swapchain_dims.height, VK_FALSE,
+				single_target_pass, m_swapchain->get_surface_format(), target);
+			fbo->add_ref();
+
+			{
+				// As flip()'s render_overlays: lock to avoid modification during the run-update chain.
+				auto ui_renderer = vk::get_overlay_pass<vk::ui_overlay_renderer>();
+				std::lock_guard lock(*m_overlay_manager);
+
+				const areau display_area = { 0, 0, static_cast<u32>(m_swapchain_dims.width), static_cast<u32>(m_swapchain_dims.height) };
+
+				// advance = false: the same overlays the real frame drew, without stepping them. The
+				// performance overlay counts a frame per step, so stepping here made its FPS read
+				// the generated rate instead of the game's.
+				for (const auto& view : m_overlay_manager->get_views())
+				{
+					const areau render_area = view->use_window_space ? display_area : areau(area);
+					ui_renderer->run(*cmd, render_area, fbo, single_target_pass, m_texture_upload_buffer_ring_info, *view.get(), false);
+				}
+			}
+
+			fbo->release();
+
+			vk::change_image_layout(*cmd, target, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+				VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, range);
+		}
+		else
+		{
+			vk::change_image_layout(*cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, range);
+		}
+	}
+	else
+	{
+		// Captured from the finished screen: already composited, so a straight copy.
+		VkImageBlit region = {};
+		region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		region.srcOffsets[1] = { s32(m_swapchain_dims.width), s32(m_swapchain_dims.height), 1 };
+		region.dstOffsets[1] = { s32(m_swapchain_dims.width), s32(m_swapchain_dims.height), 1 };
+
+		vkCmdBlitImage(*cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			// NEAREST: source and destination are the same size, so linear filtering buys nothing and
+			// costs a filtered sampling pass instead of the fast copy path.
+			target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_NEAREST);
+
+		vk::change_image_layout(*cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, range);
+	}
 
 	cmd->end();
 
-	// No semaphores either side. The source was already made visible by framegen's device idle,
-	// and the present below has nothing to wait on because this command buffer is the only writer
-	// of this swapchain image.
+	// The overlays drawn above uploaded into the renderer's flushable heaps. Where those are
+	// shadowed in host memory nothing reaches the GPU until they are synced, which
+	// close_and_submit_command_buffer does ahead of every real submission and a plain submit()
+	// does not. Same sync, same order: its own command buffer, submitted first on this queue.
+	if (vk::test_status_interrupt(vk::heap_dirty))
+	{
+		if (const auto dirty_list = m_flushable_data_heaps.filter(FN(x->is_dirty()));
+			!dirty_list.empty())
+		{
+			auto heap_cb = m_secondary_cb_list.next();
+			heap_cb->begin();
+
+			for (auto& heap : dirty_list)
+			{
+				heap->sync(*heap_cb);
+			}
+
+			heap_cb->end();
+
+			vk::queue_submit_t heap_submit{ m_device->get_graphics_queue(), nullptr };
+			heap_cb->submit(heap_submit, VK_FALSE);
+		}
+
+		vk::clear_status_interrupt(vk::heap_dirty);
+	}
+
+	// No semaphores either side. The source was written by the passes on this queue earlier, and
+	// the present below has nothing to wait on because this command buffer is the only writer of
+	// this swapchain image.
 	vk::queue_submit_t submit_info{};
 	submit_info.queue = m_device->get_graphics_queue();
 
@@ -759,6 +903,10 @@ void VKGSRender::queue_swap_request()
 
 	s_fg_asked += generated;
 
+	// This frame's generated presents belong to it: frame_context_cleanup waits for them before it
+	// reclaims what they drew their overlays from.
+	m_current_frame->framegen_cb_count = 0;
+
 	for (u32 i = 0; i < generated; ++i)
 	{
 		auto* cb = present_generated_frame(vk::frame_gen::generated_image(i));
@@ -770,6 +918,11 @@ void VKGSRender::queue_swap_request()
 		if (cb && m_framegen_blit_cb_count < std::size(m_framegen_blit_cb))
 		{
 			m_framegen_blit_cb[m_framegen_blit_cb_count++] = cb;
+		}
+
+		if (cb && m_current_frame->framegen_cb_count < std::size(m_current_frame->framegen_cbs))
+		{
+			m_current_frame->framegen_cbs[m_current_frame->framegen_cb_count++] = cb;
 		}
 	}
 
@@ -878,6 +1031,18 @@ void VKGSRender::frame_context_cleanup(vk::frame_context_t *ctx)
 			// Lost surface/device, release swapchain
 			swapchain_unavailable = true;
 		}
+
+		// And the frame's generated presents, which read its overlay uploads and descriptors: the
+		// reclaim below would otherwise free them while the GPU is still drawing from them. They
+		// were submitted straight after the frame, so this is normally already satisfied. A buffer
+		// the ring has since reused is either not pending or later work, and waiting on either is
+		// still correct.
+		for (u32 i = 0; i < ctx->framegen_cb_count; ++i)
+		{
+			ctx->framegen_cbs[i]->wait(FRAME_PRESENT_TIMEOUT);
+		}
+
+		ctx->framegen_cb_count = 0;
 	}
 
 	// Resource cleanup.
@@ -943,6 +1108,23 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
 	const auto format_bpp = rsx::get_format_block_size_in_bytes(info->format);
 	const auto overlap_info = m_rtts.get_merged_texture_memory_region(*m_current_command_buffer,
 		info->address, info->width, info->height, info->pitch, format_bpp, rsx::surface_access::transfer_read);
+
+	if (m_frame_dump.take_final) [[unlikely]]
+	{
+		// Frame dump: what the image shown is assembled from, since a wrong piece here is its own bug.
+		fmt::append(m_frame_dump.index, "The final image is display buffer 0x%x, %ux%u, pitch %u, format %d, from %u surface(s):\n",
+			info->address, info->width, info->height, info->pitch, static_cast<int>(info->format), static_cast<u32>(overlap_info.size()));
+
+		for (const auto& section : overlap_info)
+		{
+			const auto rtt = vk::as_rtt(section.surface);
+			fmt::append(m_frame_dump.index, "  surface 0x%x, %ux%u%s%s%s, from [%u,%u %ux%u] to [%u,%u %ux%u]\n",
+				rtt->base_addr, rtt->get_surface_width<rsx::surface_metrics::samples>(), rtt->get_surface_height<rsx::surface_metrics::samples>(),
+				section.is_depth ? ", depth" : "", section.is_clipped ? ", clipped" : "", section.is_reloaded ? ", reloaded" : "",
+				section.src_area.x, section.src_area.y, section.src_area.width, section.src_area.height,
+				section.dst_area.x, section.dst_area.y, section.dst_area.width, section.dst_area.height);
+		}
+	}
 
 	if (!overlap_info.empty())
 	{
@@ -1054,6 +1236,9 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
 
 void VKGSRender::flip(const rsx::display_flip_info_t& info)
 {
+	// Frame dumps (VKFrameDump.cpp) start, wait and finish on flips.
+	frame_dump_on_flip(info);
+
 	// GPU timing is driven from the flip, the only place that corresponds to a real
 	// presented frame. collect() is non-blocking: anything the GPU has not finished is
 	// left for a later call rather than waited on.
@@ -1149,6 +1334,16 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 	}
 
 	if (m_vsync_mode != g_cfg.video.vsync)
+	{
+		swapchain_unavailable = true;
+	}
+
+	// Frame generation needs FIFO so each generated frame gets a vblank of its own (swapchain.cpp),
+	// and that is decided only when the swapchain is built. Its setting reaches the core after the
+	// first swapchain exists, and can be switched in-game, so it ran in MAILBOX: the real frame
+	// presented right after each generated one replaced it, and measured on the Odin 3 only 51 of
+	// 60 refreshes showed a new frame. Rebuild on a change, as for VSync.
+	if (m_swapchain_framegen != (g_cfg.video.frame_generation != frame_generation_mode::off))
 	{
 		swapchain_unavailable = true;
 	}
@@ -1269,6 +1464,24 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 			.eye = 0
 		};
 		image_to_flip = get_present_source(&present_info, avconfig);
+
+		if (m_frame_dump.take_final) [[unlikely]]
+		{
+			m_frame_dump.take_final = false;
+
+			if (image_to_flip)
+			{
+				// Recorded into this frame's commands and written after the frame is submitted. A GPU
+				// wait here, between choosing the present source and presenting it, can let a temporary
+				// source go while the flip still uses it: the first version of this crashed the RSX
+				// thread on its next draw with an invalid layout.
+				frame_dump_record({ image_to_flip }, "final", "final image", fmt::format("the image this flip shows (%ux%u)", image_to_flip->width(), image_to_flip->height()));
+			}
+			else
+			{
+				m_frame_dump.index += "This flip had no image to show.\n";
+			}
+		}
 
 		if (avconfig.stereo_enabled) [[unlikely]]
 		{
@@ -1468,7 +1681,10 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 
 	const bool has_overlay = (m_overlay_manager && m_overlay_manager->has_visible());
 	const bool user_asked_for_screenshot = g_user_asked_for_screenshot.exchange(false);
-	const bool user_is_recording = (g_recording_mode != recording_mode::stopped && m_frame->can_consume_frame());
+	// Remote play takes the recording hook too, but reads frames back on its own path (below).
+	const u32 remote_play_max_size = g_remote_play_max_size.load();
+	const bool remote_play_capture = remote_play_max_size && g_recording_mode != recording_mode::stopped && m_frame->can_consume_frame();
+	const bool user_is_recording = !remote_play_max_size && (g_recording_mode != recording_mode::stopped && m_frame->can_consume_frame());
 	const bool need_media_capture = user_asked_for_screenshot || user_is_recording;
 
 	const auto render_overlays = [&](vk::framebuffer_holder* fbo, const areau& area)
@@ -1486,6 +1702,15 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 			ui_renderer->run(*m_current_command_buffer, render_area, fbo, single_target_pass, m_texture_upload_buffer_ring_info, *view.get());
 		}
 	};
+
+	if (image_to_flip && remote_play_capture)
+	{
+		remote_capture_record(image_to_flip, buffer_width, buffer_height, remote_play_max_size);
+	}
+	else if (!remote_play_max_size && (m_remote_capture_marker || m_remote_capture_y || m_remote_capture_rgba))
+	{
+		remote_capture_release(false);
+	}
 
 	// WARNING: We have to do this here. We cannot touch the acquired image on the CB and then do a hard sync on it before it is submitted to the presentation engine.
 	// That introduces a WRITE_AFTER_PRESENT (from the previous present) when we later try to present on a different CB
@@ -1566,14 +1791,21 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 		vk::copy_image_to_buffer(*m_current_command_buffer, image_to_copy, &sshot_vkbuf, copy_info);
 		image_to_copy->pop_layout(*m_current_command_buffer);
 
+		// We need to disable the driver manager temporarily as this next section is out of sequence.
+		// We're not supposed to be halting the GPU here and we certainly do not want to run driver management as we will end up deleting temp resources too early.
+		auto& driver_manager = g_fxo->get<vk::driver_manager_thread>();
+		driver_manager.set_enabled(false);
+
 		if (rsx::prof::enabled()) [[unlikely]] rsx::prof::g_flush_sites[18]++; flush_command_queue(true);
 		const auto src = sshot_vkbuf.map(0, sshot_size);
 		std::vector<u8> sshot_frame(sshot_size);
 		memcpy(sshot_frame.data(), src, sshot_size);
 		sshot_vkbuf.unmap();
 
-		const bool is_bgra = image_to_copy->format() == VK_FORMAT_B8G8R8A8_UNORM;
+		// Restore the driver manager state to keep things from crashing...
+		driver_manager.set_enabled(true);
 
+		const bool is_bgra = image_to_copy->format() == VK_FORMAT_B8G8R8A8_UNORM;
 		if (user_asked_for_screenshot)
 		{
 			m_frame->take_screenshot(std::move(sshot_frame), buffer_width, buffer_height, is_bgra);
@@ -1876,7 +2108,28 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 	// A swapchain image is not usable as a pass input, so this copies it into a plain device-local
 	// VkImage on our own device (vk::frame_gen::shared_image). There is no second device and no
 	// AHardwareBuffer. Returns false and costs nothing when the feature is off, which is the default.
-	if (image_to_flip)
+	//
+	// EXCEPT on the plain path -- no calibration pass and a blit upscaler, which is the default.
+	// There a generated frame can be put on screen exactly as the real one was: the same scaled
+	// blit into the same area, then the overlays drawn on top of it rather than interpolated. So
+	// the passes run on the game image at the game's own size instead of the screen's, which costs
+	// less by the ratio of the two (720p on a 1080p screen: 2.25x fewer pixels to generate). Every
+	// other output mode renders through passes a generated frame would need a run of its own of,
+	// so those keep capturing the finished screen.
+	const bool framegen_plain_output = image_to_flip && !avconfig.stereo_enabled &&
+		g_cfg.video.full_rgb_range_output.get() && rsx::fcmp(avconfig.gamma, 1.f) &&
+		(m_output_scaling == output_scaling_mode::bilinear || m_output_scaling == output_scaling_mode::nearest);
+
+	if (framegen_plain_output)
+	{
+		if (vk::frame_gen::capture_game_frame(*m_current_command_buffer, *m_device, image_to_flip,
+			buffer_width, buffer_height, m_swapchain_dims.width, m_swapchain_dims.height))
+		{
+			m_framegen_present_area = aspect_ratio;
+			m_framegen_filter = (m_output_scaling == output_scaling_mode::nearest) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+		}
+	}
+	else if (image_to_flip)
 	{
 		vk::frame_gen::capture_presented_frame(*m_current_command_buffer, *m_device,
 			// present_layout, NOT target_layout.
@@ -1891,12 +2144,79 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 			buffer_width, buffer_height);
 	}
 
+	// Frame dump: copy out the swapchain image as it will be presented, to tell a frame that was
+	// rendered wrong from one that only reached the screen wrong. It joins the final image's copy,
+	// and both are written once this frame's commands have finished.
+	vk::command_buffer_chunk* dump_cb = nullptr;
+
+	if (m_frame_dump.take_screen) [[unlikely]]
+	{
+		m_frame_dump.take_screen = false;
+
+		if (!m_frame_dump.stop_reason.empty())
+		{
+			// A limit was reached: frame_dump_finish says which, and nothing more is written.
+		}
+		else if (m_swapchain->is_headless() || !vk::g_swapchain_transfer_src)
+		{
+			// Reading a WSI image needs TRANSFER_SRC, which the swapchain only asks for when frame
+			// generation is on or ARMSX3_DUMP_PASSES was set at boot.
+			m_frame_dump.index += "The screen buffer was not saved: this swapchain cannot be read back.\n";
+		}
+		else
+		{
+			frame_dump_copy copy;
+			copy.width = m_swapchain->get_width();
+			copy.height = m_swapchain->get_height();
+			copy.format = m_swapchain->get_surface_format();
+			copy.bpp = vk::get_format_texel_width(copy.format);
+			copy.size = u64{copy.width} * copy.height * copy.bpp;
+			copy.why = "screen";
+			copy.desc = "the swapchain image, as it is handed to the display";
+			copy.draws = umax;
+			copy.name = fmt::format("%03u_screen_%ux%u.png", m_frame_dump.images + static_cast<u32>(m_frame_dump_pending.size()), copy.width, copy.height);
+			copy.buf = std::make_unique<vk::buffer>(*m_device, copy.size,
+				m_device->get_memory_mapping().host_visible_coherent, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+				VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0, VMM_ALLOCATION_POOL_SYSTEM);
+
+			vk::change_image_layout(*m_current_command_buffer, target_image, target_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, subresource_range);
+			target_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+
+			VkBufferImageCopy region{};
+			region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+			region.imageExtent = { copy.width, copy.height, 1 };
+			vkCmdCopyImageToBuffer(*m_current_command_buffer, target_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, copy.buf->value, 1, &region);
+
+			m_frame_dump_pending.push_back(std::move(copy));
+		}
+
+		if (!m_frame_dump_pending.empty())
+		{
+			vk::insert_global_memory_barrier(*m_current_command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+				VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+		}
+
+		dump_cb = m_current_command_buffer;
+	}
+
 	if (target_layout != present_layout)
 	{
 		vk::change_image_layout(*m_current_command_buffer, target_image, target_layout, present_layout, subresource_range);
 	}
 
 	queue_swap_request();
+
+	if (dump_cb) [[unlikely]]
+	{
+		// The copies ride in this frame's own command buffers, so wait for the last one to land.
+		if (!m_frame_dump_pending.empty())
+		{
+			dump_cb->wait(FRAME_PRESENT_TIMEOUT);
+			frame_dump_write_pending();
+		}
+
+		frame_dump_finish();
+	}
 
 	m_frame_stats.flip_time = m_profiler.duration();
 
@@ -1930,4 +2250,581 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 			if (rsx::prof::enabled()) [[unlikely]] rsx::prof::g_flush_sites[20]++; flush_command_queue(true);
 		}
 	}
+}
+
+namespace vk
+{
+	// ARMSX3 remote play: a capture pass's target. Its framebuffers go with it when the resource
+	// manager finally destroys it, after the frames that drew into it have completed, the way render
+	// targets do theirs, instead of while a pending frame may still use them.
+	struct remote_capture_target : public image
+	{
+		using image::image;
+
+		~remote_capture_target() override
+		{
+			vk::remove_framebuffers_with_image(this);
+		}
+	};
+
+	// ARMSX3 remote play: the stream's frame, drawn from the game's. Three modes: the Y plane at the
+	// stream's size, the interleaved UV plane at half that, or the whole frame as RGBA for the
+	// hardware path. Each samples the game's frame with linear filtering, which is also the
+	// downscale. Fragment passes rather than compute: a compute dispatch every frame is the
+	// graphics->compute switch that hung Adreno 830 (see compute_task::run). YUV is BT.601 limited
+	// range, as libyuv's ABGRToI420 that this replaced.
+	struct remote_play_capture_pass : public overlay_pass
+	{
+		enum mode : s32
+		{
+			luma = 0,
+			chroma = 1,
+			rgba = 2,
+		};
+
+		struct
+		{
+			f32 scale_x = 1.f;
+			f32 scale_y = 1.f;
+			s32 mode = luma;
+			s32 srgb = 0;
+			f32 area_x = 0.f;
+			f32 area_y = 0.f;
+			f32 area_w = 1.f;
+			f32 area_h = 1.f;
+		} params;
+
+		static constexpr u32 push_constants_size = 32;
+
+		remote_play_capture_pass()
+		{
+			vs_src =
+			#include "../Program/GLSLSnippets/GenericVSPassthrough.glsl"
+			;
+
+			fs_src = R"(
+#version 440
+
+layout(set=0, binding=0) uniform sampler2D fs0;
+
+layout(location=0) in vec2 tc0;
+layout(location=0) out vec4 ocol;
+
+layout(push_constant) uniform static_data
+{
+	vec2 scale;
+	int mode;
+	int srgb;
+	vec4 area;
+};
+
+void main()
+{
+	// Where this pixel falls in the game's picture, which sits in the stream's frame the way it
+	// sits on a screen: the bars around it are black.
+	vec2 pos = (tc0 - area.xy) / area.zw;
+	if (any(lessThan(pos, vec2(0.0))) || any(greaterThan(pos, vec2(1.0))))
+	{
+		ocol = mode == 0 ? vec4(16.0 / 255.0) : mode == 1 ? vec4(128.0 / 255.0, 128.0 / 255.0, 0.0, 1.0) : vec4(0.0, 0.0, 0.0, 1.0);
+		return;
+	}
+
+	vec3 c = texture(fs0, pos * scale).rgb;
+
+	if (srgb != 0)
+	{
+		// The view decoded sRGB when sampling; the stream is made from the encoded values.
+		c = mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c));
+	}
+
+	if (mode == 0)
+	{
+		ocol = vec4((16.0 + dot(c, vec3(65.481, 128.553, 24.966))) / 255.0);
+	}
+	else if (mode == 1)
+	{
+		ocol = vec4(
+			(128.0 + dot(c, vec3(-37.797, -74.203, 112.0))) / 255.0,
+			(128.0 + dot(c, vec3(112.0, -93.786, -18.214))) / 255.0,
+			0.0, 1.0);
+	}
+	else
+	{
+		ocol = vec4(c, 1.0);
+	}
+}
+)";
+
+			renderpass_config.set_depth_mask(false);
+			renderpass_config.set_color_mask(0, true, true, true, true);
+			renderpass_config.set_attachment_count(1);
+
+			m_num_usable_samplers = 1;
+			m_num_uniform_buffers = 0;
+		}
+
+		std::vector<vk::glsl::program_input> get_fragment_inputs() override
+		{
+			auto result = overlay_pass::get_fragment_inputs();
+			result.push_back(vk::glsl::program_input::make(::glsl::glsl_fragment_program, "push_constants",
+				vk::glsl::input_type_push_constant, 0, 0, glsl::push_constant_ref{ .size = push_constants_size }));
+			return result;
+		}
+
+		void update_uniforms(vk::command_buffer& cmd, vk::glsl::program* program) override
+		{
+			static_assert(sizeof(params) == push_constants_size);
+			vkCmdPushConstants(cmd, program->layout(), VK_SHADER_STAGE_FRAGMENT_BIT, 0, push_constants_size, &params);
+		}
+
+		// Draws over the whole of target: the picture in area (x, y, width, height, as fractions of
+		// target), black around it. scale picks the part of src the game displays.
+		void run(vk::command_buffer& cmd, vk::image* target, vk::image_view* src, f32 scale_x, f32 scale_y, const std::array<f32, 4>& area, mode what, bool srgb)
+		{
+			params.scale_x = scale_x;
+			params.scale_y = scale_y;
+			params.mode = what;
+			params.srgb = srgb ? 1 : 0;
+			params.area_x = area[0];
+			params.area_y = area[1];
+			params.area_w = area[2];
+			params.area_h = area[3];
+
+			target->change_layout(cmd, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+			const VkRenderPass render_pass = vk::get_renderpass(*vk::get_current_renderer(), vk::get_renderpass_key(target->format()));
+			overlay_pass::run(cmd, areau{ 0, 0, target->width(), target->height() }, target, src, render_pass);
+
+			if (vk::is_renderpass_open(cmd))
+			{
+				vk::end_renderpass(cmd);
+			}
+
+			target->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+		}
+	};
+}
+
+void VKGSRender::remote_capture_record(vk::viewable_image* src, u32 width, u32 height, u32 max_size)
+{
+	g_remote_play_frames++;
+
+	// The stream wants 8-bit colour; anything else (an HDR or 16-bit display buffer) is skipped
+	// rather than converted, so a format nobody has tested cannot break the presenter.
+	const VkFormat format = src->format();
+	if (format != VK_FORMAT_B8G8R8A8_UNORM && format != VK_FORMAT_R8G8B8A8_UNORM &&
+		format != VK_FORMAT_B8G8R8A8_SRGB && format != VK_FORMAT_R8G8B8A8_SRGB)
+	{
+		return;
+	}
+
+	width = std::min(width, src->width());
+	height = std::min(height, src->height());
+	if (width < 4 || height < 2)
+	{
+		return;
+	}
+
+	// A slot the app's side has finished with. When the GPU or the app still holds all of them,
+	// drop this frame rather than wait.
+	auto& ring = m_remote_capture_ring;
+	usz index = ring.slots.size();
+	for (usz i = 0; i < ring.slots.size(); i++)
+	{
+		if (ring.slots[i].state.load(std::memory_order_acquire) == remote_capture::slot_free)
+		{
+			index = i;
+			break;
+		}
+	}
+
+	if (index == ring.slots.size())
+	{
+		g_remote_play_skipped++;
+		return;
+	}
+
+	auto& slot = ring.slots[index];
+
+	// Every frame is the stream's full size, whatever size the game's own frame is. Games switch
+	// buffer sizes between menus, videos and play, and a stream that followed them changed
+	// resolution there: the encoder here and the decoder on the viewer both restart, a hitch at
+	// every such scene change. The game's picture goes in as the screen would show it, aspect and
+	// all, black around it. NV12 wants the width a multiple of 4 (two chroma samples per word) and
+	// the height even; the hardware path keeps the same size.
+	const u32 dst_width = std::max(4u, (max_size >> 16) & ~3u);
+	const u32 dst_height = std::max(2u, (max_size & 0xffff) & ~1u);
+
+	std::array<f32, 4> area = { 0.f, 0.f, 1.f, 1.f };
+	if (!g_cfg.video.stretch_to_display_area)
+	{
+		const areau region = g_fxo->get<rsx::avconf>().aspect_convert_region({ width, height }, { dst_width, dst_height });
+		if (region.width() && region.height())
+		{
+			area = { static_cast<f32>(region.x1) / dst_width, static_cast<f32>(region.y1) / dst_height,
+				static_cast<f32>(region.width()) / dst_width, static_cast<f32>(region.height()) / dst_height };
+		}
+	}
+
+	const auto make_target = [&](std::unique_ptr<vk::image>& target, VkFormat target_format, u32 target_width, u32 target_height)
+	{
+		if (target && (target->width() != target_width || target->height() != target_height))
+		{
+			vk::get_resource_manager()->dispose(target);
+		}
+
+		if (!target)
+		{
+			target = std::make_unique<vk::remote_capture_target>(*m_device, m_device->get_memory_mapping().device_local, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+				VK_IMAGE_TYPE_2D, target_format, target_width, target_height, 1, 1, 1, VK_SAMPLE_COUNT_1_BIT,
+				VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_TILING_OPTIMAL,
+				VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+				0, VMM_ALLOCATION_POOL_SYSTEM);
+		}
+	};
+
+	// The slot's storage. A free slot is nobody's, so it can be replaced here, and a frame of either
+	// kind can go into any slot.
+	auto& hardware = m_remote_capture_hardware[index];
+	auto& buffer = m_remote_capture_buffers[index];
+	bool use_hardware = g_remote_play_hardware && !m_remote_capture_hardware_failed && m_device->get_external_memory_ahb_support();
+
+	if (use_hardware && (!hardware || hardware->width != dst_width || hardware->height != dst_height))
+	{
+		if (hardware)
+		{
+			vk::get_resource_manager()->dispose(hardware);
+		}
+
+		hardware = remote_capture_create_hardware(dst_width, dst_height);
+
+		std::lock_guard lock(remote_capture::g_mutex);
+
+		if (hardware)
+		{
+			slot.hardware_buffer = hardware->buffer;
+			slot.generation = ++remote_capture::g_generation;
+		}
+		else
+		{
+			// Frames go through the CPU from here on, for as long as this renderer lives.
+			m_remote_capture_hardware_failed = true;
+			use_hardware = false;
+			slot.hardware_buffer = nullptr;
+			rsx_log.warning("Remote play: no shareable frame buffers on this device, sending frames through the CPU.");
+		}
+	}
+
+	const usz y_size = usz{dst_width} * dst_height;
+	const usz nv12_size = y_size + y_size / 2;
+
+	if (!use_hardware && (!buffer || buffer->size() < nv12_size))
+	{
+		if (buffer)
+		{
+			buffer->unmap();
+			vk::get_resource_manager()->dispose(buffer);
+		}
+
+		buffer = std::make_unique<vk::buffer>(*m_device, utils::align(nv12_size, 0x10000), m_device->get_memory_mapping().host_visible_coherent,
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0, VMM_ALLOCATION_POOL_UNDEFINED);
+		// All of it: a later, larger frame can still fit.
+		slot.data = static_cast<const u8*>(buffer->map(0, buffer->size()));
+	}
+
+	// One u32 per slot, cleared once and kept mapped, so checking a slot costs a memory read.
+	if (!m_remote_capture_marker)
+	{
+		m_remote_capture_marker = std::make_unique<vk::buffer>(*m_device, 0x100, m_device->get_memory_mapping().host_visible_coherent,
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0, VMM_ALLOCATION_POOL_UNDEFINED);
+		auto markers = static_cast<u32*>(m_remote_capture_marker->map(0, sizeof(u32) * ring.slots.size()));
+		std::memset(markers, 0, sizeof(u32) * ring.slots.size());
+		ring.markers = markers;
+	}
+
+	if (!m_remote_capture_published)
+	{
+		std::lock_guard lock(remote_capture::g_mutex);
+		remote_capture::g_ring = &ring;
+		m_remote_capture_published = true;
+	}
+
+	auto& cmd = *m_current_command_buffer;
+	auto* const pass = vk::get_overlay_pass<vk::remote_play_capture_pass>();
+	const bool srgb = format == VK_FORMAT_B8G8R8A8_SRGB || format == VK_FORMAT_R8G8B8A8_SRGB;
+	const f32 scale_x = static_cast<f32>(width) / src->width();
+	const f32 scale_y = static_cast<f32>(height) / src->height();
+
+	src->push_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+	vk::image_view* const view = src->get_view(rsx::default_remap_vector.with_encoding(vk::VK_REMAP_IDENTITY));
+
+	if (use_hardware)
+	{
+		make_target(m_remote_capture_rgba, VK_FORMAT_R8G8B8A8_UNORM, dst_width, dst_height);
+		pass->run(cmd, m_remote_capture_rgba.get(), view, scale_x, scale_y, area, vk::remote_play_capture_pass::rgba, srgb);
+		src->pop_layout(cmd);
+
+		const VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+		// Whatever the encoder last read from it is discarded, so no ownership transfer back is needed.
+		VkImageMemoryBarrier acquire = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+		acquire.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		acquire.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		acquire.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		acquire.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		acquire.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		acquire.image = hardware->image;
+		acquire.subresourceRange = range;
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &acquire);
+
+		VkImageCopy copy = {};
+		copy.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		copy.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		copy.extent = { dst_width, dst_height, 1 };
+		vkCmdCopyImage(cmd, m_remote_capture_rgba->value, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hardware->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+		// Hand it to the encoder's side (GL, on the same GPU): released to the foreign queue family.
+		// The second scope is TRANSFER, not BOTTOM_OF_PIPE, so the marker write below waits for the
+		// release and its layout change to finish, and a landed marker means GL may read.
+		VkImageMemoryBarrier release = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+		release.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		release.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		release.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+		release.srcQueueFamilyIndex = m_device->get_graphics_queue_family();
+		release.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+		release.image = hardware->image;
+		release.subresourceRange = range;
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &release);
+	}
+	else
+	{
+		make_target(m_remote_capture_y, VK_FORMAT_R8_UNORM, dst_width, dst_height);
+		make_target(m_remote_capture_uv, VK_FORMAT_R8G8_UNORM, dst_width / 2, dst_height / 2);
+		pass->run(cmd, m_remote_capture_y.get(), view, scale_x, scale_y, area, vk::remote_play_capture_pass::luma, srgb);
+		pass->run(cmd, m_remote_capture_uv.get(), view, scale_x, scale_y, area, vk::remote_play_capture_pass::chroma, srgb);
+		src->pop_layout(cmd);
+
+		VkBufferImageCopy region{};
+		region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		region.imageSubresource.layerCount = 1;
+		region.imageExtent = { dst_width, dst_height, 1 };
+		vk::copy_image_to_buffer(cmd, m_remote_capture_y.get(), buffer.get(), region);
+
+		region.bufferOffset = y_size;
+		region.imageExtent = { dst_width / 2, dst_height / 2, 1 };
+		vk::copy_image_to_buffer(cmd, m_remote_capture_uv.get(), buffer.get(), region);
+
+		// The planes go out to the host, and the marker write waits for them, so a marker that shows
+		// this slot's number means its frame is in.
+		vk::insert_buffer_memory_barrier(cmd, buffer->value, 0, nv12_size,
+			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+			VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+	}
+
+	if (!++m_remote_capture_seq)
+	{
+		// 0 is what a cleared marker reads.
+		++m_remote_capture_seq;
+	}
+
+	vkCmdFillBuffer(cmd, m_remote_capture_marker->value, index * sizeof(u32), sizeof(u32), m_remote_capture_seq);
+	vk::insert_buffer_memory_barrier(cmd, m_remote_capture_marker->value, index * sizeof(u32), sizeof(u32),
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+
+	slot.seq = m_remote_capture_seq;
+	slot.width = dst_width;
+	slot.height = dst_height;
+	slot.hardware = use_hardware;
+	slot.recorded_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+	slot.state.store(remote_capture::slot_recorded, std::memory_order_release);
+
+	// Wakes the app's thread, which then waits the few ms until the GPU has the frame done.
+	remote_capture::g_recorded++;
+	remote_capture::g_recorded.notify_one();
+}
+
+// An AHardwareBuffer the GPU can copy a frame into and the encoder's GL can read, imported as a
+// Vulkan image with its own dedicated memory. Null when any step fails.
+std::unique_ptr<VKGSRender::remote_capture_hardware> VKGSRender::remote_capture_create_hardware(u32 width, u32 height)
+{
+#ifdef __ANDROID__
+	auto hardware = std::make_unique<remote_capture_hardware>();
+	hardware->device = *m_device;
+
+	AHardwareBuffer_Desc desc = {};
+	desc.width = width;
+	desc.height = height;
+	desc.layers = 1;
+	desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+	// CPU_READ_RARELY although the CPU never reads it: it keeps gralloc from picking a compressed
+	// GPU layout. The writer can be Turnip while the reader is the system GLES driver, and a plain
+	// linear buffer is the one layout both are sure to agree on.
+	desc.usage = AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_CPU_READ_RARELY;
+
+	if (AHardwareBuffer_allocate(&desc, &hardware->buffer) != 0 || !hardware->buffer)
+	{
+		hardware->buffer = nullptr;
+		return {};
+	}
+
+	VkAndroidHardwareBufferFormatPropertiesANDROID format_properties = { .sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID };
+	VkAndroidHardwareBufferPropertiesANDROID properties = { .sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID, .pNext = &format_properties };
+
+	if (!vkGetAndroidHardwareBufferPropertiesANDROID || vkGetAndroidHardwareBufferPropertiesANDROID(hardware->device, hardware->buffer, &properties) != VK_SUCCESS ||
+		!properties.memoryTypeBits || format_properties.format != VK_FORMAT_R8G8B8A8_UNORM)
+	{
+		return {};
+	}
+
+	VkExternalMemoryImageCreateInfo external = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
+	external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+
+	VkImageCreateInfo image_info = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = &external };
+	image_info.imageType = VK_IMAGE_TYPE_2D;
+	image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+	image_info.extent = { width, height, 1 };
+	image_info.mipLevels = 1;
+	image_info.arrayLayers = 1;
+	image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+	image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+	image_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+	image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+	if (vkCreateImage(hardware->device, &image_info, nullptr, &hardware->image) != VK_SUCCESS)
+	{
+		hardware->image = VK_NULL_HANDLE;
+		return {};
+	}
+
+	VkImportAndroidHardwareBufferInfoANDROID import = { .sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID };
+	import.buffer = hardware->buffer;
+
+	VkMemoryDedicatedAllocateInfo dedicated = { .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .pNext = &import };
+	dedicated.image = hardware->image;
+
+	VkMemoryAllocateInfo allocate = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &dedicated };
+	allocate.allocationSize = properties.allocationSize;
+	allocate.memoryTypeIndex = static_cast<u32>(std::countr_zero(properties.memoryTypeBits));
+
+	if (vkAllocateMemory(hardware->device, &allocate, nullptr, &hardware->memory) != VK_SUCCESS)
+	{
+		hardware->memory = VK_NULL_HANDLE;
+		return {};
+	}
+
+	if (vkBindImageMemory(hardware->device, hardware->image, hardware->memory, 0) != VK_SUCCESS)
+	{
+		return {};
+	}
+
+	hardware->width = width;
+	hardware->height = height;
+	return hardware;
+#else
+	(void)width;
+	(void)height;
+	return {};
+#endif
+}
+
+// The buffer itself lives on while the encoder's GL still holds an image of it.
+VKGSRender::remote_capture_hardware::~remote_capture_hardware()
+{
+	if (image)
+	{
+		vkDestroyImage(device, image, nullptr);
+	}
+
+	if (memory)
+	{
+		vkFreeMemory(device, memory, nullptr);
+	}
+
+#ifdef __ANDROID__
+	if (buffer)
+	{
+		AHardwareBuffer_release(buffer);
+	}
+#endif
+}
+
+// RSX thread. Everything remote play allocated goes once it stops. device_idle: the GPU has nothing
+// in flight (the renderer is going away). Otherwise a slot the GPU may still be filling is waited for
+// over the next flips, and the rest goes through the resource manager. A frame the encoder still
+// holds needs no waiting: its buffer outlives the Vulkan image for as long as GL has it.
+void VKGSRender::remote_capture_release(bool device_idle)
+{
+	auto& ring = m_remote_capture_ring;
+
+	if (!device_idle && ring.markers)
+	{
+		for (usz i = 0; i < ring.slots.size(); i++)
+		{
+			const auto& slot = ring.slots[i];
+
+			if (slot.state.load(std::memory_order_acquire) == remote_capture::slot_recorded && ring.markers[i] != slot.seq)
+			{
+				return;
+			}
+		}
+	}
+
+	{
+		// The app's side reads slots under this lock, so once the ring is withdrawn nothing reads it.
+		std::lock_guard lock(remote_capture::g_mutex);
+
+		if (remote_capture::g_ring == &ring)
+		{
+			remote_capture::g_ring = nullptr;
+		}
+	}
+
+	m_remote_capture_published = false;
+
+	// Destroyed now when the device is idle, otherwise once the frames that used them complete.
+	const auto discard = [device_idle](auto& resource)
+	{
+		if (!resource)
+		{
+			return;
+		}
+
+		if (device_idle)
+		{
+			resource.reset();
+		}
+		else
+		{
+			vk::get_resource_manager()->dispose(resource);
+		}
+	};
+
+	for (usz i = 0; i < ring.slots.size(); i++)
+	{
+		auto& slot = ring.slots[i];
+		slot.state.store(remote_capture::slot_free, std::memory_order_relaxed);
+		slot.data = nullptr;
+		slot.hardware_buffer = nullptr;
+		slot.hardware = false;
+
+		if (auto& buffer = m_remote_capture_buffers[i])
+		{
+			buffer->unmap();
+		}
+
+		discard(m_remote_capture_buffers[i]);
+		discard(m_remote_capture_hardware[i]);
+	}
+
+	if (m_remote_capture_marker)
+	{
+		m_remote_capture_marker->unmap();
+		ring.markers = nullptr;
+	}
+
+	discard(m_remote_capture_marker);
+	discard(m_remote_capture_y);
+	discard(m_remote_capture_uv);
+	discard(m_remote_capture_rgba);
 }

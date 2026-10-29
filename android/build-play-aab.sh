@@ -12,8 +12,16 @@
 #   REQUEST_INSTALL_PACKAGES  a self-updating app is a hard policy violation, and it is the
 #                             declared permission that gets rejected, not the code path
 #   MANAGE_EXTERNAL_STORAGE   all-files access needs a declared exemption the app does not need
-#   RECORD_AUDIO              would put "Microphone" on the listing for a capability not shipped
+#   FOREGROUND_SERVICE_MICROPHONE, FOREGROUND_SERVICE_MEDIA_PLAYBACK
+#                             the Discord SDK's voice services; each typed foreground service
+#                             needs its own Play Console declaration. The one the app does use,
+#                             FOREGROUND_SERVICE_SPECIAL_USE (online keep-alive), is declared there.
+#                             RECORD_AUDIO is the app's own now (microphone for singing games), so
+#                             it is expected, and the data safety form covers it.
 #   libarmsx3_lsfg.so         frame generation is not distributed through Play
+#   "Lossless" in the dex     nor are its screens and strings, which name the product its shaders
+#                             come from; they live in src/github, since a runtime flag would still
+#                             compile them in
 #   updateprovider            the FileProvider that hands the downloaded APK to the installer
 #
 # Fails closed: if a check cannot run, that is a failure too.
@@ -132,8 +140,20 @@ check_absent_manifest() {
 
 check_absent_manifest "REQUEST_INSTALL_PACKAGES" "Play forbids self-updating apps"
 check_absent_manifest "MANAGE_EXTERNAL_STORAGE"  "all-files access needs a declared exemption"
-check_absent_manifest "RECORD_AUDIO"             "would add Microphone to the listing"
+check_absent_manifest "FOREGROUND_SERVICE_MICROPHONE"    "the Discord SDK's voice service, never declared in the Play Console"
+check_absent_manifest "FOREGROUND_SERVICE_MEDIA_PLAYBACK" "the Discord SDK's voice service, never declared in the Play Console"
 check_absent_manifest "updateprovider"           "the updater FileProvider must not ship"
+
+# A permission that implies hardware makes that hardware required on Play unless the manifest
+# declares it optional: RECORD_AUDIO alone took 1.4's first upload off four devices with no
+# microphone. The app's only uses-feature for the microphone is the optional one, so its
+# presence is the check. Read straight from the file, so no pipe can turn a match into a failure.
+if LC_ALL=C grep -aqF "RECORD_AUDIO" "$MANIFEST" && ! LC_ALL=C grep -aqF "android.hardware.microphone" "$MANIFEST"; then
+	echo "FAIL: RECORD_AUDIO without an optional android.hardware.microphone -- Play would drop every device with no microphone" >&2
+	fail=1
+else
+	echo "  ok: the microphone is optional"
+fi
 
 # Native libraries are entries in the archive, so check the listing rather than the bytes.
 #
@@ -159,6 +179,22 @@ else
 fi
 
 # And the things that MUST be there.
+DEXES=("$WORK"/base/dex/*.dex)
+if [ ! -f "${DEXES[0]}" ]; then
+	echo "FAIL: no dex in the bundle to check" >&2
+	fail=1
+else
+	set +e
+	LC_ALL=C grep -aqF "Lossless" "${DEXES[@]}"
+	status=$?
+	set -e
+	case $status in
+		0) echo "FAIL: the bundle's code names Lossless Scaling -- frame generation's screens and strings are github-only" >&2; fail=1 ;;
+		1) echo "  ok: no Lossless Scaling text in the bundle's code" ;;
+		*) echo "FAIL: could not scan the bundle's dex (grep status $status)" >&2; fail=1 ;;
+	esac
+fi
+
 if LC_ALL=C grep -aqF "com.armsx3.play" "$MANIFEST"; then
 	echo "  ok: applicationId is com.armsx3.play"
 else

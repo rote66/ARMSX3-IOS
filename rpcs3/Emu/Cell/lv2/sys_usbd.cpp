@@ -352,8 +352,90 @@ static void LIBUSB_CALL log_cb(libusb_context* /*ctx*/, enum libusb_log_level le
 }
 #endif
 
+#ifdef __ANDROID__
+namespace
+{
+	std::mutex s_android_usb_mutex;
+	std::vector<int> s_android_usb_fds;
+	atomic_t<u32> s_android_passed_through = 0;
+}
+
+void usb_android_set_devices(std::vector<int> fds)
+{
+	std::lock_guard lock(s_android_usb_mutex);
+	s_android_usb_fds = std::move(fds);
+}
+
+u32 usb_android_passed_through()
+{
+	return s_android_passed_through.load();
+}
+#endif
+
 void usb_handler_thread::perform_scan()
 {
+#ifdef __ANDROID__
+	// ARMSX3: the devices the app opened for passthrough (usb_android_set_devices), wrapped into libusb
+	std::vector<int> fds;
+	{
+		std::lock_guard lock(s_android_usb_mutex);
+		fds = s_android_usb_fds;
+	}
+
+	u32 passed_through = 0;
+
+	for (const int fd : fds)
+	{
+		libusb_device_handle* handle = nullptr;
+
+		if (int res = libusb_wrap_sys_device(ctx, static_cast<intptr_t>(fd), &handle); res < 0)
+		{
+			sys_usbd.error("Failed to take the USB device the app opened (fd %d): %s", fd, libusb_error_name(res));
+			continue;
+		}
+
+		libusb_device* dev = libusb_get_device(handle);
+		libusb_device_descriptor desc;
+
+		if (int res = libusb_get_device_descriptor(dev, &desc); res < 0)
+		{
+			sys_usbd.error("Failed to get device descriptor: %s", libusb_error_name(res));
+			libusb_close(handle);
+			continue;
+		}
+
+		const u64 usb_id = (static_cast<u64>(desc.idVendor) << 48) | (static_cast<u64>(desc.idProduct) << 32) | static_cast<u32>(fd);
+		bool attached = false;
+
+		for (const auto& entry : device_allow_list)
+		{
+			if (!usb_passthrough_devices.contains(usb_id) && desc.idVendor == entry.id_vendor
+				&& desc.idProduct >= entry.id_product_min && desc.idProduct <= entry.id_product_max)
+			{
+				sys_usbd.success("Found device: %s", std::basic_string(entry.device_name));
+				libusb_ref_device(dev);
+				std::shared_ptr<usb_device_passthrough> usb_dev = std::make_shared<usb_device_passthrough>(dev, desc, get_new_location(), handle);
+				connect_usb_device(usb_dev, true);
+				usb_passthrough_devices[usb_id] = usb_dev;
+				attached = true;
+
+				if (desc.idVendor == 0x1430 && desc.idProduct == 0x0150) passed_through |= 1;
+				else if (desc.idVendor == 0x0E6F && desc.idProduct == 0x0129) passed_through |= 2;
+				else if (desc.idVendor == 0x0E6F && desc.idProduct == 0x0241) passed_through |= 4;
+				break;
+			}
+		}
+
+		if (!attached)
+		{
+			libusb_close(handle);
+		}
+	}
+
+	s_android_passed_through = passed_through;
+	return;
+#endif
+
 	// look if any device which we could be interested in is actually connected
 	libusb_device** list = nullptr;
 	const auto ndev = libusb_get_device_list(ctx, &list);
@@ -411,7 +493,7 @@ void usb_handler_thread::perform_scan()
 			}
 		}
 
-		if (desc.idVendor == 0x1209 && desc.idProduct == 0x2882)
+		if (desc.idVendor == 0x1209 && (desc.idProduct == 0x2882 || desc.idProduct == 0x2883))
 		{
 			sys_usbd.success("Found device: Santroller");
 			// Send the device a specific control transfer so that it jumps to a RPCS3 compatible mode
@@ -465,6 +547,13 @@ usb_handler_thread::usb_handler_thread()
 		std::move(log_lv_opt),
 		std::move(log_cb_opt)
 	};
+
+#ifdef __ANDROID__
+	// ARMSX3: libusb cannot open a device on Android, only take one the app opened (perform_scan)
+	libusb_init_option no_discovery_opt{};
+	no_discovery_opt.option = LIBUSB_OPTION_NO_DEVICE_DISCOVERY;
+	options.push_back(no_discovery_opt);
+#endif
 
 	if (int res = libusb_init_context(&ctx, options.data(), static_cast<int>(options.size())); res < 0)
 #else
@@ -1621,7 +1710,7 @@ error_code sys_usbd_isochronous_transfer_data(ppu_thread& ppu, u32 handle, u32 i
 	transfer.iso_request.num_packets = iso_request->num_packets;
 	for (u32 index = 0; index < iso_request->num_packets; index++)
 	{
-		transfer.iso_request.packets[index] = iso_request->packets[index];
+		::at32(transfer.iso_request.packets, index) = ::at32(iso_request->packets, index);
 	}
 
 	pipe.device->isochronous_transfer(&transfer);

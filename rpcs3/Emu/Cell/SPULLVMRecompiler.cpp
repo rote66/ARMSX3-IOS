@@ -9,6 +9,7 @@
 #include "Emu/Cell/lv2/sys_time.h"
 #include "Emu/Memory/vm_reservation.h"
 #include "Emu/RSX/Core/RSXReservationLock.hpp"
+#include "Emu/RSX/Overlays/overlay_compile_notification.h"
 #include "Crypto/sha1.h"
 #include "Utilities/JIT.h"
 
@@ -65,6 +66,7 @@ namespace vm
 #include <llvm/Transforms/Scalar/LICM.h>
 #include <llvm/Transforms/Scalar/LoopPassManager.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
 #ifdef _MSC_VER
 #pragma warning(pop)
 #else
@@ -1360,7 +1362,7 @@ class spu_llvm_recompiler : public spu_recompiler_base, public cpu_translator
 			spu_context_attr(m_ir->CreateStore(m_ir->getInt8(1), spu_ptr(&spu_thread::unsavable)))->setVolatile(true);
 		}
 
-		m_ir->CreateCall(m_test_state, {m_thread});
+		m_ir->CreateCall(m_test_state, {m_thread})->setCallingConv(m_test_state->getCallingConv());
 
 		if (may_be_unsafe_for_savestate)
 		{
@@ -2060,6 +2062,16 @@ public:
 #endif
 
 		spu_log.notice("Building function 0x%x... (size %u, %s)", func.entry_point, func.data.size(), m_hash);
+
+		// Say so on screen when SPU code compiles during play. That happens on the SPU thread that
+		// needs the code; the boot-time precompile runs on worker threads under its own progress
+		// dialog, so it is left out. Without this a first run after a cache wipe stutters for
+		// minutes with nothing to explain it (Metal Gear Solid V built 2,000 functions a minute).
+		if (g_cfg.misc.show_spu_compilation_hint && cpu_thread::get_current<spu_thread>())
+		{
+			rsx::overlays::show_spu_compile_notification();
+		}
+
 		m_pos = func.lower_bound;
 		m_base = func.entry_point;
 		m_size = ::size32(func.data) * 4;
@@ -2137,6 +2149,45 @@ public:
 		// Emit code check
 		u32 check_iterations = 0;
 		m_ir->SetInsertPoint(label_test);
+
+		if (g_cfg.core.mfc_transfers_shuffling)
+		{
+			const auto spu_work = [](spu_thread* _this)
+			{
+				bool work_left = _this->do_mfc();
+
+				if (_this->interrupts_enabled)
+				{
+					_this->get_events(SPU_EVENT_TM);
+					work_left = true;
+				}
+
+				if (work_left)
+				{
+					_this->mfc_queued_ops_timeout = g_cfg.core.mfc_shuffling_instructions;
+				}
+
+				if (_this->check_mfc_interrupts(_this->pc))
+				{
+					spu_runtime::g_escape(_this);
+				}
+			};
+
+			const auto mfc_ops = spu_ptr(&spu_thread::mfc_queued_ops_timeout);
+			const auto label_next = BasicBlock::Create(m_context, "ShuffleNext", m_function);
+			const auto label_mfc_check = BasicBlock::Create(m_context, "MfcCheck", m_function);
+			const auto label_mfc_ops = BasicBlock::Create(m_context, "MfcOps", m_function);
+			const auto old_mfc_timeout = spu_context_attr(m_ir->CreateLoad(get_type<u64>(), mfc_ops));
+			m_ir->CreateCondBr(m_ir->CreateIsNull(old_mfc_timeout), label_next, label_mfc_check);
+			m_ir->SetInsertPoint(label_mfc_check);
+			const auto store_timeout = m_ir->CreateSub(old_mfc_timeout, m_ir->getInt64(1));
+			m_ir->CreateStore(store_timeout, mfc_ops);
+			m_ir->CreateCondBr(m_ir->CreateIsNull(store_timeout), label_mfc_ops, label_next);
+			m_ir->SetInsertPoint(label_mfc_ops);
+			call("spu_work", +spu_work, m_thread);
+			m_ir->CreateBr(label_next);
+			m_ir->SetInsertPoint(label_next);
+		}
 
 		// Set block hash for profiling (if enabled)
 		if ((g_cfg.core.spu_prof || g_cfg.core.spu_debug) && g_cfg.core.spu_verification)
@@ -3071,6 +3122,84 @@ public:
 				if (need_check || (bi == 0 && g_cfg.core.spu_block_size != spu_block_size_type::safe))
 				{
 					check_state(baddr);
+
+					// Improve MFC command shuffling for specific short loops
+					bool is_self_jump = false;
+
+					for (u32 pred : bb.preds)
+					{
+						if (pred == baddr)
+						{
+							// If this block is a target of a backward branch (possibly loop), emit a check
+							is_self_jump = true;
+							break;
+						}
+					}
+
+					// They must contain a load, but not a astore
+					bool contains_store = false;
+					bool contains_load = false;
+					bool contains_floating = false;
+
+					if (is_self_jump && m_bbs.at(baddr).size < 16)
+					{
+						for (u32 iaddr = baddr, counter = 0; counter < m_bbs.at(baddr).size; iaddr += 4, counter++)
+						{
+							const u32 op = std::bit_cast<be_t<u32>>(func.data[(iaddr - start) / 4]);
+							const auto itype = g_spu_itype.decode(op);
+
+							if (itype & spu_itype::memory)
+							{
+								if (itype & spu_itype::zregmod)
+								{
+									contains_store = true;
+								}
+								else
+								{
+									contains_load = true;
+								}
+							}
+							else if (itype & spu_itype::floating)
+							{
+								contains_floating = true;
+							}
+						}
+					}
+
+					if (is_self_jump && !contains_store && !contains_floating && contains_load && m_bbs.at(baddr).size < 12 && g_cfg.core.mfc_transfers_shuffling)
+					{
+						const auto spu_work_limted = [](spu_thread* _this)
+						{
+							if (_this->interrupts_enabled)
+							{
+								// Undo changes
+								_this->mfc_queued_ops_timeout++;
+								return;
+							}
+
+							const bool work_left = _this->do_mfc();
+
+							if (work_left)
+							{
+								_this->mfc_queued_ops_timeout = g_cfg.core.mfc_shuffling_instructions;
+							}
+						};
+
+						const auto mfc_ops = spu_ptr(&spu_thread::mfc_queued_ops_timeout);
+						const auto label_next = BasicBlock::Create(m_context, "ShuffleNext2", m_function);
+						const auto label_mfc_check = BasicBlock::Create(m_context, "MfcCheck2", m_function);
+						const auto label_mfc_ops = BasicBlock::Create(m_context, "MfcOps2", m_function);
+						const auto old_mfc_timeout = spu_context_attr(m_ir->CreateLoad(get_type<u64>(), mfc_ops));
+						m_ir->CreateCondBr(m_ir->CreateIsNull(old_mfc_timeout), label_next, label_mfc_check);
+						m_ir->SetInsertPoint(label_mfc_check);
+						const auto store_timeout = m_ir->CreateSub(old_mfc_timeout, m_ir->getInt64(1));
+						m_ir->CreateStore(store_timeout, mfc_ops);
+						m_ir->CreateCondBr(m_ir->CreateIsNull(store_timeout), label_mfc_ops, label_next);
+						m_ir->SetInsertPoint(label_mfc_ops);
+						call("spu_work_limited", +spu_work_limted, m_thread);
+						m_ir->CreateBr(label_next);
+						m_ir->SetInsertPoint(label_next);
+					}
 				}
 
 				const bool is_reduced_loop = m_inst_attrs[(baddr - start) / 4] == inst_attr::reduced_loop;
@@ -4237,6 +4366,7 @@ public:
 		// Basic optimizations
 		fpm.addPass(EarlyCSEPass(true));
 		fpm.addPass(SimplifyCFGPass());
+		fpm.addPass(InstCombinePass());
 		fpm.addPass(DSEPass());
 		fpm.addPass(createFunctionToLoopPassAdaptor(LICMPass(LICMOptions()), true));
 		fpm.addPass(ADCEPass());
@@ -5242,6 +5372,30 @@ public:
 		}
 		case MFC_RdTagStat:
 		{
+			if (g_cfg.core.mfc_transfers_shuffling)
+			{
+				// Execute shuffled MFC commands before reading (see spu_thread::get_ch_value)
+				const auto next = llvm::BasicBlock::Create(m_context, "", m_function);
+				const auto fall_rdch = llvm::BasicBlock::Create(m_context, "", m_function);;
+				const auto llvm_rdch = llvm::BasicBlock::Create(m_context, "", m_function);;
+				m_ir->CreateCondBr(m_ir->CreateIsNotNull(m_ir->CreateLoad(get_type<u32>(), spu_ptr(&spu_thread::mfc_size))), fall_rdch, llvm_rdch, m_md_unlikely);
+				m_ir->SetInsertPoint(llvm_rdch);
+				const auto get_rdch_val = get_rdch(op, ::offset32(&spu_thread::ch_tag_stat), false);
+				const auto after_block = m_ir->GetInsertBlock();
+				m_ir->CreateBr(next);
+				m_ir->SetInsertPoint(fall_rdch);
+				ensure_gpr_stores();
+				update_pc();
+				const auto fall_val = call("spu_read_channel", &exec_rdch, m_thread, m_ir->getInt32(MFC_RdTagStat));
+				m_ir->CreateBr(next);
+				m_ir->SetInsertPoint(next);
+				const auto phi_ch_val = m_ir->CreatePHI(get_type<u32>(), 2);
+				phi_ch_val->addIncoming(get_rdch_val, after_block);
+				phi_ch_val->addIncoming(fall_val, fall_rdch);
+				res.value = phi_ch_val;
+				break;
+			}
+
 			res.value = get_rdch(op, ::offset32(&spu_thread::ch_tag_stat), false);
 			break;
 		}
@@ -5768,7 +5922,8 @@ public:
 
 				// The local-store watch and the KZ3 sync probe both live in do_dma_transfer, and the
 				// inlined copy below would step around them, so an instrumented run gives up inlining.
-				bool must_use_cpp_functions = !!g_cfg.core.spu_accurate_dma || spu_ls_watch_enabled() || kz3_sync_probe_enabled();
+				// So does MFC shuffling, which has to queue the command instead of running it here.
+				bool must_use_cpp_functions = !!g_cfg.core.spu_accurate_dma || !!g_cfg.core.mfc_transfers_shuffling || spu_ls_watch_enabled() || kz3_sync_probe_enabled();
 
 				if (u64 cmdh = ci->getZExtValue() & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_RESULT_MASK); g_cfg.core.rsx_fifo_accuracy || g_cfg.video.strict_rendering_mode || /*!g_use_rtm*/ true)
 				{
@@ -6057,11 +6212,40 @@ public:
 				m_ir->SetInsertPoint(fail);
 
 				// Get MFC slot, redirect to invalid memory address
-				const auto slot = m_ir->CreateLoad(get_type<u32>(), spu_ptr(&spu_thread::mfc_size));
+				llvm::Value* slot = m_ir->CreateLoad(get_type<u32>(), spu_ptr(&spu_thread::mfc_size));
 				const auto off0 = m_ir->CreateAdd(m_ir->CreateMul(slot, m_ir->getInt32(sizeof(spu_mfc_cmd))), m_ir->getInt32(::offset32(&spu_thread::mfc_queue)));
-				const auto ptr0 = _ptr(m_thread, m_ir->CreateZExt(off0, get_type<u64>()));
+				auto ptr0 = _ptr(m_thread, m_ir->CreateZExt(off0, get_type<u64>()));
 				const auto ptr1 = _ptr(m_memptr, 0xffdeadf0);
-				const auto pmfc = m_ir->CreateSelect(m_ir->CreateICmpULT(slot, m_ir->getInt32(16)), ptr0, ptr1);
+				auto mfc_not_full = m_ir->CreateICmpULT(slot, m_ir->getInt32(g_cfg.core.mfc_transfers_shuffling != 0 ? std::min<u32>(+g_cfg.core.mfc_transfers_shuffling + 1, 16) : 16));
+
+				if (g_cfg.core.mfc_transfers_shuffling)
+				{
+					auto exec_mfc = [](spu_thread* _this)
+					{
+						_this->do_mfc(false);
+					};
+
+					const auto mfc_next = llvm::BasicBlock::Create(m_context, "MfcQueueNext", m_function);
+					const auto mfc_work = llvm::BasicBlock::Create(m_context, "MfcQueueWork", m_function);
+
+					m_ir->CreateCondBr(mfc_not_full, mfc_next, mfc_work);
+					m_ir->SetInsertPoint(mfc_work);
+					call("spu_mfc", +exec_mfc, m_thread);
+					const auto updated_slot = m_ir->CreateLoad(get_type<u32>(), spu_ptr(&spu_thread::mfc_size));
+					const auto old_slot = slot;
+					m_ir->CreateBr(mfc_next);
+					m_ir->SetInsertPoint(mfc_next);
+					const auto slot_phi = m_ir->CreatePHI(get_type<u32>(), 2);
+					slot_phi->addIncoming(updated_slot, mfc_work);
+					slot_phi->addIncoming(old_slot, fail);
+					slot = slot_phi;
+					mfc_not_full = m_ir->CreateICmpULT(slot, m_ir->getInt32(16));
+
+					const auto off2 = m_ir->CreateAdd(m_ir->CreateMul(slot, m_ir->getInt32(sizeof(spu_mfc_cmd))), m_ir->getInt32(::offset32(&spu_thread::mfc_queue)));
+					ptr0 = _ptr(m_thread, m_ir->CreateZExt(off2, get_type<u64>()));
+				}
+
+				const auto pmfc = m_ir->CreateSelect(mfc_not_full, ptr0, ptr1);
 				m_ir->CreateStore(ci, _ptr(pmfc, &spu_mfc_cmd::cmd));
 
 				switch (u64 cmd = ci->getZExtValue())
@@ -8221,7 +8405,7 @@ public:
 					{ 0x1011121314151617, 0x000102031c1d1e1f, &cpu_translator::get_type<u32[4]>, 3, 1 },
 					{ 0x1011121314151617, 0x18191a1b00010203, &cpu_translator::get_type<u32[4]>, 3, 0 },
 					{ 0x0001020304050607, 0x18191a1b1c1d1e1f, &cpu_translator::get_type<u64[2]>, 1, 1 },
-					{ 0x1011121303151617, 0x0001020304050607, &cpu_translator::get_type<u64[2]>, 1, 0 },
+					{ 0x1011121314151617, 0x0001020304050607, &cpu_translator::get_type<u64[2]>, 1, 0 },
 				};
 
 				// Check important constants from CWD-like constant generation instructions
@@ -10870,7 +11054,7 @@ public:
 			{
 				// Can't afford external tail call in true functions
 				m_ir->CreateStore(m_ir->getInt32("BIJT"_u32), _ptr(m_memptr, 0xffdead20));
-				m_ir->CreateCall(m_test_state, {m_thread});
+				m_ir->CreateCall(m_test_state, {m_thread})->setCallingConv(m_test_state->getCallingConv());
 				m_ir->CreateBr(sw->getDefaultDest());
 			}
 			else

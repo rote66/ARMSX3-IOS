@@ -138,6 +138,7 @@ target_sources(rpcs3_emu PRIVATE
     ../Loader/PUP.cpp
     ../Loader/TAR.cpp
     ../Loader/ISO.cpp
+    ../Loader/CHD.cpp
     ../Loader/iso_cache.cpp
     ../Loader/content_validation.cpp
     ../Loader/TROPUSR.cpp
@@ -156,6 +157,7 @@ if(NOT ARMSX3_IOS)
     target_sources(rpcs3_emu PRIVATE
         Audio/Cubeb/CubebBackend.cpp
         Audio/Oboe/OboeBackend.cpp
+        Audio/Oboe/OboeCapture.cpp
         Audio/Cubeb/cubeb_enumerator.cpp
     )
 endif()
@@ -468,6 +470,7 @@ target_sources(rpcs3_emu PRIVATE
 # Np
 target_sources(rpcs3_emu PRIVATE
     NP/pb_helpers.cpp
+    NP/np_avatar.cpp
     NP/np_cache.cpp
     NP/np_gui_cache.cpp
     NP/np_contexts.cpp
@@ -479,6 +482,7 @@ target_sources(rpcs3_emu PRIVATE
     NP/np_requests.cpp
     NP/signaling_handler.cpp
     NP/np_structs_extra.cpp
+    NP/arkham_revived.cpp
     NP/clans_client.cpp
     NP/clans_config.cpp
     NP/rpcn_client.cpp
@@ -675,6 +679,7 @@ if(TARGET 3rdparty_vulkan)
         RSX/VK/VKDataHeapManager.cpp
         RSX/VK/VKDMA.cpp
         RSX/VK/VKFrameGen.cpp
+        RSX/VK/VKFrameDump.cpp
         RSX/VK/VKDraw.cpp
         RSX/VK/VKFormats.cpp
         RSX/VK/VKFragmentProgram.cpp
@@ -765,6 +770,7 @@ target_link_libraries(rpcs3_emu
         3rdparty::yaml-cpp
         3rdparty::zlib
         3rdparty::zstd
+        3rdparty::chdr
         3rdparty::libcurl
 )
 

@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Utilities/ppu_patch.h"
 #include "Utilities/JIT.h"
 #include "Utilities/StrUtil.h"
 #include "util/serialization.hpp"
@@ -186,6 +187,34 @@ extern thread_local bool g_ppu_avoid_strict_fma;
 // the user is told rather than left watching a progress bar that quietly produced an
 // uncompiled game. Not thread_local: any worker may be the one that hits it.
 static atomic_t<bool> g_ppu_compile_oom{false};
+
+// Set by ppu_initialize2 on the calling thread when the module it just tried failed for want of
+// memory. The worker reads it to tell running out of memory, which is worth waiting out and
+// retrying alone, from a codegen failure, which is worth the allocator-friendly retry instead.
+static thread_local bool g_ppu_module_oom = false;
+
+// Set when the title being booted needs upstream's cached reservation, which only Metal Gear
+// Solid 4 does (see the end of ppu_store_reservation's success path). Written whenever a PPU thread
+// is created, before the game's own code runs, so the conditional store reads one flag instead of
+// comparing serials on every success.
+static atomic_t<bool> g_ppu_res_cache_upstream{false};
+
+static bool ppu_res_cache_upstream_title(std::string_view title)
+{
+	static constexpr std::string_view s_titles[] =
+	{
+		"BLUS30109"sv, "BLES00246"sv, "BLJM67001"sv, // disc
+		"NPUB31633"sv, "NPEB02182"sv, "NPJB00698"sv, // PSN
+	};
+
+	return std::find(std::begin(s_titles), std::end(s_titles), title) != std::end(s_titles);
+}
+
+// Defined in JITLLVM.cpp: runs func on a disposable thread so that LLVM's fatal handler or running
+// out of memory ends that thread instead of the caller. False when it did not finish; error says
+// why, starting with "Out of memory" when that was the reason.
+extern bool jit_run_recoverable(const std::function<void()>& func, std::string& error);
+
 static void ppu_break(ppu_thread&, ppu_opcode_t, be_t<u32>*, ppu_intrp_func*);
 
 extern void do_cell_atomic_128_store(u32 addr, const void* to_write);
@@ -1432,18 +1461,36 @@ struct ppu_far_jumps_t
 				c.mov(args[2], vm::g_base_addr + pc);
 				c.jmp(ppu_far_jump);
 #else
+				// This sits in the exec table like any PPU block and is entered the same way, as
+				// GHC, so the thread is in x20 -- not x0. The x86 path above makes the same move
+				// from rbp. Without it ppu_far_jump took whatever x0 held, guest r0 in practice,
+				// as its ppu_thread&, and its store to ppu.cia faulted at r0 + 0x474: 0x475 every
+				// time, for NBA 08's code cave and for every line of Splatterhouse's, whether the
+				// patch point was reached by a branch or by falling into it.
+				//
+				// It then escapes to the host instead of returning, for the reason given in
+				// ppu_recompiler_fallback_ghc: GHC code on arm64 keeps no call stack to return
+				// into. The gateway resumes at the ppu.cia that ppu_far_jump just set.
 				Label jmp_address = c.newLabel();
 				Label this_op_address = c.newLabel();
+				Label escape_address = c.newLabel();
 
+				c.mov(args[0], a64::x20);
 				c.ldr(args[2], arm::ptr(this_op_address));
-				c.ldr(args[1], arm::ptr(jmp_address));
-				c.br(args[1]);
+				c.ldr(a64::x13, arm::ptr(jmp_address));
+				c.blr(a64::x13);
+
+				c.mov(a64::x0, a64::x20);
+				c.ldr(a64::x13, arm::ptr(escape_address));
+				c.br(a64::x13);
 
 				c.align(AlignMode::kCode, 16);
 				c.bind(jmp_address);
 				c.embedUInt64(reinterpret_cast<u64>(ppu_far_jump));
 				c.bind(this_op_address);
 				c.embedUInt64(reinterpret_cast<u64>(vm::g_base_addr) + pc);
+				c.bind(escape_address);
+				c.embedUInt64(reinterpret_cast<u64>(ppu_escape));
 #endif
 			}, &rt);
 		}
@@ -1451,6 +1498,19 @@ struct ppu_far_jumps_t
 		return it->second.func;
 	}
 };
+
+bool ppu_has_far_jump(u32 addr, u32 size)
+{
+	if (!g_fxo->is_init<ppu_far_jumps_t>())
+	{
+		return false;
+	}
+
+	auto& jumps = g_fxo->get<ppu_far_jumps_t>();
+	reader_lock lock(jumps.mutex);
+	const auto it = jumps.vals.lower_bound(addr);
+	return it != jumps.vals.end() && it->first - addr < size;
+}
 
 u32 ppu_get_far_jump(u32 pc)
 {
@@ -1546,12 +1606,12 @@ bool ppu_form_branch_to_code(u32 entry, u32 target, bool link, bool with_toc)
 
 bool ppu_form_branch_to_code(u32 entry, u32 target, bool link)
 {
-	return ppu_form_branch_to_code(entry, target, link, false);
+	return ppu_form_branch_to_code(entry, target, link, false, std::string{});
 }
 
 bool ppu_form_branch_to_code(u32 entry, u32 target)
 {
-	return ppu_form_branch_to_code(entry, target, false);
+	return ppu_form_branch_to_code(entry, target, false, false, std::string{});
 }
 
 void ppu_remove_hle_instructions(u32 addr, u32 size)
@@ -3178,6 +3238,8 @@ ppu_thread::ppu_thread(const ppu_thread_params& param, std::string_view name, u3
 {
 	prio.raw().prio = _prio;
 
+	g_ppu_res_cache_upstream = ppu_res_cache_upstream_title(Emu.GetTitleID());
+
 	memset(&hv_ctx, 0, sizeof(hv_ctx));
 
 	gpr[1] = stack_addr + stack_size - ppu_stack_start_offset;
@@ -3272,6 +3334,8 @@ ppu_thread::ppu_thread(utils::serial& ar)
 	, is_interrupt_thread(ar)
 {
 	[[maybe_unused]] const s32 version = GET_SERIALIZATION_VERSION(ppu);
+
+	g_ppu_res_cache_upstream = ppu_res_cache_upstream_title(Emu.GetTitleID());
 
 	struct init_pushed
 	{
@@ -3941,6 +4005,9 @@ static T ppu_load_acquire_reservation(ppu_thread& ppu, u32 addr)
 		// 0x102ed6b8, res-rtime==128 on every single one, data unchanged. 047f71b43 added a
 		// "-= 128" here to pair with the advance; the two cancel, which is presumably why the
 		// pair was dropped rather than corrected.
+		//
+		// Metal Gear Solid 4 is the exception and keeps upstream's behaviour; see the end of the
+		// success path in ppu_store_reservation.
 	}
 	else
 	{
@@ -4258,7 +4325,19 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 		// The other half of upstream 047f71b43; see the note in ppu_load_acquire_reservation.
 		// Every success path above leaves the line's counter at rtime + 128, so this is what
 		// keeps a cached re-reservation of the same line validating against the right value.
-		ppu.rtime += 128;
+		//
+		// Except in Metal Gear Solid 4, which keeps upstream's behaviour: no advance, so the next
+		// conditional store on this line through a cached re-reservation fails once. That is what
+		// upstream's fix for MGS4 freezing at the start of a new game relies on (#16907): it lets
+		// cellSpursAddUrgentCommand queue one urgent command at a time. With the advance, MGS4 froze
+		// as Act 1's first stage loaded (tester logs, 10-27): the main and both audio threads stuck
+		// on one lock and the urgent SPURS kernel idle from the same instant. Assassin's Creed needs
+		// the advance, so it stays the default.
+		if (!g_ppu_res_cache_upstream.observe())
+		{
+			ppu.rtime += 128;
+		}
+
 		ppu.raddr = 0;
 		return true;
 	}
@@ -4333,6 +4412,15 @@ struct jit_core_allocator
 	// Same reasoning as the SPU compile claim, and the same failure this fork has already been
 	// bitten by twice.
 	atomic_t<u32> low_memory_claim{0};
+
+	// Set once a module has run out of memory during this boot. From then on every module
+	// compiles alone, whatever the free memory reading says: the reading that let two workers
+	// run was the one that just proved wrong.
+	atomic_t<bool> out_of_memory_seen{false};
+
+	// Modules being compiled right now, across all workers. A worker retrying after running out
+	// of memory waits for this to fall to itself, so the retry really does run alone.
+	atomic_t<u32> compiling{0};
 
 	// Enough left for the emulator plus a single worker. Below that, running two workers is
 	// how the process gets killed rather than how it finishes sooner.
@@ -5338,6 +5426,192 @@ extern void ppu_precompile(std::vector<std::string>& dir_queue, std::vector<ppu_
 	exec_worker();
 }
 
+// Compile each startup calloc helper after validating its reachable instructions.
+static void ppu_initialize_patch_helpers(const ppu_module<lv2_obj>& owner)
+{
+	if (g_cfg.core.ppu_decoder != ppu_decoder_type::llvm || !g_fxo->is_init<ppu_patch_block_registry_t>())
+	{
+		return;
+	}
+
+	const auto& ranges = g_fxo->get<ppu_patch_block_registry_t>().code_ranges;
+
+	for (const auto& [start, size, patch] : ranges)
+	{
+		if (Emu.IsStopped())
+		{
+			return;
+		}
+
+		if (!size || start % 4 || size % 4 || u64(start) + size > u32{umax} ||
+			!vm::check_addr(start, vm::page_executable, size))
+		{
+			continue;
+		}
+
+		const u32 end = start + size;
+		enum : u8 { entry = 1, reachable = 2, exit = 4, hook = 8, link = 16 };
+		struct instruction
+		{
+			u32 target = 0;
+			u8 flags = 0;
+		};
+		std::vector<instruction> instructions(size / 4);
+
+		if (g_fxo->is_init<ppu_far_jumps_t>())
+		{
+			auto& jumps = g_fxo->get<ppu_far_jumps_t>();
+			reader_lock lock(jumps.mutex);
+
+			for (auto it = jumps.vals.lower_bound(start); it != jumps.vals.end() && it->first < end; ++it)
+			{
+				const auto& jump = it->second;
+				const bool direct = !jump.with_toc && jump.module_name.empty();
+				auto& inst = instructions[(it->first - start) / 4];
+				inst.target = direct ? jump.target : u32{umax};
+				inst.flags = hook | ((jump.link || !direct) ? link : 0);
+			}
+		}
+
+		std::vector<u32> pending;
+
+		auto enqueue = [&](u32 addr)
+		{
+			if (addr >= start && addr < end && addr % 4 == 0 && !(instructions[(addr - start) / 4].flags & entry))
+			{
+				instructions[(addr - start) / 4].flags |= entry;
+				pending.emplace_back(addr);
+			}
+		};
+
+		enqueue(start);
+
+		for (usz i = 0; i < pending.size(); i++)
+		{
+			for (u32 pc = pending[i]; pc < end; pc += 4)
+			{
+				auto& inst = instructions[(pc - start) / 4];
+				if (inst.flags & hook)
+				{
+					enqueue(inst.target);
+
+					if (inst.flags & link)
+					{
+						enqueue(pc + 4);
+					}
+
+					break;
+				}
+
+				const ppu_opcode_t op{vm::read32(pc)};
+				const auto type = g_ppu_itype.decode(op.opcode);
+
+				// calloc helpers must use instructions supported by the LLVM translator.
+				switch (type)
+				{
+				case ppu_itype::SC:
+					if (op.opcode == ppu_instructions::SC(0))
+					{
+						break;
+					}
+					[[fallthrough]];
+				case ppu_itype::UNK:
+				case ppu_itype::ECIWX:
+				case ppu_itype::ECOWX:
+				case ppu_itype::LSWX:
+				case ppu_itype::STSWX:
+				case ppu_itype::SUBFCO:
+				case ppu_itype::SUBFCO_:
+				case ppu_itype::SUBFEO:
+				case ppu_itype::SUBFEO_:
+				case ppu_itype::ADDEO:
+				case ppu_itype::ADDEO_:
+				case ppu_itype::ADDZEO:
+				case ppu_itype::ADDZEO_:
+				case ppu_itype::SUBFZEO:
+				case ppu_itype::SUBFZEO_:
+				case ppu_itype::SUBFMEO:
+				case ppu_itype::SUBFMEO_:
+				case ppu_itype::MULLDO:
+				case ppu_itype::MULLDO_:
+				case ppu_itype::ADDMEO:
+				case ppu_itype::ADDMEO_:
+				case ppu_itype::MULLWO:
+				case ppu_itype::MULLWO_:
+				{
+					fmt::throw_exception("Unsupported calloc instruction 0x%08x at 0x%x (helper 0x%x, patch '%s')",
+						op.opcode, pc, start, patch);
+				}
+				default: break;
+				}
+
+				if (inst.flags & reachable)
+				{
+					break;
+				}
+
+				inst.flags |= reachable;
+
+				const bool direct_branch = type == ppu_itype::B || type == ppu_itype::BC;
+				const bool indirect_branch = type == ppu_itype::BCLR || type == ppu_itype::BCCTR;
+				const bool exception = type == ppu_itype::SC || (type & ppu_itype::trap);
+				if (direct_branch)
+				{
+					enqueue((op.aa ? 0 : pc) + (type == ppu_itype::B ? +op.bt24 : +op.bt14));
+				}
+
+				if (direct_branch || indirect_branch || exception)
+				{
+					// Calls, conditional branches and exceptions may resume at the next instruction.
+					if (exception || op.lk || (type != ppu_itype::B && (op.bo & 0x14) != 0x14))
+					{
+						enqueue(pc + 4);
+					}
+					inst.flags |= exit;
+					break;
+				}
+			}
+		}
+
+		ppu_module<lv2_obj> helper;
+		helper.name = fmt::format("patch-helper-%x", start);
+		helper.path = owner.path;
+		helper.cache = owner.cache;
+		std::memcpy(helper.sha1, owner.sha1, sizeof(helper.sha1));
+		helper.segs.push_back({start, size, 1, 5, size, vm::base(start)});
+		helper.addr_to_seg_index.emplace(start, 0);
+
+		for (u32 i = 0; i < instructions.size();)
+		{
+			if (!(instructions[i].flags & reachable))
+			{
+				i++;
+				continue;
+			}
+
+			ppu_function func;
+			func.addr = start + i * 4;
+			do
+			{
+				func.size += 4;
+				if ((instructions[i++].flags & exit) || i == instructions.size() ||
+					!(instructions[i].flags & reachable) || (instructions[i].flags & entry))
+				{
+					break;
+				}
+			}
+			while (true);
+			helper.funcs.emplace_back(std::move(func));
+		}
+
+		if (!helper.funcs.empty())
+		{
+			ppu_log.notice("Compiling allocated patch helper at 0x%x: %u blocks", start, helper.funcs.size());
+			ppu_initialize(helper);
+		}
+	}
+}
+
 extern void ppu_initialize()
 {
 	if (!g_fxo->is_init<main_ppu_module<lv2_obj>>())
@@ -5482,6 +5756,8 @@ extern void ppu_initialize()
 
 		ppu_initialize(*ptr);
 	}
+
+	ppu_initialize_patch_helpers(_main);
 }
 
 // Run chosen guest functions through the interpreter while everything else stays compiled.
@@ -6553,6 +6829,51 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 #if defined(__APPLE__) && !defined(ARMSX3_IOS)
 				pthread_jit_write_protect_np(false);
 #endif
+				// One attempt at a module, on a fresh JIT so a failed attempt cannot poison the next.
+				//
+				// The whole attempt runs on a disposable thread, translation included, not only the
+				// codegen try_add already isolates. This core is built without exceptions, so running
+				// out of memory cannot be caught, only survived by the thread it happens on ending.
+				// Translation used to run here on the worker, so when operator new failed under
+				// PPUTranslator::SetGpr the std::bad_alloc had nowhere to go and the app aborted:
+				// Metal Gear Solid V: The Phantom Pain (BLUS31491), 18 minutes into its first compile
+				// on an Odin 3. Now the new_handler in JITLLVM.cpp ends only that disposable thread
+				// and the attempt comes back with out_of_memory set.
+				//
+				// The JIT is made here, not on that thread, so destroying it afterwards frees its
+				// context and every module in it even when the thread died partway through.
+				const auto compile_module = [this](const ppu_module<lv2_obj>& part, const std::string& obj_name, bool& out_of_memory) -> bool
+				{
+					jit_compiler jit({}, g_cfg.core.llvm_cpu.to_string(), 0x1);
+
+					// Thread-local in the translator, so it has to be handed to the thread that
+					// does the translating.
+					const bool avoid_strict_fma = g_ppu_avoid_strict_fma;
+
+					bool result = false;
+					bool module_oom = false;
+					std::string error;
+
+					const bool finished = jit_run_recoverable([&]()
+					{
+						g_ppu_avoid_strict_fma = avoid_strict_fma;
+						g_ppu_module_oom = false;
+
+						result = ppu_initialize2(jit, part, cache_path, obj_name);
+						module_oom = g_ppu_module_oom;
+					}, error);
+
+					if (!finished)
+					{
+						ppu_log.error("LLVM: Failed to translate module %s: %s", obj_name, error);
+						result = false;
+						module_oom = error.find("Out of memory") != umax;
+					}
+
+					out_of_memory = !result && module_oom;
+					return result;
+				};
+
 				for (usz i = (*work_cv)++; i < workload.size(); i = (*work_cv)++, (*work_done)++, g_progr_pdone++)
 				{
 					if (cpu ? cpu->state.all_of(cpu_flag::exit) : Emu.IsStopped())
@@ -6566,6 +6887,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 					ppu_log.warning("LLVM: Compiling module %s%s", cache_path, obj_name);
 
 					bool compiled_this_module = false;
+					bool out_of_memory = false;
 
 					{
 #if defined(__ANDROID__) || defined(ARMSX3_IOS)
@@ -6592,19 +6914,19 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 							}
 						} serialise_compiles;
 
-						if (jit_core_allocator::memory_is_tight())
-						{
-							auto& claim = g_fxo->get<jit_core_allocator>().low_memory_claim;
+						auto& allocator = g_fxo->get<jit_core_allocator>();
 
-							// Bounded at ~60s. A claim still held after that is one whose owner
-							// died without releasing it, and compiling anyway is better than a
-							// precompile that never finishes -- the memory back-pressure below
-							// is unchanged either way, so this only bounds the wait.
-							for (u32 i = 0; i < 600; i++)
+						// Bounded. A claim still held after the wait is one whose owner died
+						// without releasing it, and compiling anyway is better than a precompile
+						// that never finishes -- the memory back-pressure below is unchanged
+						// either way, so this only bounds the wait.
+						const auto take_claim = [&](u32 tries)
+						{
+							for (u32 i = 0; i < tries && !serialise_compiles.owner; i++)
 							{
-								if (claim.compare_and_swap_test(0, 1))
+								if (allocator.low_memory_claim.compare_and_swap_test(0, 1))
 								{
-									serialise_compiles.owner = &claim;
+									serialise_compiles.owner = &allocator.low_memory_claim;
 									break;
 								}
 
@@ -6613,19 +6935,42 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 									break;
 								}
 
-								claim.wait(1, atomic_wait_timeout{100'000'000});
+								allocator.low_memory_claim.wait(1, atomic_wait_timeout{100'000'000});
 							}
+						};
+
+						if (jit_core_allocator::memory_is_tight() || allocator.out_of_memory_seen)
+						{
+							// ~60s normally. After running out of memory the holder may be
+							// compiling a module that takes minutes on its own, so ~10 minutes.
+							take_claim(allocator.out_of_memory_seen ? 6000 : 600);
 
 							// Holding the claim first is deliberate: whoever waits should be the
 							// only one running, otherwise the other worker keeps allocating and
 							// the wait watches memory it is not allowed to influence.
 							jit_core_allocator::wait_for_memory();
 						}
+
+						// Counted from here, not while waiting above, so a worker queued for the
+						// claim is never mistaken for one holding compiler memory.
+						struct compiling_guard_t
+						{
+							atomic_t<u32>& count;
+
+							explicit compiling_guard_t(atomic_t<u32>& c)
+								: count(c)
+							{
+								count++;
+							}
+
+							~compiling_guard_t()
+							{
+								count--;
+							}
+						} counted(allocator.compiling);
 #endif
 
-						// Use another JIT instance
-						jit_compiler jit2({}, g_cfg.core.llvm_cpu.to_string(), 0x1);
-						compiled_this_module = ppu_initialize2(jit2, part, cache_path, obj_name);
+						compiled_this_module = compile_module(part, obj_name, out_of_memory);
 
 #if defined(ARCH_ARM64)
 						// One retry with allocator-friendly codegen before giving the module up.
@@ -6653,15 +6998,16 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 						// has ALREADY rejected pays for the double-precision form. A fresh jit is
 						// mandatory -- the previous instance is poisoned by the failed add and its
 						// engine cannot be reused.
-						if (!compiled_this_module && !Emu.IsStopped())
+						//
+						// Not after running out of memory: this retry changes only how VMADDFP is
+						// emitted, so running it straight away just adds a second large compile to
+						// the pressure that failed the first.
+						if (!compiled_this_module && !out_of_memory && !Emu.IsStopped())
 						{
 							ppu_log.warning("LLVM: Retrying module %s with allocator-friendly codegen", obj_name);
 
 							g_ppu_avoid_strict_fma = true;
-
-							jit_compiler jit3({}, g_cfg.core.llvm_cpu.to_string(), 0x1);
-							compiled_this_module = ppu_initialize2(jit3, part, cache_path, obj_name);
-
+							compiled_this_module = compile_module(part, obj_name, out_of_memory);
 							g_ppu_avoid_strict_fma = false;
 
 							if (compiled_this_module)
@@ -6670,6 +7016,55 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 							}
 						}
 #endif
+
+#ifdef __ANDROID__
+						// Out of memory: one more attempt, alone.
+						//
+						// The module is rarely too big on its own; what failed was the sum of the
+						// modules in flight. So stop new modules from starting (the claim, plus
+						// out_of_memory_seen making every later module ask for it), let the ones
+						// already running finish, give the system time to hand memory back, and
+						// try again with nothing else compiling. Only if that fails too does the
+						// boot stop with the restart message after the workers join. Running on
+						// without the module would be worse: its functions would go through
+						// ppu_recompiler_fallback, which can take a game from full speed to
+						// unplayable.
+						if (!compiled_this_module && out_of_memory && !Emu.IsStopped())
+						{
+							allocator.out_of_memory_seen = true;
+
+							// Not counted while queued for the claim, or two workers that ran out
+							// together would each wait for the other to finish.
+							allocator.compiling--;
+							take_claim(6000);
+							allocator.compiling++;
+
+							// Bounded at ~2 minutes, in case a worker died holding its count.
+							for (u32 i = 0; i < 1200 && allocator.compiling > 1 && !Emu.IsStopped(); i++)
+							{
+								std::this_thread::sleep_for(std::chrono::milliseconds(100));
+							}
+
+							jit_core_allocator::wait_for_memory();
+
+							ppu_log.warning("LLVM: Retrying module %s alone after running out of memory", obj_name);
+
+							compiled_this_module = compile_module(part, obj_name, out_of_memory);
+
+							if (compiled_this_module)
+							{
+								ppu_log.success("LLVM: Module %s compiled on its own", obj_name);
+							}
+						}
+#endif
+
+						// Out of memory is the one compile failure the user can do something about,
+						// and the one that arrives in bulk once the device is short. Flag it for a
+						// single message after the workers join.
+						if (!compiled_this_module && out_of_memory)
+						{
+							g_ppu_compile_oom = true;
+						}
 					}
 
 					if (compiled_this_module)
@@ -7336,12 +7731,11 @@ static bool ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 	{
 		ppu_log.error("LLVM: Failed to compile module %s: %s", obj_name, llvm_error);
 
-		// Out of memory is the one compile failure the user can do something about, and the one
-		// that arrives in bulk -- every remaining module fails the same way once the device is
-		// short. Flag it for a single message after the workers join.
+		// Out of memory is the one compile failure that waiting can fix. Tell the worker, which
+		// retries the module alone and only then gives up (see thread_op in ppu_initialize).
 		if (llvm_error.find("Out of memory") != umax)
 		{
-			g_ppu_compile_oom = true;
+			g_ppu_module_oom = true;
 		}
 
 		return false;

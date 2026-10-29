@@ -67,6 +67,7 @@ import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalDensity
@@ -104,6 +105,11 @@ internal fun rowAura() = Brush.horizontalGradient(
     listOf(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.055f), Color.Transparent),
 )
 
+/** The nav layer the controls composed here belong to, for those that don't name one. An overlay
+ *  provides its layer once (the in-game menu's Friends panel does) and everything inside it, shared
+ *  rows included, registers under that layer with no plumbing. */
+internal val LocalNavLayer = staticCompositionLocalOf<String?> { null }
+
 internal object SettingsControllerNav {
     private data class Item(
         val id: String,
@@ -111,6 +117,7 @@ internal object SettingsControllerNav {
         val onLeft: (() -> Unit)?,
         val onRight: (() -> Unit)?,
         val layer: String? = null,
+        val onSecondary: (() -> Unit)? = null,
     )
 
     // Exclusive input layer. When non-null (e.g. the nav drawer is open), only
@@ -147,8 +154,24 @@ internal object SettingsControllerNav {
      *  scroll to the very top when a category chip regains focus. */
     fun currentSelectedId(): String? = selectedId.value
 
-    fun setPosition(id: String, x: Float, y: Float) {
-        positions[id] = y to x
+    // Each control's layout, read again before a spatial move. A lazy grid's scroll moves its
+    // cells without telling onGloballyPositioned, so a position kept from that callback could be
+    // a row behind: in the avatar picker the selected cell and the row below it then sat at the
+    // same height, and Down found nothing to go to.
+    private val coordinates = HashMap<String, LayoutCoordinates>()
+
+    fun setPosition(id: String, layout: LayoutCoordinates) {
+        coordinates[id] = layout
+        val p = layout.positionInRoot()
+        positions[id] = p.y to p.x
+    }
+
+    private fun refreshPositions() {
+        for ((id, layout) in coordinates) {
+            if (!layout.isAttached) continue
+            val p = layout.positionInRoot()
+            positions[id] = p.y to p.x
+        }
     }
 
     private fun orderedIds(): List<String> {
@@ -194,10 +217,11 @@ internal object SettingsControllerNav {
         onLeft: (() -> Unit)? = null,
         onRight: (() -> Unit)? = null,
         layer: String? = null,
+        onSecondary: (() -> Unit)? = null,
     ) {
         // Upsert — replacing an existing key keeps its insertion order (stable
         // visual order) while refreshing the closures to the current value.
-        registry[id] = Item(id, onConfirm, onLeft, onRight, layer)
+        registry[id] = Item(id, onConfirm, onLeft, onRight, layer, onSecondary)
         if (selectedId.value == id)
             selectedIndex.intValue = orderedIds().indexOf(id)
     }
@@ -205,8 +229,12 @@ internal object SettingsControllerNav {
     fun unregister(id: String) {
         registry.remove(id)
         positions.remove(id)
+        coordinates.remove(id)
+        // Handing the selection to the first control scrolls the page there. With the pad driving
+        // that keeps it somewhere reachable; under touch it only flung the page to the top when a
+        // tapped row went away (Keep on an RPCN friend), so the selection is dropped instead.
         if (selectedId.value == id)
-            selectedId.value = orderedIds().firstOrNull()
+            selectedId.value = if (com.armsx2.ui.common.PadInput.active.value) orderedIds().firstOrNull() else null
         selectedIndex.intValue = orderedIds().indexOf(selectedId.value)
     }
 
@@ -242,10 +270,9 @@ internal object SettingsControllerNav {
     /** Focus a specific control by id. Returns false when it hasn't registered yet, so a caller
      *  that composes its controls in the same frame can retry.
      *
-     *  Exists for modal layers (see ConfirmOverlay): the home screen decides whether the D-pad
-     *  belongs to this registry or to the cover grid by asking [hasSelection], so a modal that
-     *  merely claims [activeLayer] without also taking a selection would lose its first press to
-     *  the grid behind the scrim. */
+     *  Exists for modal layers (see ConfirmOverlay). Claiming [activeLayer] is what takes the pad
+     *  from the cover grid behind the scrim (MainActivityRuntime checks it before handing the grid
+     *  any input); taking a selection as well is what gives the first press a button to land on. */
     fun selectById(id: String): Boolean {
         val ids = orderedIds()
         val index = ids.indexOf(id)
@@ -267,6 +294,7 @@ internal object SettingsControllerNav {
     fun count(): Int = registry.size
 
     fun move(delta: Int): Boolean {
+        refreshPositions()
         val ids = orderedIds()
         if (ids.isEmpty() || delta == 0) return false
         val cur = ids.indexOf(selectedId.value)
@@ -289,8 +317,12 @@ internal object SettingsControllerNav {
      *  is selected yet. positions[id] = (y, x). */
     fun moveSpatial(dx: Int, dy: Int): Boolean {
         if (dx == 0 && dy == 0) return false
+        refreshPositions()
         val curId = selectedId.value
-        val cur = curId?.let { positions[it] }
+        // Only the active layer takes part, as in [move]. Without this an overlay's rows reached
+        // the screen behind them: Up through the capture picker in Settings, Advanced landed on the
+        // Frame dump row it covers, which sits between two of its rows on screen.
+        val cur = curId?.takeIf { inActiveLayer(it) }?.let { positions[it] }
         if (cur == null) {
             val moved = move(if (dx < 0 || dy < 0) -1 else 1)
             android.util.Log.d("ARMSX2_MCNAV", "moveSpatial dx=$dx dy=$dy cur=$curId NO_POS -> fallback move=$moved")
@@ -308,7 +340,7 @@ internal object SettingsControllerNav {
             // nowhere useful on the card grid.
             var rowY: Float? = null
             for ((id, p) in positions) {
-                if (id == curId || registry[id] == null) continue
+                if (id == curId || registry[id] == null || !inActiveLayer(id)) continue
                 val py = p.first
                 if (dy < 0 && py >= cy - rowTol) continue   // need a row strictly above
                 if (dy > 0 && py <= cy + rowTol) continue   // need a row strictly below
@@ -323,7 +355,7 @@ internal object SettingsControllerNav {
                 var bestId: String? = null
                 var bestDx = Float.MAX_VALUE
                 for ((id, p) in positions) {
-                    if (id == curId || registry[id] == null) continue
+                    if (id == curId || registry[id] == null || !inActiveLayer(id)) continue
                     if (abs(p.first - ry) > rowTol) continue
                     val d = abs(p.second - cx)
                     if (d < bestDx) { bestDx = d; bestId = id }
@@ -335,7 +367,7 @@ internal object SettingsControllerNav {
             var bestId: String? = null
             var bestScore = Float.MAX_VALUE
             for ((id, p) in positions) {
-                if (id == curId || registry[id] == null) continue
+                if (id == curId || registry[id] == null || !inActiveLayer(id)) continue
                 val ddx = p.second - cx
                 val ddy = p.first - cy
                 val inDir = if (dx > 0) ddx > 1f && abs(ddy) < rowTol
@@ -374,6 +406,14 @@ internal object SettingsControllerNav {
         // BIOS-location, patches/cheats — that route through the nav registry but aren't one of the
         // self-sounding standard widgets. Anything that made its own sound is left alone (no double).
         if (com.armsx2.MenuSfx.lastPlayedAt() == before) com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.SELECT)
+        return true
+    }
+
+    /** Triangle on the selected control, for the few with a second action (favouriting an
+     *  avatar). False when it has none, so the button keeps whatever else it does there. */
+    fun secondary(): Boolean {
+        val action = selectedItem()?.onSecondary ?: return false
+        action.invoke()
         return true
     }
 
@@ -428,7 +468,15 @@ internal fun Modifier.controllerFocusable(
     onLeft: (() -> Unit)? = null,
     onRight: (() -> Unit)? = null,
     layer: String? = null,
+    // False for a control that draws its own selection, as the toy portals' spots do
+    ring: Boolean = true,
+    // What Triangle does on it (SettingsControllerNav.secondary)
+    onSecondary: (() -> Unit)? = null,
+    // False inside a list that scrolls itself to the selection: this request scrolls as little as
+    // shows the control, and a second scroll at once cancels the list's (the avatar grid's Down)
+    scrollIntoView: Boolean = true,
 ): Modifier = composed {
+    val navLayer = layer ?: LocalNavLayer.current
     var focused by remember { mutableStateOf(false) }
     val bringIntoView = remember { BringIntoViewRequester() }
     if (controllerId != null) {
@@ -442,7 +490,8 @@ internal fun Modifier.controllerFocusable(
                 onConfirm = onConfirm,
                 onLeft = onLeft,
                 onRight = onRight,
-                layer = layer,
+                layer = navLayer,
+                onSecondary = onSecondary,
             )
         }
         DisposableEffect(controllerId) {
@@ -453,17 +502,14 @@ internal fun Modifier.controllerFocusable(
     if (controllerId != null) {
         // Scroll the selected row just into view using its real measured bounds.
         LaunchedEffect(selected) {
-            if (selected) runCatching { bringIntoView.bringIntoView() }
+            if (selected && scrollIntoView) runCatching { bringIntoView.bringIntoView() }
         }
     }
     this
         .bringIntoViewRequester(bringIntoView)
         .then(
             if (controllerId != null)
-                Modifier.onGloballyPositioned {
-                    val p = it.positionInRoot()
-                    SettingsControllerNav.setPosition(controllerId, p.x, p.y)
-                }
+                Modifier.onGloballyPositioned { SettingsControllerNav.setPosition(controllerId, it) }
             else Modifier,
         )
         .onFocusChanged { focused = it.isFocused }
@@ -495,7 +541,10 @@ internal fun Modifier.controllerFocusable(
             }
         }
         .then(
-            if (focused || selected) {
+            // Only while the pad drives the UI: Compose focus lands on controls by itself (the
+            // first focusable one when the game surface lets go), and under touch a ring there is
+            // a selection nobody made.
+            if (ring && (focused || selected) && com.armsx2.ui.common.PadInput.active.value) {
                 // Driver-safe selection ring: solid inner + translucent outer border. We
                 // deliberately avoid Modifier.shadow with a custom ambient/spot color here —
                 // Adreno / Mali / Turnip drivers frequently ignore the tint and render the
@@ -1185,7 +1234,7 @@ internal fun com.armsx2.config.Settings.notDefault(pick: (com.armsx2.config.Sett
  *  changed long ago, or by someone else, cannot hide in plain sight: a tester went looking for why
  *  Killzone 3 crawled, and the PPU decoder on Interpreter looked like any other row. */
 @Composable
-private fun NotDefaultLabel(modifier: Modifier = Modifier) {
+internal fun NotDefaultLabel(modifier: Modifier = Modifier) {
     Text(
         str("settings.notDefault"),
         color = MaterialTheme.colorScheme.error,

@@ -115,6 +115,8 @@ private data class DrawerItem(
     // Overlay the live "friends online" count on this row's glyph. Only Friends uses it — the
     // point is to be visible from the drawer without opening the screen.
     val friendsBadge: Boolean = false,
+    // RPCN shows the firmware's own avatar for this user in place of its glyph, once it is read
+    val rpcnAvatar: Boolean = false,
 )
 
 @Composable
@@ -223,6 +225,9 @@ private fun DrawerContent(selected: AppRoute, onNavigate: (AppRoute) -> Unit, on
         // Install .pkg games/updates/DLC. The native installer was always there; this
         // is the entry point it never had.
         DrawerItem("packages.title", "📦", AppRoute.PackageInstaller),
+        // Online play: the RPCN account, its friends and servers. In Settings it only appears
+        // once PSN status is RPCN, which was no help to someone looking for where to sign in.
+        DrawerItem("rpcn.screen.title", "\uD83D\uDEF0\uFE0F", AppRoute.Rpcn, rpcnAvatar = true),
         // ARMSX3: PS2 memory cards removed - PS3 uses HDD save data instead.
         DrawerItem("savestate.title.loadManage", "📥", AppRoute.SaveManager()),
         DrawerItem("tab.controls", "🕹️", AppRoute.ControllerManager),
@@ -255,6 +260,7 @@ private fun DrawerContent(selected: AppRoute, onNavigate: (AppRoute) -> Unit, on
         // anyone who wants the repo itself.
         DrawerItem("news.title", "📰", AppRoute.News),
         DrawerItem("friends.title", "👥", AppRoute.Friends, friendsBadge = true),
+        DrawerItem("remoteplay.title", "📡", AppRoute.RemotePlay),
         // About left the settings tab strip: it is a read-only page, not a setting, and it sat in
         // the tab row costing a slot on every settings visit.
         DrawerItem("about.title", "ℹ️", AppRoute.About),
@@ -327,6 +333,7 @@ private fun DrawerSection(
             iconRes = item.iconRes,
             iconTint = item.iconTint,
             friendsBadge = item.friendsBadge,
+            rpcnAvatar = item.rpcnAvatar,
             selected = item.destination != null && sameDestination(selected, item.destination),
             onClick = { item.onAction?.invoke() ?: item.destination?.let(onNavigate) },
         )
@@ -343,6 +350,7 @@ private fun DrawerRow(
     // the About rows' marks must follow the row so they don't render gold.
     iconTint: Color? = null,
     friendsBadge: Boolean = false,
+    rpcnAvatar: Boolean = false,
     selected: Boolean,
     onClick: () -> Unit,
 ) {
@@ -365,6 +373,16 @@ private fun DrawerRow(
             if (iconRes != null) {
                 Box(Modifier.width(32.dp), contentAlignment = Alignment.Center) {
                     Icon(painterResource(iconRes), contentDescription = null, tint = iconTint ?: contentColor, modifier = Modifier.size(24.dp))
+                }
+            } else if (rpcnAvatar) {
+                // The glyph until the picture is read, and for good without the firmware
+                val avatar = com.armsx2.ui.settings.rememberDefaultAvatar()
+                Box(Modifier.width(32.dp), contentAlignment = Alignment.CenterStart) {
+                    if (avatar != null) {
+                        androidx.compose.foundation.Image(avatar, contentDescription = null, modifier = Modifier.size(28.dp))
+                    } else {
+                        Text(glyph, color = contentColor, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                    }
                 }
             } else if (friendsBadge) {
                 Box(Modifier.width(32.dp)) {
@@ -397,5 +415,9 @@ private fun sameDestination(current: AppRoute, target: AppRoute): Boolean = when
     AppRoute.Language -> current is AppRoute.Language
     AppRoute.News -> current is AppRoute.News
     AppRoute.Friends -> current is AppRoute.Friends
-    AppRoute.About -> current is AppRoute.About
+    AppRoute.Rpcn -> current is AppRoute.Rpcn
+    AppRoute.RemotePlay -> current is AppRoute.RemotePlay
+    // The licenses screen is a page of About, so the drawer keeps About lit there.
+    AppRoute.About -> current is AppRoute.About || current is AppRoute.Licenses
+    AppRoute.Licenses -> current is AppRoute.Licenses
 }

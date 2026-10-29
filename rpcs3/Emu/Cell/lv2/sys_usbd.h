@@ -62,6 +62,19 @@ struct UsbDeviceIsoRequest
 	be_t<u16> packets[8];
 };
 
+#ifdef __ANDROID__
+#include <vector>
+
+// ARMSX3: the USB devices the app opened for passthrough (toy portals), as file descriptors. Android
+// gives an app a device only through UsbManager after the user allows it, and libusb cannot open one
+// itself there, so these are what a game's USB scan finds. Set before the game boots.
+void usb_android_set_devices(std::vector<int> fds);
+
+// ARMSX3: which of those the last scan passed through to the game, as bits: 1 Skylanders portal,
+// 2 Disney Infinity base, 4 LEGO Dimensions toy pad. One it could not take is emulated instead.
+u32 usb_android_passed_through();
+#endif
+
 error_code sys_usbd_initialize(ppu_thread& ppu, vm::ptr<u32> handle);
 error_code sys_usbd_finalize(ppu_thread& ppu, u32 handle);
 error_code sys_usbd_get_device_list(ppu_thread& ppu, u32 handle, vm::ptr<UsbInternalDevice> device_list, u32 max_devices);

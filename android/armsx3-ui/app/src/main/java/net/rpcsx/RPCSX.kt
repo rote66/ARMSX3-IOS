@@ -143,6 +143,28 @@ class RPCSX {
     external fun processCompilationQueue(): Boolean
     external fun startMainThreadProcessor(): Boolean
     external fun overlayPadData(port: Int, digital1: Int, digital2: Int, leftStickX: Int, leftStickY: Int, rightStickX: Int, rightStickY: Int): Boolean
+
+    // Remote play capture (native-lib.cpp, android/src/remote_play.cpp). The streaming threads
+    // pull frames and audio from the core; it never calls back for them.
+    external fun remotePlayStart(maxWidth: Int, maxHeight: Int): Boolean
+    external fun remotePlayStop()
+    external fun remotePlayPollVideo(buffer: java.nio.ByteBuffer, info: IntArray, timeoutMs: Int): Int
+    external fun remotePlayPollAudio(buffer: java.nio.ByteBuffer, capFrames: Int, timeoutMs: Int): Int
+    external fun remotePlayCounters(out: IntArray): Boolean
+    // Hardware frames (remotePlayPollVideo returned 2): the slot's buffer as a GL texture, needing a
+    // current EGL context; the slot handed back once the encoder has drawn it; and whether the core
+    // may send them at all.
+    external fun remotePlayImportFrame(slot: Int, texture: Int): Long
+    external fun remotePlayDestroyImage(image: Long)
+    external fun remotePlayReleaseFrame(slot: Int, seq: Int)
+    external fun remotePlaySetHardware(enabled: Boolean)
+    // Whether the running game can be hosted: only the Vulkan renderer captures frames.
+    external fun remotePlayCanCapture(): Boolean
+    // Online hosting, a port on the router (UPnP): this device's address on the router's network or
+    // null (blocks ~2 s the first time); "public address:port" opened for a UDP port or null; close.
+    external fun remotePlayUpnpPrepare(): String?
+    external fun remotePlayUpnpMap(internalPort: Int, externalHint: Int, leaseSeconds: Int): String?
+    external fun remotePlayUpnpUnmap(externalPort: Int)
     /** Analog pressure per pressure-capable button, in CELL_PAD press-offset order
      *  (RIGHT, LEFT, UP, DOWN, TRIANGLE, CIRCLE, CROSS, SQUARE, L1, R1, L2, R2),
      *  each 1..255, or 0 to leave that button digital. */
@@ -179,13 +201,28 @@ class RPCSX {
     /** Removes a friend. Returns "" on success or a message. */
     external fun rpcnRemoveFriend(npid: String): String
 
-    /** Friend list as JSON, or [] when not signed in. Never signs in on its own. */
+    /** Friends and pending requests as JSON: signedIn, friends, received, sent. Never signs in on its own. */
     external fun rpcnGetFriends(): String
+
+    /** Holds a signed-in session open for a friends screen (true, signing in if needed) or lets it go (false).
+     *  Returns "" on success or a message. */
+    external fun rpcnFriendsSession(open: Boolean): String
+
+    /** Game invites received and not yet used, as JSON [{id, from, subject, body}]. Never signs in. */
+    external fun rpcnGetInvites(): String
+
+    /** Hands an invite to the running game, as the XMB would. Returns "" on success or a message. */
+    external fun rpcnAcceptInvite(id: Long): String
+
+    /** Discards an invite. Returns "" on success or a message. */
+    external fun rpcnDeclineInvite(id: Long): String
 
     external fun rpcnCreateAccount(npid: String, password: String, onlineName: String, email: String): String
     external fun rpcnResendToken(npid: String, password: String): String
     external fun rpcnSendResetToken(npid: String, email: String): String
     external fun rpcnResetPassword(npid: String, token: String, password: String): String
+    /** Save the account and sign in, offering the password in the forms RPCN may want (RPCS3's derived one first). */
+    external fun rpcnSignIn(host: String, npid: String, password: String, token: String): String
 
     /** Connect and authenticate with the saved account. */
     external fun rpcnTestLogin(): String
@@ -210,6 +247,50 @@ class RPCSX {
      *  credentials -- so `configured` is what survives a restart, not `authentified`. */
     external fun rpcnStatus(): String
 
+    /** Whether an RPCN session is signed in right now. Cheap enough to poll: no config reload, and
+     *  it never creates a client. */
+    external fun rpcnSignedIn(): Boolean
+
+    /** The phone's microphones for the core: one "<Android device id>\t<name>" per line (MicDevices). */
+    external fun setMicDevices(list: String)
+
+    /** Audio settings' microphone test, through the game's own capture: start, poll 0..1 (-1 stopped), stop. */
+    external fun micTestStart(device: String): Boolean
+    external fun micTestLevel(): Float
+    external fun micTestStop()
+
+    /** Puts a .sky figure file on the emulated Skylanders portal: the place it took, -1 not a figure, -2 full. */
+    external fun skylanderLoad(path: String): Int
+
+    /** Lifts the figure in that place off the emulated portal. */
+    external fun skylanderRemove(slot: Int): Boolean
+    external fun skylanderLight(): Int
+
+    /** Disney Infinity base: a 320-byte figure file at position 0 to 8 (ToyPortals.InfinityBase). */
+    external fun infinityLoad(path: String, position: Int): Boolean
+    external fun infinityRemove(position: Int): Boolean
+
+    /** Lego Dimensions toy pad: a 180-byte figure file at index 0 to 6 (ToyPortals.DimensionsToyPad). */
+    external fun dimensionsLoad(path: String, index: Int): Boolean
+    external fun dimensionsRemove(index: Int): Boolean
+    /** New figure files, as RPCS3's portal managers create them. False when the file exists. */
+    external fun skylanderCreate(path: String, id: Int, variant: Int): Boolean
+    external fun infinityCreate(path: String, figure: Int, series: Int): Boolean
+    external fun dimensionsCreate(path: String, id: Int): Boolean
+
+    /** The RPCN tab's avatar picker (np_avatar): the installed PSN avatars as JSON, the PNG inside one,
+     *  choosing one by path ("" = the default), and a picture of the player's own as a square PNG. */
+    external fun avatarList(): String
+    external fun avatarCurrent(): String
+    external fun avatarImage(path: String): ByteArray?
+    external fun avatarSelect(path: String): Boolean
+    external fun avatarUseImage(png: ByteArray): Boolean
+
+    /** Real toy portals the app opened, as comma-separated file descriptors, for the next game (UsbPassthrough). */
+    external fun usbSetPassthrough(fds: String)
+    external fun usbPassedThrough(): Int
+    external fun takeGameError(): String
+
     /** Coalesce the config file writes of every settingsSet until [settingsEndBatch]. */
     external fun settingsBeginBatch()
     external fun settingsEndBatch()
@@ -217,14 +298,23 @@ class RPCSX {
     external fun kill()
     external fun resume()
     external fun pause()
+    /** From the activity's onStart (false) and onStop (true); paused-game threads poll less. */
+    external fun setAppBackgrounded(backgrounded: Boolean)
     external fun openHomeMenu()
 
     /** Arm an RSX frame capture: the next frame the emulator renders is recorded to
      *  config/captures/ and emulation pauses. */
     external fun captureFrame()
+
+    /** Arm a frame dump of the next frame (1 = final image, 2 = every render pass), saved as PNGs to
+     *  config/captures/. False when the renderer cannot dump frames. */
+    external fun dumpFrame(mode: Int): Boolean
     external fun loginUser(userId: String)
     external fun getUser(): String
     external fun getTitleId(): String
+    /** The running game's title from its PARAM.SFO. Empty when nothing is running, null before
+     *  the core is loaded. */
+    external fun getTitle(): String?
     /** The running game's trophy folder name (NPWR comm id, e.g. "NPWR05636_00").
      *
      *  Empty when no game is running, when the game has not called

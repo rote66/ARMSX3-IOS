@@ -141,7 +141,7 @@ fun TouchControlsOverlay() {
         com.armsx2.input.AndroidGyroscopeInput(context) { mode, x, y ->
             // Fold the gyro into the shared analog-merge layer as a SIGNED addend on
             // the physical stick that shares its axis (aim -> right or the user-chosen
-            // left for RE4-style games; steer -> left) instead of writing the stick
+            // left for RE4-style games; steer -> its own choice, left by default) instead of writing the stick
             // codes raw. That lets coarse stick aim and fine gyro adjustment run at
             // once — before, whichever moved last clobbered the other. The combine
             // (and the P1 physical-stick state it sums with) lives in the runtime.
@@ -153,17 +153,23 @@ fun TouchControlsOverlay() {
     // the effect keys on it: turning it off unregisters the sensor, and stop()'s (0,0)
     // release clears the gyro addend so the physical stick is left driving on its own.
     val gyroOn = MainActivityRuntime.gyroActive.value
+    // Split axes (ARMSX2 #592): each axis its own sensitivity, and Steer mode reads Y as well.
+    val gyroSplit = ControllerMappings.gyroSplitAxes()
+    val gyroSensX = if (gyroSplit) ControllerMappings.gyroSensitivityX() else ControllerMappings.gyroSensitivity()
+    val gyroSensY = if (gyroSplit) ControllerMappings.gyroSensitivityY() else ControllerMappings.gyroSensitivity()
     DisposableEffect(MainActivityRuntime.eState.value, gyroMode, gyroOn,
-            ControllerMappings.gyroSensitivity(),
+            gyroSensX, gyroSensY, gyroSplit,
             ControllerMappings.gyroSmoothing(),
             ControllerMappings.gyroInvertX(),
             ControllerMappings.gyroInvertY()) {
         if (MainActivityRuntime.eState.value == EmuState.RUNNING && gyroMode != 0 && gyroOn) {
             gyro.start(gyroMode,
-                ControllerMappings.gyroSensitivity(),
+                gyroSensX,
+                gyroSensY,
                 ControllerMappings.gyroSmoothing(),
                 ControllerMappings.gyroInvertX(),
-                ControllerMappings.gyroInvertY())
+                ControllerMappings.gyroInvertY(),
+                steerY = gyroSplit)
             // Hand the runtime a handle on recenter() — it owns hotkey dispatch but not the
             // sensor. Only published while a session is actually registered so GYRO_RECENTER
             // can report "not active" rather than appearing to work.
@@ -177,6 +183,10 @@ fun TouchControlsOverlay() {
             gyro.stop()
         }
     }
+    // Sensor off while the app is out of sight and back on when it returns, told by the lifecycle
+    // itself: the keys above only change on recomposition, which stops with the activity.
+    androidx.lifecycle.compose.LifecycleEventEffect(androidx.lifecycle.Lifecycle.Event.ON_STOP) { gyro.setInSight(false) }
+    androidx.lifecycle.compose.LifecycleEventEffect(androidx.lifecycle.Lifecycle.Event.ON_START) { gyro.setInSight(true) }
     val edit = TouchControls.editMode.value
     val running = MainActivityRuntime.eState.value == EmuState.RUNNING ||
                   MainActivityRuntime.eState.value == EmuState.PAUSED
@@ -239,12 +249,15 @@ fun TouchControlsOverlay() {
             OverlayDims.last = OverlayDims.Dims(widthPx, heightPx, density.density)
         }
         val layout = TouchControls.activeLayout.value
+        val tight = tightShoulderFactors()
         // Buttons the single UnifiedTouchLayer currently holds down (face + shoulder +
         // menu digital buttons). The covered widgets read this to paint their pressed
         // visual — they're render-only when multi-touch is on (inputEnabled=false).
         // Generalizes the old per-region facePressed / lShoulderPressed / rShoulderPressed
         // trio into one published set.
         var unifiedPressed by remember { mutableStateOf<Set<TouchButtonId>>(emptySet()) }
+        // The D-pad directions the same layer holds, for the D-pad widget to draw (ARMSX2 #765).
+        var unifiedDpad by remember { mutableStateOf(DpadState()) }
 
         // #357: the tap-to-reveal settings cog is GONE — the top-right pause button is the single
         // entry point into the menu now. It renders HERE, above the `showPad` early-return below,
@@ -357,6 +370,7 @@ fun TouchControlsOverlay() {
         val faceMulti = !edit && TouchControls.faceMultiTouch.value
         if (!faceMulti) {
             if (unifiedPressed.isNotEmpty()) unifiedPressed = emptySet()
+            if (unifiedDpad.any()) unifiedDpad = DpadState()
         }
         // Buttons currently held via the unified multi-touch hit-test layer.
         val multiPressed = unifiedPressed
@@ -376,6 +390,7 @@ fun TouchControlsOverlay() {
                 heightPx = heightPx,
                 glideMode = TouchControls.glideMode.value,
                 onPressedChange = { unifiedPressed = it },
+                onDpadChange = { unifiedDpad = it },
             )
         }
         // Lightgun aiming, when a GunCon 2 is attached. Below the widgets (so gun buttons and
@@ -426,21 +441,26 @@ fun TouchControlsOverlay() {
             val yFrac = if (snapping) snapFracToGrid(cfg.yFrac, heightPx, gridPx) else cfg.yFrac
             val cx = w * xFrac
             val cy = h * yFrac
+            val boxH = size * (tight[cfg.id] ?: 1f)
             val left = cx - size / 2
-            val top = cy - size / 2
+            val top = cy - boxH / 2
             Box(
                 modifier = Modifier
                     .offset(x = left, y = top)
-                    .size(size)
+                    .size(width = size, height = boxH)
                     .alpha(if (edit && !cfg.enabled) 0.4f else 1f),
             ) {
                 when (cfg.id.kind) {
-                    TouchButtonId.Kind.DPAD -> DpadWidget(cfg, edit)
+                    TouchButtonId.Kind.DPAD -> DpadWidget(
+                        cfg, edit,
+                        inputEnabled = !faceMulti,
+                        forced = if (faceMulti) unifiedDpad else null,
+                    )
                     TouchButtonId.Kind.STICK -> StickWidget(cfg, edit)
                     TouchButtonId.Kind.PAUSE -> PauseWidget(cfg, edit)
-                    TouchButtonId.Kind.PRESSURE -> PressureButtonWidget(cfg, edit)
+                    TouchButtonId.Kind.PRESSURE -> PressureButtonWidget(cfg, edit, inputEnabled = !(faceMulti && !cfg.tapToHold))
                     TouchButtonId.Kind.FASTFORWARD -> FastForwardWidget(cfg, edit)
-                    TouchButtonId.Kind.MACRO -> MacroWidget(cfg, edit)
+                    TouchButtonId.Kind.MACRO -> MacroWidget(cfg, edit, inputEnabled = !(faceMulti && !cfg.tapToHold))
                     TouchButtonId.Kind.STATEACTION -> StateActionWidget(cfg, edit)
                     TouchButtonId.Kind.ANALOGEXTRA -> AnalogExtraWidget(cfg, edit)
 	                    else -> ButtonWidget(
@@ -517,6 +537,124 @@ fun TouchControlsOverlay() {
 
         if (TouchControls.profileDialogOpen.value) {
             ProfilePicker(onDismiss = { TouchControls.profileDialogOpen.value = false })
+        }
+    }
+}
+
+/* -------------------------------------------------------------------- */
+/*  Remote play: these controls on a friend's device, as player 2        */
+/* -------------------------------------------------------------------- */
+
+/** Where presses go while a remote play viewer is open (com.armsx2.remoteplay): to the stream's
+ *  player 2 instead of this device's emulator. Set for the viewer's whole life rather than while the
+ *  controls are composed, so the releases they send as they hide still reach player 2. */
+@Volatile
+private var remotePlayPadSink: ((keycode: Int, value: Int, pressed: Boolean) -> Unit)? = null
+
+/** Remote play's viewer sets this when it opens and clears it when it closes; see [RemotePlayTouchControls]. */
+/**
+ * Clears the sink, but only while it is still [sink]: a second viewer screen that closes (refused,
+ * say) must not cut off the one still playing.
+ */
+fun clearRemotePlayPadSink(sink: (keycode: Int, value: Int, pressed: Boolean) -> Unit) {
+    if (remotePlayPadSink === sink) remotePlayPadSink = null
+}
+
+fun setRemotePlayPadSink(sink: ((keycode: Int, value: Int, pressed: Boolean) -> Unit)?) {
+    remotePlayPadSink = sink
+}
+
+/** What a remote play viewer gets: the controller itself. Pause, fast forward, save states and the
+ *  pressure modifier act on a game running on this device, and there is none. */
+private fun isRemotePlayKind(kind: TouchButtonId.Kind): Boolean = when (kind) {
+    TouchButtonId.Kind.FACE, TouchButtonId.Kind.SHOULDER, TouchButtonId.Kind.MENU,
+    TouchButtonId.Kind.DPAD, TouchButtonId.Kind.STICK, TouchButtonId.Kind.MACRO,
+    TouchButtonId.Kind.ANALOGEXTRA -> true
+    else -> false
+}
+
+/**
+ * Remote play: the player's own touch controls (layout, skin, size, opacity, multi-touch and glide
+ * settings) on a friend's stream, playing as player 2. Presses go to the sink set with
+ * [setRemotePlayPadSink]. Built from the same widgets as [TouchControlsOverlay], minus everything
+ * tied to a local game: the light gun, screen gestures, gyro and the buttons [isRemotePlayKind]
+ * leaves out.
+ */
+@Composable
+fun RemotePlayTouchControls() {
+    TouchControls.ensureLoaded()
+    val context = LocalContext.current
+    val isPortrait = LocalConfiguration.current.orientation == Configuration.ORIENTATION_PORTRAIT
+    TouchControls.portrait.value = isPortrait
+    LaunchedEffect(isPortrait) {
+        // The global profile and skin, as outside a game.
+        TouchControls.applyActiveProfileForOrientation()
+        ControllerSkinStore.applyForSerial(context, null)
+    }
+
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val w = maxWidth
+        val h = maxHeight
+        val density = LocalDensity.current
+        val widthPx = with(density) { w.toPx() }
+        val heightPx = with(density) { h.toPx() }
+        LaunchedEffect(widthPx, heightPx, density.density) {
+            OverlayDims.last = OverlayDims.Dims(widthPx, heightPx, density.density)
+        }
+        val full = TouchControls.activeLayout.value
+        val layout = remember(full) { TouchLayout(full.buttons.filter { isRemotePlayKind(it.id.kind) }) }
+        val tight = tightShoulderFactors()
+        var unifiedPressed by remember { mutableStateOf<Set<TouchButtonId>>(emptySet()) }
+        var unifiedDpad by remember { mutableStateOf(DpadState()) }
+        val faceMulti = TouchControls.faceMultiTouch.value
+        if (!faceMulti) {
+            if (unifiedPressed.isNotEmpty()) unifiedPressed = emptySet()
+            if (unifiedDpad.any()) unifiedDpad = DpadState()
+        }
+
+        // Layered as in TouchControlsOverlay: the full-screen layers under the widgets.
+        if (faceMulti) {
+            UnifiedTouchLayer(
+                layout = layout,
+                widthPx = widthPx,
+                heightPx = heightPx,
+                glideMode = TouchControls.glideMode.value,
+                onPressedChange = { unifiedPressed = it },
+                onDpadChange = { unifiedDpad = it },
+            )
+        }
+        if (TouchControls.fullHalfSticks.value) {
+            FullHalfStickLayer(layout = layout, widthPx = widthPx, heightPx = heightPx, faceMulti = faceMulti)
+        }
+        for (cfg in layout.buttons) {
+            if (!cfg.enabled) continue
+            if (TouchControls.fullHalfSticks.value && cfg.id.kind == TouchButtonId.Kind.STICK &&
+                !(cfg.id == TouchButtonId.L_STICK && TouchControls.fullHalfKeepLeftStick.value)) continue
+            if (cfg.id == TouchButtonId.ANALOG_EXTRA && !TouchControls.analogExtraEnabled.value) continue
+            val size = cfg.sizeDp.dp
+            val boxH = size * (tight[cfg.id] ?: 1f)
+            Box(
+                modifier = Modifier
+                    .offset(x = w * cfg.xFrac - size / 2, y = h * cfg.yFrac - boxH / 2)
+                    .size(width = size, height = boxH),
+            ) {
+                when (cfg.id.kind) {
+                    TouchButtonId.Kind.DPAD -> DpadWidget(
+                        cfg, edit = false,
+                        inputEnabled = !faceMulti,
+                        forced = if (faceMulti) unifiedDpad else null,
+                    )
+                    TouchButtonId.Kind.STICK -> StickWidget(cfg, edit = false)
+                    TouchButtonId.Kind.MACRO -> MacroWidget(cfg, edit = false, inputEnabled = !(faceMulti && !cfg.tapToHold))
+                    TouchButtonId.Kind.ANALOGEXTRA -> AnalogExtraWidget(cfg, edit = false)
+                    else -> ButtonWidget(
+                        cfg = cfg,
+                        edit = false,
+                        inputEnabled = !(faceMulti && isMultiTouchKind(cfg.id.kind) && !cfg.tapToHold),
+                        forcedPressed = faceMulti && cfg.id in unifiedPressed,
+                    )
+                }
+            }
         }
     }
 }
@@ -601,6 +739,37 @@ private fun skinPainter(key: String?): Painter? {
     return remember(bmp) { BitmapPainter(bmp) }
 }
 
+/** Height over width of a shoulder button's art on screen: the skin's image or the bundled sprite.
+ *  At most 1: art taller than it is wide fills the square anyway. */
+@Composable
+private fun shoulderArtAspect(id: TouchButtonId): Float {
+    val art = (skinPainter(skinKeyFor(id)) ?: painterResource(drawableFor(id, false))).intrinsicSize
+    return if (art.width.isFinite() && art.height.isFinite() && art.width > 0f && art.height > 0f)
+        (art.height / art.width).coerceIn(0.2f, 1f) else 1f
+}
+
+private val SHOULDER_IDS = listOf(TouchButtonId.L1, TouchButtonId.R1, TouchButtonId.L2, TouchButtonId.R2)
+
+/**
+ * Height factor of each shoulder button's box while Tight shoulder buttons is on, else empty.
+ *
+ * Every widget is a square of its size, and with multi-touch on a button also answers anywhere in a
+ * circle 1.24 times as wide. L1/R1's sprite is only 0.58 of its width tall, so those reached far
+ * above and below the button and got in the way (a request pointing at NetherSX2, which keeps the
+ * touch area to the button). With the option on, a shoulder's widget box, touch area and the
+ * regions other layers leave to it are all its artwork's box.
+ */
+@Composable
+private fun tightShoulderFactors(): Map<TouchButtonId, Float> {
+    val on = TouchControls.tightShoulders.value
+    val factors = HashMap<TouchButtonId, Float>(SHOULDER_IDS.size)
+    for (id in SHOULDER_IDS) {
+        val aspect = shoulderArtAspect(id)
+        if (on) factors[id] = aspect
+    }
+    return factors
+}
+
 /** Logical skin key for a button, or null for buttons with no skin slot. */
 private fun skinKeyFor(id: TouchButtonId): String? = when (id) {
     TouchButtonId.CROSS -> "cross"
@@ -650,13 +819,15 @@ private fun drawableFor(id: TouchButtonId, pressed: Boolean): Int = when (id) {
  *  sets TouchControls.pressureModifierHeld so pressure-capable buttons report a
  *  soft (~50%) press. Tints blue while held. */
 @Composable
-private fun PressureButtonWidget(cfg: TouchButtonCfg, edit: Boolean) {
+private fun PressureButtonWidget(cfg: TouchButtonCfg, edit: Boolean, inputEnabled: Boolean = true) {
     val held = TouchControls.pressureModifierHeld.value
     val opacity = TouchControls.opacity.floatValue
     val mod = Modifier
         .fillMaxSize()
         .let { it ->
             if (edit) it.editGestures(cfg)
+            // Multi-touch on: UnifiedTouchLayer presses P½, so a finger can glide on and off it.
+            else if (!inputEnabled) it
             else it.pointerInput(cfg.id) {
                 awaitPointerEventScope {
                     while (true) {
@@ -715,6 +886,7 @@ private fun UnifiedTouchLayer(
     heightPx: Float,
     glideMode: TouchControls.GlideMode = TouchControls.GlideMode.FOLLOW,
     onPressedChange: (Set<TouchButtonId>) -> Unit,
+    onDpadChange: (DpadState) -> Unit = {},
 ) {
     if (widthPx <= 0f || heightPx <= 0f) return
 
@@ -722,8 +894,11 @@ private fun UnifiedTouchLayer(
     // tap-to-hold (latched buttons keep their own pressGestures handler so the
     // latch logic runs — the shared layer has no latch). Same rect+circle hit math
     // as the old per-region FaceMultiTouchLayer: center + radius = sizePx * 0.62.
+    // Macros and the P½ pressure modifier are the layer's too (ARMSX2 #765), so a finger can press
+    // one, slide onto one or slide off one, the way MGS2/3 players hold a weapon button and then
+    // need P½ or a macro on the same thumb. Their widgets are render-only while this layer is on.
     val hitButtons = layout.buttons.filter {
-        it.enabled && isMultiTouchKind(it.id.kind) && !it.tapToHold
+        it.enabled && isUnifiedKind(it.id.kind) && !it.tapToHold
     }
     // Foreign regions: DPAD / STICK / tap+long-press kinds (PAUSE / FASTFORWARD /
     // MACRO / STATEACTION / PRESSURE) and any tap-to-hold digital button. Those
@@ -733,25 +908,32 @@ private fun UnifiedTouchLayer(
     // above-layer consume ever races), so a tap on the stick / Pause can't leak
     // into a face button.
     val foreignRects = layout.buttons.filter { cfg ->
-        cfg.enabled && (!isMultiTouchKind(cfg.id.kind) || cfg.tapToHold)
+        cfg.enabled && cfg.id.kind != TouchButtonId.Kind.DPAD && (!isUnifiedKind(cfg.id.kind) || cfg.tapToHold)
     }
 
     val density = LocalDensity.current
+    val tight = tightShoulderFactors()
     val buttonRects = hitButtons.map { cfg ->
         val sizePx = with(density) { cfg.sizeDp.dp.toPx() }
         val cx = widthPx * cfg.xFrac
         val cy = heightPx * cfg.yFrac
-        UnifiedHit(id = cfg.id, cx = cx, cy = cy, radius = sizePx * TouchControls.multiTouchRadius.floatValue)
+        val factor = tight[cfg.id]
+        if (factor != null) {
+            UnifiedHit(id = cfg.id, cx = cx, cy = cy, radius = 0f, halfW = sizePx / 2f, halfH = sizePx * factor / 2f)
+        } else {
+            UnifiedHit(id = cfg.id, cx = cx, cy = cy, radius = sizePx * TouchControls.multiTouchRadius.floatValue)
+        }
     }
     val foreignBounds = foreignRects.map { cfg ->
         val sizePx = with(density) { cfg.sizeDp.dp.toPx() }
         val cx = widthPx * cfg.xFrac
         val cy = heightPx * cfg.yFrac
+        val halfH = sizePx * (tight[cfg.id] ?: 1f) / 2f
         UnifiedRect(
             left = cx - sizePx / 2f,
-            top = cy - sizePx / 2f,
+            top = cy - halfH,
             right = cx + sizePx / 2f,
-            bottom = cy + sizePx / 2f,
+            bottom = cy + halfH,
         )
     } + listOfNotNull(
         // #357: the top-center cog carve-out went away with the cog. PAUSE inherits its job as the
@@ -774,25 +956,37 @@ private fun UnifiedTouchLayer(
         }
     )
     val dims = widthPx to heightPx
+    // The D-pad is the layer's too (ARMSX2 #765), so a thumb can glide off it onto a button and onto
+    // it from one. Its square is its hit area, as for the widget. Inside it the directions come from
+    // dpadStateAt, the widget's own math, and obey the glide mode like buttons: Follow tracks the
+    // thumb, Hold first keeps the first direction, Hold all every direction crossed.
+    // radius = half the square's side.
+    val dpadHit = layout.buttons.firstOrNull { it.enabled && it.id.kind == TouchButtonId.Kind.DPAD }?.let { cfg ->
+        val sizePx = with(density) { cfg.sizeDp.dp.toPx() }
+        UnifiedHit(id = cfg.id, cx = widthPx * cfg.xFrac, cy = heightPx * cfg.yFrac, radius = sizePx / 2f)
+    }
 
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .pointerInput(buttonRects, foreignBounds, dims, glideMode) {
+            .pointerInput(buttonRects, foreignBounds, dims, glideMode, dpadHit) {
                 var pressed = emptySet<TouchButtonId>()
-                fun updatePressed(next: Set<TouchButtonId>) {
-                    if (pressed == next) return
-                    pressed = next
-                    onPressedChange(next)
+                var pressedDir = DpadState()
+                fun updatePressed(next: Set<TouchButtonId>, nextDir: DpadState) {
+                    if (pressed == next && pressedDir == nextDir) return
+                    if (pressed != next) {
+                        pressed = next
+                        onPressedChange(next)
+                    }
+                    if (pressedDir != nextDir) {
+                        pressedDir = nextDir
+                        onDpadChange(nextDir)
+                    }
                 }
                 // Full-screen: positions are already in global (layer) coordinates.
                 fun hits(pos: Offset): Set<TouchButtonId> =
                     buttonRects
-                        .filter { hit ->
-                            val dx = pos.x - hit.cx
-                            val dy = pos.y - hit.cy
-                            dx * dx + dy * dy <= hit.radius * hit.radius
-                        }
+                        .filter { hit -> hit.contains(pos.x, pos.y) }
                         .map { it.id }
                         .toSet()
                 fun inForeignRegion(pos: Offset): Boolean =
@@ -800,9 +994,27 @@ private fun UnifiedTouchLayer(
                         pos.x >= it.left && pos.x <= it.right &&
                         pos.y >= it.top && pos.y <= it.bottom
                     }
+                // Presses one glide target: a button sends its keycode, a macro runs through
+                // fireMacro (its own frequency and pressure, under a key of its own so a finger
+                // tapping the same macro directly can't release this one), and P½ sets the
+                // modifier as its widget does, softening buttons already held.
+                fun glidePress(id: TouchButtonId, down: Boolean) {
+                    when (id.kind) {
+                        TouchButtonId.Kind.MACRO ->
+                            TouchControls.fireMacro(id, "glide", down) { code, p -> sendDigital(code, p) }
+                        TouchButtonId.Kind.PRESSURE -> {
+                            TouchControls.pressureModifierHeld.value = down
+                            TouchControls.reapplyPressureToHeldButtons()
+                        }
+                        else -> sendDigital(id.keycode, down)
+                    }
+                }
                 fun releaseAll() {
-                    pressed.forEach { sendDigital(it.keycode, false) }
-                    updatePressed(emptySet())
+                    // P½ last, so letting it go can't re-send a button still down at full pressure.
+                    pressed.filter { it.kind != TouchButtonId.Kind.PRESSURE }.forEach { glidePress(it, false) }
+                    releaseDpad(pressedDir)
+                    pressed.filter { it.kind == TouchButtonId.Kind.PRESSURE }.forEach { glidePress(it, false) }
+                    updatePressed(emptySet(), DpadState())
                 }
                 awaitPointerEventScope {
                     // Per-finger state. All three are tracked whatever the mode, and the mode
@@ -820,14 +1032,51 @@ private fun UnifiedTouchLayer(
                     val current = mutableMapOf<androidx.compose.ui.input.pointer.PointerId, Set<TouchButtonId>>()
                     val first = mutableMapOf<androidx.compose.ui.input.pointer.PointerId, Set<TouchButtonId>>()
                     val foreign = mutableSetOf<androidx.compose.ui.input.pointer.PointerId>()
+                    // P½ is a modifier, not a button (ARMSX2 #765). A finger that reaches it holds it
+                    // until the finger lifts, whatever the glide mode, so it can go on gliding over
+                    // other buttons and press them softly. Until it reaches another button it also
+                    // keeps the buttons it arrived holding, so "hold Square, slide onto P½, lift"
+                    // eases Square off instead of firing it, even in Follow.
+                    val modifier = mutableMapOf<androidx.compose.ui.input.pointer.PointerId, Set<TouchButtonId>>()
+                    val carried = mutableMapOf<androidx.compose.ui.input.pointer.PointerId, Set<TouchButtonId>>()
+                    fun isPressure(b: TouchButtonId) = b.kind == TouchButtonId.Kind.PRESSURE
+                    // D-pad fingers. A thumb that lands on the pad, or slides into it, drives it:
+                    // past the pad's edge it keeps steering from the pad's centre, as the widget
+                    // always did, until it reaches a control, which it then glides onto.
+                    //   dpadOwned  -- fingers driving the D-pad now.
+                    //   dir        -- the directions under this finger now.
+                    //   dirFirst   -- its first direction, when a direction came before any button
+                    //                 (Hold first keeps whichever the thumb touched first).
+                    //   dirLatched -- every direction it has crossed (Hold all).
+                    //   carriedDir -- the directions it held when it reached P½, kept like carried.
+                    val dpadOwned = mutableSetOf<androidx.compose.ui.input.pointer.PointerId>()
+                    val dir = mutableMapOf<androidx.compose.ui.input.pointer.PointerId, DpadState>()
+                    val dirFirst = mutableMapOf<androidx.compose.ui.input.pointer.PointerId, DpadState>()
+                    val dirLatched = mutableMapOf<androidx.compose.ui.input.pointer.PointerId, DpadState>()
+                    val carriedDir = mutableMapOf<androidx.compose.ui.input.pointer.PointerId, DpadState>()
+                    fun dirContribution(id: androidx.compose.ui.input.pointer.PointerId): DpadState {
+                        val d = dir[id] ?: DpadState()
+                        val base = when (glideMode) {
+                            TouchControls.GlideMode.FOLLOW -> d
+                            TouchControls.GlideMode.HOLD_FIRST -> (dirFirst[id] ?: DpadState()) or d
+                            TouchControls.GlideMode.HOLD_ALL -> dirLatched[id] ?: DpadState()
+                        }
+                        if (modifier[id] == null) return base
+                        val onButton = current[id].orEmpty().any { !isPressure(it) }
+                        return if (onButton) base else base or (carriedDir[id] ?: DpadState())
+                    }
                     // What one finger holds down. FOLLOW and HOLD_ALL read exactly what the old
                     // glide=false and glide=true read, so those two are unchanged.
-                    fun contribution(id: androidx.compose.ui.input.pointer.PointerId): Set<TouchButtonId> =
-                        when (glideMode) {
+                    fun contribution(id: androidx.compose.ui.input.pointer.PointerId): Set<TouchButtonId> {
+                        val base = when (glideMode) {
                             TouchControls.GlideMode.FOLLOW -> current[id].orEmpty()
                             TouchControls.GlideMode.HOLD_FIRST -> first[id].orEmpty() + current[id].orEmpty()
                             TouchControls.GlideMode.HOLD_ALL -> latched[id].orEmpty()
                         }
+                        val mod = modifier[id] ?: return base
+                        val onButton = current[id].orEmpty().any { !isPressure(it) }
+                        return base + mod + (if (onButton) emptySet() else carried[id].orEmpty())
+                    }
                     try {
                         while (true) {
                             val ev = awaitPointerEvent()
@@ -850,26 +1099,68 @@ private fun UnifiedTouchLayer(
                                     current.remove(ch.id)
                                     first.remove(ch.id)
                                     foreign.remove(ch.id)
+                                    modifier.remove(ch.id)
+                                    carried.remove(ch.id)
+                                    dpadOwned.remove(ch.id)
+                                    dir.remove(ch.id)
+                                    dirFirst.remove(ch.id)
+                                    dirLatched.remove(ch.id)
+                                    carriedDir.remove(ch.id)
                                     continue
                                 }
                                 if (ch.id in foreign) continue
-                                val h = hits(ch.position)
+                                val pos = ch.position
+                                val pad = dpadHit
+                                val inPad = pad != null &&
+                                    abs(pos.x - pad.cx) <= pad.radius && abs(pos.y - pad.cy) <= pad.radius
+                                if (inPad) dpadOwned.add(ch.id)
+                                // Inside the pad only the pad answers, as when its widget owned it.
+                                val h = if (inPad) emptySet() else hits(pos)
+                                if (!inPad && h.isNotEmpty()) dpadOwned.remove(ch.id)
+                                val d = if (pad != null && ch.id in dpadOwned)
+                                    dpadStateAt(pos.x - pad.cx, pos.y - pad.cy, pad.radius) else DpadState()
+                                val reached = h.filter(::isPressure)
+                                if (reached.isNotEmpty()) {
+                                    if (ch.id !in modifier) {
+                                        carried[ch.id] = contribution(ch.id).filterNot(::isPressure).toSet()
+                                        carriedDir[ch.id] = dirContribution(ch.id)
+                                    }
+                                    modifier[ch.id] = modifier[ch.id].orEmpty() + reached
+                                }
+                                dir[ch.id] = d
+                                dirLatched[ch.id] = (dirLatched[ch.id] ?: DpadState()) or d
                                 current[ch.id] = h
                                 latched.getOrPut(ch.id) { mutableSetOf() }.addAll(h)
-                                if (ch.id !in first && h.isNotEmpty()) first[ch.id] = h
+                                // The first thing this finger touched, button or direction, for Hold first.
+                                if (ch.id !in first && ch.id !in dirFirst) {
+                                    if (h.isNotEmpty()) first[ch.id] = h
+                                    else if (d.any()) dirFirst[ch.id] = d
+                                }
                             }
                             val agg = current.keys.flatMap { contribution(it) }.toSet()
-                            (pressed - agg).forEach { sendDigital(it.keycode, false) }
-                            (agg - pressed).forEach { sendDigital(it.keycode, true) }
+                            val aggDir = current.keys.fold(DpadState()) { acc, f -> acc or dirContribution(f) }
+                            // P½ re-sends every held pressure button at its new strength as it goes
+                            // down or up, so what lets go goes first, then P½, then what presses.
+                            // The other way round, lifting "hold Square, slide onto P½" in Follow let
+                            // P½ go first and put Square back at full pressure for an instant on its
+                            // way up; and a button pressed along with P½ started at full.
+                            val released = pressed - agg
+                            val added = agg - pressed
+                            released.filterNot(::isPressure).forEach { glidePress(it, false) }
+                            applyDpadDiff(pressedDir, pressedDir and aggDir)
+                            (released + added).filter(::isPressure).forEach { glidePress(it, it in added) }
+                            added.filterNot(::isPressure).forEach { glidePress(it, true) }
+                            applyDpadDiff(pressedDir and aggDir, aggDir)
                             // Per-finger consume: only claim changes for fingers WE own
                             // (mapped to >=1 control). Never blanket-consume the whole
                             // event — that would starve co-occurring gestures like the
                             // Pause long-press on a finger we don't own.
                             for (ch in ev.changes) {
                                 if (ch.id in foreign) continue
-                                if (contribution(ch.id).isNotEmpty()) ch.consume()
+                                if (contribution(ch.id).isNotEmpty() || ch.id in dpadOwned || dirContribution(ch.id).any())
+                                    ch.consume()
                             }
-                            updatePressed(agg)
+                            updatePressed(agg, aggDir)
                         }
                     } finally {
                         releaseAll()
@@ -884,7 +1175,17 @@ private data class UnifiedHit(
     val cx: Float,
     val cy: Float,
     val radius: Float,
-)
+    /** Half extents of a box hit, for a tight shoulder button; 0 = the circle of [radius]. */
+    val halfW: Float = 0f,
+    val halfH: Float = 0f,
+) {
+    fun contains(x: Float, y: Float): Boolean {
+        val dx = x - cx
+        val dy = y - cy
+        return if (halfW > 0f) dx >= -halfW && dx <= halfW && dy >= -halfH && dy <= halfH
+        else dx * dx + dy * dy <= radius * radius
+    }
+}
 
 private data class UnifiedRect(
     val left: Float,
@@ -1074,7 +1375,7 @@ private fun Modifier.macroPressGestures(macroId: TouchButtonId) =
  *  and releases them on lift. Opt-in (disabled in the default layout); configure the
  *  button set in Pad settings → Touch Macros. An unconfigured macro is a no-op. */
 @Composable
-private fun MacroWidget(cfg: TouchButtonCfg, edit: Boolean) {
+private fun MacroWidget(cfg: TouchButtonCfg, edit: Boolean, inputEnabled: Boolean = true) {
     if (edit) {
         Box(
             modifier = Modifier.fillMaxSize().editGestures(cfg),
@@ -1091,13 +1392,21 @@ private fun MacroWidget(cfg: TouchButtonCfg, edit: Boolean) {
         // stored, and then silently never drawn. Reported by Duda, who had analog_base working and
         // reasonably assumed the macro name was wrong.
         val skin = skinPainter(skinKeyFor(cfg.id))
+        // Lit while the macro fires, the blue P½ uses, so a press shows (ARMSX2 #765): a macro
+        // gave no sign at all, even though its buttons were going down.
+        val pressed = TouchControls.macroPressed.containsValue(cfg.id)
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 // No dark circle behind custom art — the pack draws its own shape, and the backing
                 // would show as a disc behind a square button.
-                .then(if (skin == null) Modifier.clip(CircleShape).background(Color.Black.copy(alpha = 0.30f * opacity)) else Modifier)
-                .macroPressGestures(cfg.id),
+                .then(
+                    if (skin == null) Modifier.clip(CircleShape).background(
+                        if (pressed) Color(0xFF3A6EA5).copy(alpha = opacity) else Color.Black.copy(alpha = 0.30f * opacity)
+                    ) else Modifier
+                )
+                // Multi-touch on: UnifiedTouchLayer fires the macro, so a finger can glide on and off.
+                .then(if (inputEnabled) Modifier.macroPressGestures(cfg.id) else Modifier),
             contentAlignment = Alignment.Center,
         ) {
             if (skin != null) {
@@ -1107,6 +1416,10 @@ private fun MacroWidget(cfg: TouchButtonCfg, edit: Boolean) {
                     contentScale = ContentScale.Fit,
                     alpha = opacity,
                     modifier = Modifier.fillMaxSize(),
+                )
+                // Custom art keeps its own look, with the same blue laid over it while pressed.
+                if (pressed) Box(
+                    Modifier.fillMaxSize().clip(CircleShape).background(Color(0xFF3A6EA5).copy(alpha = 0.45f * opacity))
                 )
             } else {
                 Text(
@@ -1188,12 +1501,22 @@ private fun StateActionWidget(cfg: TouchButtonCfg, edit: Boolean) {
 /* -------------------------------------------------------------------- */
 
 @Composable
-private fun DpadWidget(cfg: TouchButtonCfg, edit: Boolean) {
+private fun DpadWidget(
+    cfg: TouchButtonCfg,
+    edit: Boolean,
+    inputEnabled: Boolean = true,
+    forced: DpadState? = null,
+) {
     val active = remember(cfg.id) { mutableStateOf(DpadState()) }
+    // What the arms draw: the multi-touch layer's directions when it drives the pad, else ours.
+    val shown = forced ?: active.value
     val opacity = TouchControls.opacity.floatValue
 
     val pressMod: Modifier = if (edit) {
         Modifier.editGestures(cfg)
+    } else if (!inputEnabled) {
+        // Multi-touch on: UnifiedTouchLayer drives the D-pad, so a thumb can glide on and off it.
+        Modifier
     } else {
         Modifier.pointerInput(cfg.id) {
             awaitPointerEventScope {
@@ -1211,33 +1534,7 @@ private fun DpadWidget(cfg: TouchButtonCfg, edit: Boolean) {
                         val pos = change.position
                         val cx = size.width / 2f
                         val cy = size.height / 2f
-                        val dx = pos.x - cx
-                        val dy = pos.y - cy
-                        // Dead-center grows with the key spacing so the empty middle gap
-                        // between the spread-apart arms registers nothing (a small base gap
-                        // is always present to avoid center-jitter at spacing 0).
-                        val deadR = min(cx, cy) * (0.08f + TouchControls.dpadSpacing.floatValue)
-                        val r = hypot(dx, dy)
-                        // 8-way with cardinal-biased sectors: the minor axis
-                        // only fires when its magnitude is at least
-                        // `diagBias` of the major axis. With diagBias=0.55
-                        // that's an angle within ~29° of 45° — a ~58° wedge
-                        // around each diagonal; everything outside snaps to
-                        // the dominant cardinal so a slightly-angled press
-                        // doesn't fire two axes by accident.
-                        val target = if (r < deadR) DpadState() else {
-                            val absDx = abs(dx)
-                            val absDy = abs(dy)
-                            val diagBias = 0.55f
-                            val keepX = absDx >= absDy * diagBias
-                            val keepY = absDy >= absDx * diagBias
-                            DpadState(
-                                up    = keepY && dy < 0f,
-                                down  = keepY && dy > 0f,
-                                left  = keepX && dx < 0f,
-                                right = keepX && dx > 0f,
-                            )
-                        }
+                        val target = dpadStateAt(pos.x - cx, pos.y - cy, min(cx, cy))
                         if (target != active.value) {
                             applyDpadDiff(active.value, target)
                             active.value = target
@@ -1288,7 +1585,7 @@ private fun DpadWidget(cfg: TouchButtonCfg, edit: Boolean) {
         // sprite rotated 180° and sat correctly already.
         Image(
             painter = skUp ?: painterResource(
-                if (active.value.up) R.drawable.pad_dpad_up_pressed else R.drawable.pad_dpad_up
+                if (shown.up) R.drawable.pad_dpad_up_pressed else R.drawable.pad_dpad_up
             ),
             contentDescription = str("touch.dpad.up.description"),
             contentScale = ContentScale.Fit,
@@ -1301,7 +1598,7 @@ private fun DpadWidget(cfg: TouchButtonCfg, edit: Boolean) {
         )
         Image(
             painter = skDown ?: painterResource(
-                if (active.value.down) R.drawable.pad_dpad_up_pressed else R.drawable.pad_dpad_up
+                if (shown.down) R.drawable.pad_dpad_up_pressed else R.drawable.pad_dpad_up
             ),
             contentDescription = str("touch.dpad.down.description"),
             contentScale = ContentScale.Fit,
@@ -1314,7 +1611,7 @@ private fun DpadWidget(cfg: TouchButtonCfg, edit: Boolean) {
         )
         Image(
             painter = skLeft ?: painterResource(
-                if (active.value.left) R.drawable.pad_dpad_left_pressed else R.drawable.pad_dpad_left
+                if (shown.left) R.drawable.pad_dpad_left_pressed else R.drawable.pad_dpad_left
             ),
             contentDescription = str("touch.dpad.left.description"),
             contentScale = ContentScale.Fit,
@@ -1326,7 +1623,7 @@ private fun DpadWidget(cfg: TouchButtonCfg, edit: Boolean) {
         )
         Image(
             painter = skRight ?: painterResource(
-                if (active.value.right) R.drawable.pad_dpad_right_pressed else R.drawable.pad_dpad_right
+                if (shown.right) R.drawable.pad_dpad_right_pressed else R.drawable.pad_dpad_right
             ),
             contentDescription = str("touch.dpad.right.description"),
             contentScale = ContentScale.Fit,
@@ -1347,6 +1644,35 @@ private data class DpadState(
     val right: Boolean = false,
 ) {
     fun any() = up || down || left || right
+    infix fun or(o: DpadState) = DpadState(up || o.up, down || o.down, left || o.left, right || o.right)
+    infix fun and(o: DpadState) = DpadState(up && o.up, down && o.down, left && o.left, right && o.right)
+}
+
+/**
+ * The directions a touch at ([dx], [dy]) from the D-pad's centre presses, for a pad whose half
+ * side is [half]. One copy, for DpadWidget and for the multi-touch layer when it drives the pad.
+ *
+ * Dead-center grows with the key spacing so the empty middle gap between the spread-apart arms
+ * registers nothing (a small base gap is always present to avoid center-jitter at spacing 0).
+ * 8-way with cardinal-biased sectors: the minor axis only fires when its magnitude is at least
+ * `diagBias` of the major axis. With diagBias=0.55 that's an angle within ~29° of 45° — a ~58°
+ * wedge around each diagonal; everything outside snaps to the dominant cardinal so a
+ * slightly-angled press doesn't fire two axes by accident.
+ */
+private fun dpadStateAt(dx: Float, dy: Float, half: Float): DpadState {
+    val deadR = half * (0.08f + TouchControls.dpadSpacing.floatValue)
+    if (hypot(dx, dy) < deadR) return DpadState()
+    val absDx = abs(dx)
+    val absDy = abs(dy)
+    val diagBias = 0.55f
+    val keepX = absDx >= absDy * diagBias
+    val keepY = absDy >= absDx * diagBias
+    return DpadState(
+        up    = keepY && dy < 0f,
+        down  = keepY && dy > 0f,
+        left  = keepX && dx < 0f,
+        right = keepX && dx > 0f,
+    )
 }
 
 private fun applyDpadDiff(prev: DpadState, next: DpadState) {
@@ -1687,17 +2013,23 @@ private fun computeStickEmit(nx: Float, ny: Float, left: Boolean): StickEmit {
 }
 
 private fun applyStickDiff(codes: StickCodes, prev: StickEmit, next: StickEmit) {
-    if (prev.xPos != next.xPos) NativeApp.setPadButton(codes.xPos, next.xPos, next.xPos > 0)
-    if (prev.xNeg != next.xNeg) NativeApp.setPadButton(codes.xNeg, next.xNeg, next.xNeg > 0)
-    if (prev.yPos != next.yPos) NativeApp.setPadButton(codes.yPos, next.yPos, next.yPos > 0)
-    if (prev.yNeg != next.yNeg) NativeApp.setPadButton(codes.yNeg, next.yNeg, next.yNeg > 0)
+    if (prev.xPos != next.xPos) sendStickAxis(codes.xPos, next.xPos)
+    if (prev.xNeg != next.xNeg) sendStickAxis(codes.xNeg, next.xNeg)
+    if (prev.yPos != next.yPos) sendStickAxis(codes.yPos, next.yPos)
+    if (prev.yNeg != next.yNeg) sendStickAxis(codes.yNeg, next.yNeg)
 }
 
 private fun releaseStick(codes: StickCodes, last: StickEmit) {
-    if (last.xPos != 0) NativeApp.setPadButton(codes.xPos, 0, false)
-    if (last.xNeg != 0) NativeApp.setPadButton(codes.xNeg, 0, false)
-    if (last.yPos != 0) NativeApp.setPadButton(codes.yPos, 0, false)
-    if (last.yNeg != 0) NativeApp.setPadButton(codes.yNeg, 0, false)
+    if (last.xPos != 0) sendStickAxis(codes.xPos, 0)
+    if (last.xNeg != 0) sendStickAxis(codes.xNeg, 0)
+    if (last.yPos != 0) sendStickAxis(codes.yPos, 0)
+    if (last.yNeg != 0) sendStickAxis(codes.yNeg, 0)
+}
+
+/** One stick half-axis (0..32767) to this device's game, or to player 2 during remote play. */
+private fun sendStickAxis(code: Int, value: Int) {
+    val sink = remotePlayPadSink
+    if (sink != null) sink(code, value, value > 0) else NativeApp.setPadButton(code, value, value > 0)
 }
 
 /* -------------------------------------------------------------------- */
@@ -1727,11 +2059,7 @@ private data class HalfStickParams(
 ) {
     fun inForeign(pos: Offset): Boolean =
         foreignRects.any { pos.x >= it.left && pos.x <= it.right && pos.y >= it.top && pos.y <= it.bottom } ||
-            foreignCircles.any {
-                val dx = pos.x - it.cx
-                val dy = pos.y - it.cy
-                dx * dx + dy * dy <= it.radius * it.radius
-            }
+            foreignCircles.any { it.contains(pos.x, pos.y) }
 }
 
 /** Invisible full-screen layer: the LEFT half drives the left analog, the RIGHT half the right one.
@@ -1743,6 +2071,7 @@ private data class HalfStickParams(
 private fun FullHalfStickLayer(layout: TouchLayout, widthPx: Float, heightPx: Float, faceMulti: Boolean) {
     if (widthPx <= 0f || heightPx <= 0f) return
     val density = LocalDensity.current
+    val tight = tightShoulderFactors()
     // Foreign regions: every enabled non-stick widget (D-pad, face, shoulders, menu, L3/R3, Pause,
     // FF, macro, state, pressure). A finger starting on one of these drives the button, not a stick.
     val foreignRects = layout.buttons
@@ -1751,14 +2080,15 @@ private fun FullHalfStickLayer(layout: TouchLayout, widthPx: Float, heightPx: Fl
             val sizePx = with(density) { cfg.sizeDp.dp.toPx() }
             val cx = widthPx * cfg.xFrac
             val cy = heightPx * cfg.yFrac
-            UnifiedRect(cx - sizePx / 2f, cy - sizePx / 2f, cx + sizePx / 2f, cy + sizePx / 2f)
+            val halfH = sizePx * (tight[cfg.id] ?: 1f) / 2f
+            UnifiedRect(cx - sizePx / 2f, cy - halfH, cx + sizePx / 2f, cy + halfH)
         }
     // With multi-touch on, a face/shoulder/menu button answers anywhere in its hit circle
     // (UnifiedTouchLayer), and the circle reaches past the square. Leave those to the button too,
     // or a thumb on the rim of Cross would move the right stick instead.
     val radius = TouchControls.multiTouchRadius.floatValue
     val foreignCircles = if (!faceMulti) emptyList() else layout.buttons
-        .filter { it.enabled && isMultiTouchKind(it.id.kind) && !it.tapToHold }
+        .filter { it.enabled && isUnifiedKind(it.id.kind) && !it.tapToHold && it.id !in tight }
         .map { cfg ->
             val sizePx = with(density) { cfg.sizeDp.dp.toPx() }
             UnifiedHit(id = cfg.id, cx = widthPx * cfg.xFrac, cy = heightPx * cfg.yFrac, radius = sizePx * radius)
@@ -1863,6 +2193,13 @@ private class HalfStickInputNode(private var params: HalfStickParams) : Modifier
 /* -------------------------------------------------------------------- */
 
 private fun sendDigital(keycode: Int, pressed: Boolean) {
+    remotePlayPadSink?.let { sink ->
+        // Remote play: a full press to player 2 (the stream carries no pressure), and none of the
+        // local pressure bookkeeping, which belongs to a game on this device.
+        sink(keycode, if (pressed) 255 else 0, pressed)
+        if (pressed && TouchControls.touchHaptics.value) NativeApp.touchHaptic()
+        return
+    }
     // Pressure modifier: send a soft (~50%) range for pressure-capable buttons
     // while the modifier is held; 0 (full press) otherwise. native-lib.cpp's
     // setPadButton turns the range into a 0..1 pressure value.
@@ -1886,6 +2223,16 @@ private fun isMultiTouchKind(kind: TouchButtonId.Kind): Boolean =
     kind == TouchButtonId.Kind.FACE ||
     kind == TouchButtonId.Kind.SHOULDER ||
     kind == TouchButtonId.Kind.MENU
+
+/** Macros and P½ (ARMSX2 #765). With multi-touch on they are the layer's as well, so a finger can
+ *  start on one and glide off it, not only glide onto it: their widgets go render-only like the
+ *  buttons'. */
+private fun isGlideTargetKind(kind: TouchButtonId.Kind): Boolean =
+    kind == TouchButtonId.Kind.MACRO || kind == TouchButtonId.Kind.PRESSURE
+
+/** Everything [UnifiedTouchLayer] owns while multi-touch is on. */
+private fun isUnifiedKind(kind: TouchButtonId.Kind): Boolean =
+    isMultiTouchKind(kind) || isGlideTargetKind(kind)
 
 /** Press/release pointerInput for a single digital button. Emits the
  *  keycode on down, releases on up or pointer cancel.

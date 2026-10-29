@@ -5,6 +5,8 @@
 #include <cstring>
 #include "Crypto/unpkg.h"
 #include "Crypto/unself.h"
+#include "Crypto/aes.h"
+#include "Crypto/sha1.h"
 #include "Emu/Audio/Cubeb/CubebBackend.h"
 #include "Emu/Cell/Modules/cellAudio.h"
 #include "Emu/RSX/VK/VKFrameGen.h"
@@ -14,6 +16,13 @@
 #include "Emu/Cell/SPURecompiler.h"
 #include "Emu/Cell/SPUThread.h"
 #include "Emu/IdManager.h"
+#include "util/video_provider.h"
+#include "Emu/android_app_state.h"
+#include "Emu/Audio/Oboe/OboeCapture.h"
+#include "Emu/Cell/lv2/sys_usbd.h"
+#include "Emu/Io/Skylander.h"
+#include "Emu/Io/Infinity.h"
+#include "Emu/Io/Dimensions.h"
 #include "Emu/Io/KeyboardHandler.h"
 #include "Emu/Io/Null/NullKeyboardHandler.h"
 #include "Emu/Io/Null/NullMouseHandler.h"
@@ -28,6 +37,7 @@
 #include "Emu/RSX/Overlays/overlay_trophy_notification.h"
 #include "Emu/RSX/Overlays/overlay_utils.h"
 #include "Emu/RSX/RSXThread.h"
+#include "Emu/RSX/rsx_frame_dump.h"
 #include "Emu/RSX/GL/GLGSRender.h"
 #include "Emu/RSX/VK/VKGSRender.h"
 #include "Emu/savestate_utils.hpp"
@@ -36,8 +46,12 @@
 #include "Emu/localized_string_id.h"
 #include "Emu/emu_callbacks.h"
 #include "Emu/system_config.h"
+#include "Emu/NP/np_avatar.h"
+#include "Emu/NP/np_handler.h"
 #include "Emu/NP/rpcn_client.h"
 #include "Emu/NP/rpcn_config.h"
+#include <wolfssl/wolfcrypt/pwdbased.h>
+#include <wolfssl/wolfcrypt/sha3.h>
 #include "Emu/system_config_types.h"
 #include "Emu/system_progress.hpp"
 #include "Emu/system_utils.hpp"
@@ -100,6 +114,7 @@
 #include <sys/resource.h>
 #include <thread>
 #include <vector>
+#include <random>
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wreturn-type-c-linkage"
@@ -250,6 +265,13 @@ static void pgo_flush()
 // actively debugging on a device.
 static std::atomic<int> g_logcat_min_level{static_cast<int>(logs::level::warning)};
 
+// The reason the first game thread to die of a fatal error gave, until the app takes it
+// (_rpcsx_takeGameError). The game stops where it was when one does, and on screen that is a freeze
+// with nothing said: one tester's "stuck at SPU compile" was a network thread killed for wanting
+// RPCN, which only the log showed.
+static std::mutex s_game_error_mutex;
+static std::string s_game_error;
+
 struct LogListener : logs::listener {
   LogListener() { logs::listener::add(this); }
 
@@ -281,6 +303,14 @@ struct LogListener : logs::listener {
     case logs::level::trace:
       prio = ANDROID_LOG_VERBOSE;
       break;
+    }
+
+    if (static_cast<logs::level>(msg) == logs::level::fatal) {
+      constexpr std::string_view died = "Thread terminated due to fatal error: ";
+      if (text.starts_with(died)) {
+        std::lock_guard lock(s_game_error_mutex);
+        if (s_game_error.empty()) s_game_error.assign(text.substr(died.size()));
+      }
     }
 
     // Mirroring EVERY message to logcat is not free: each one is a heap allocation plus a
@@ -433,18 +463,27 @@ struct GraphicsFrame : GSFrameBase {
     // rest of the session. The symptom was a black game area at 0% CPU with the log stopping dead
     // just after Vulkan device creation and nothing at all to say why. Say so instead.
     u32 waited_ms = 0;
+    u32 next_report_ms = 3000;
 
     while ((result = g_native_window.load()) == nullptr) [[unlikely]] {
       if (Emu.IsStopped()) {
         return activeNativeWindow;
       }
 
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
-      waited_ms += 100;
+      // Out of sight the surface is gone on purpose and comes back with the app, so wait in
+      // longer steps and say nothing: this line every 3 s kept the log writer busy for as long
+      // as the device stayed locked (#196).
+      const u32 step_ms = g_android_app_backgrounded ? 250 : 100;
+      std::this_thread::sleep_for(std::chrono::milliseconds(step_ms));
+      waited_ms += step_ms;
 
-      if (waited_ms % 3000 == 0) {
-        rpcsx_android.error("Still waiting for a Surface after %u ms -- the renderer cannot start "
-                            "until surfaceChanged reaches native.", waited_ms);
+      if (waited_ms >= next_report_ms) {
+        next_report_ms = waited_ms + 3000;
+
+        if (!g_android_app_backgrounded) {
+          rpcsx_android.error("Still waiting for a Surface after %u ms -- the renderer cannot start "
+                              "until surfaceChanged reaches native.", waited_ms);
+        }
       }
     }
 
@@ -624,12 +663,19 @@ public:
 
   u64 display_epoch() const override { return g_native_window_epoch.load(); }
 
-  bool can_consume_frame() const override { return false; }
+  // The recording hook, as the Qt gs_frame forwards it. Its only user here is remote play
+  // (remote_play.cpp); with nothing recording, can_consume_frame stays false.
+  bool can_consume_frame() const override {
+    return g_fxo->get<utils::video_provider>().can_consume_frame();
+  }
 
   // Upstream takes the buffer by rvalue ref (it moves it); RPCSX's lvalue-ref
   // signature no longer overrides, which left GraphicsFrame abstract.
   void present_frame(std::vector<u8> &&data, u32 pitch, u32 width, u32 height,
-                     bool is_bgra) const override {}
+                     bool is_bgra) const override {
+    g_fxo->get<utils::video_provider>().present_frame(std::move(data), pitch, width,
+                                                      height, is_bgra);
+  }
   // Save slot thumbnails. RPCS3 already renders and hands over the finished frame here
   // whenever a screenshot is requested; this used to drop it, which is why the slot picker
   // had nothing to show. Kept as the most recent frame rather than written straight out:
@@ -767,6 +813,7 @@ static std::pair<std::string, std::u32string> g_strings[] = {
                 "You have earned a platinum trophy.\n%0"),
     MAKE_STRING(RSX_OVERLAYS_COMPILING_SHADERS, "Compiling shaders"),
     MAKE_STRING(RSX_OVERLAYS_COMPILING_PPU_MODULES, "Compiling PPU Modules"),
+    MAKE_STRING(RSX_OVERLAYS_COMPILING_SPU_CODE, "Compiling SPU Code"),
     MAKE_STRING(RSX_OVERLAYS_MSG_DIALOG_YES, "Yes"),
     MAKE_STRING(RSX_OVERLAYS_MSG_DIALOG_NO, "No"),
     MAKE_STRING(RSX_OVERLAYS_MSG_DIALOG_CANCEL, "Back"),
@@ -1094,6 +1141,8 @@ static std::pair<std::string, std::u32string> g_strings[] = {
                 "Handle RSX Memory Tiling"),
     MAKE_STRING(HOME_MENU_SETTINGS_ADVANCED_MAX_SPURS_THREADS,
                 "Max SPURS Threads"),
+    MAKE_STRING(HOME_MENU_SETTINGS_ADVANCED_PPU_EVENT_WAKE_UP_DELAY,
+                "PPU Event Wake-Up Delay"),
     MAKE_STRING(HOME_MENU_SETTINGS_ADVANCED_DRIVER_WAKE_UP_DELAY,
                 "Driver Wake-Up Delay"),
     MAKE_STRING(HOME_MENU_SETTINGS_ADVANCED_VBLANK_FREQUENCY,
@@ -1108,6 +1157,8 @@ static std::pair<std::string, std::u32string> g_strings[] = {
                 "Show Shader Compilation Hint"),
     MAKE_STRING(HOME_MENU_SETTINGS_OVERLAYS_SHOW_PPU_COMPILATION_HINT,
                 "Show PPU Compilation Hint"),
+    MAKE_STRING(HOME_MENU_SETTINGS_OVERLAYS_SHOW_SPU_COMPILATION_HINT,
+                "Show SPU Compilation Hint"),
     MAKE_STRING(HOME_MENU_SETTINGS_OVERLAYS_SHOW_AUTO_SAVE_LOAD_HINT,
                 "Show Autosave/Autoload Hint"),
     MAKE_STRING(HOME_MENU_SETTINGS_OVERLAYS_SHOW_PRESSURE_INTENSITY_TOGGLE_HINT,
@@ -2353,6 +2404,9 @@ static std::atomic<bool> g_disc_eject_enabled{false};
 static std::atomic<bool> g_disc_insert_enabled{false};
 
 
+// Remote play (remote_play.cpp): keeps a stream on a game that restarts itself.
+void remote_play_on_run();
+
 static void setupCallbacks() {
   g_emu_callbacks = emu_callbacks{
       .call_from_main_thread =
@@ -2368,7 +2422,7 @@ static void setupCallbacks() {
 
             g_mainThreadDispatcher.post(std::move(cb));
           },
-      .on_run = [](auto...) {},
+      .on_run = [](auto...) { remote_play_on_run(); },
       .on_pause = [](auto...) {},
       .on_resume = [](auto...) {},
       .on_stop = [](auto...) {},
@@ -3109,6 +3163,57 @@ extern "C" const char *_rpcsx_rpcnGetConfig() {
 
 // Save whatever is non-empty. Empty means "leave alone", so the UI can save a host without
 // resending a password it never displayed.
+// RPCN is never given the password a player types. RPCS3 derives one from it (derive_password in
+// rpcn_settings_dialog.cpp: PBKDF2 with SHA3-256 over this salt, as 64 hex digits), makes its
+// accounts with that and signs in with that, so an account made in RPCS3 only signs in here the
+// same way. ARMSX3 used to send the password as typed, and players got in by pasting the derived
+// string out of RPCS3's rpcn.yml instead.
+static std::string derive_rpcn_password(std::string_view typed) {
+  static constexpr std::string_view salt = "No matter where you go, everybody's connected.";
+
+  u8 digest[WC_SHA3_256_DIGEST_SIZE];
+
+  if (wc_PBKDF2(digest, reinterpret_cast<const u8 *>(typed.data()), ::narrow<s32>(typed.size()),
+                reinterpret_cast<const u8 *>(salt.data()), ::narrow<s32>(salt.size()), 200'000,
+                WC_SHA3_256_DIGEST_SIZE, WC_SHA3_256) != 0) {
+    return {};
+  }
+
+  constexpr auto hex = "0123456789ABCDEF";
+  std::string derived(WC_SHA3_256_DIGEST_SIZE * 2, '0');
+
+  for (usz i = 0; i < WC_SHA3_256_DIGEST_SIZE; i++) {
+    derived[i * 2] = hex[digest[i] >> 4];
+    derived[i * 2 + 1] = hex[digest[i] & 15];
+  }
+
+  return derived;
+}
+
+// Already derived: what RPCS3 keeps in rpcn.yml, pasted in by players who found that worked.
+static bool is_derived_rpcn_password(std::string_view text) {
+  return text.size() == WC_SHA3_256_DIGEST_SIZE * 2 &&
+         std::all_of(text.begin(), text.end(),
+                     [](char c) { return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'); });
+}
+
+// The forms of a typed password to offer RPCN, in order: derived, as RPCS3 does, then as typed,
+// which is what an account made with an older ARMSX3 was made with.
+static std::vector<std::string> rpcn_password_forms(std::string_view typed) {
+  if (is_derived_rpcn_password(typed)) {
+    return {std::string(typed)};
+  }
+
+  std::vector<std::string> forms;
+
+  if (std::string derived = derive_rpcn_password(typed); !derived.empty()) {
+    forms.push_back(std::move(derived));
+  }
+
+  forms.emplace_back(typed);
+  return forms;
+}
+
 extern "C" void _rpcsx_rpcnSetConfig(std::string_view host, std::string_view npid,
                                      std::string_view password, std::string_view token) {
   g_cfg_rpcn.load();
@@ -3158,7 +3263,7 @@ static std::string rpcn_describe(rpcn::ErrorType error) {
   case rpcn::ErrorType::LoginInvalidUsername: return "Unknown username.";
   case rpcn::ErrorType::LoginInvalidPassword: return "Wrong password.";
   case rpcn::ErrorType::LoginInvalidToken:
-    return "That token is not valid. Check the email, or send a new token.";
+    return "That activation code is missing or wrong. Enter the code from the email, or send a new one.";
   case rpcn::ErrorType::LoginAlreadyLoggedIn:
     return "That account is already logged in somewhere else.";
   case rpcn::ErrorType::LoginError: return "The server refused the login.";
@@ -3171,7 +3276,7 @@ static std::string rpcn_describe(rpcn::ErrorType error) {
     return "The request was incomplete -- a required field was empty. This is a bug; please "
            "report which button you pressed.";
   case rpcn::ErrorType::Invalid:
-    return "The server rejected that request as out of order. Try Test sign-in first.";
+    return "The server rejected that request as out of order. Sign in first, then try again.";
   default: return fmt::format("Unexpected server error %d.", static_cast<int>(error));
   }
 }
@@ -3208,6 +3313,388 @@ extern "C" const char *_rpcsx_rpcnStatus() {
       json_escape(online_name));
 
   return result.c_str();
+}
+
+// Whether an RPCN session is signed in right now, polled while a game runs so the app can keep
+// that session reachable in the background (OnlineSession). Unlike _rpcsx_rpcnStatus it does not
+// reload rpcn.yml, which logs a line each time, and like it never creates a client.
+extern "C" bool _rpcsx_rpcnSignedIn() {
+  const auto rpcn = rpcn::rpcn_client::peek_instance();
+  return rpcn && rpcn->is_authentified();
+}
+
+// The phone's microphones, for the one picked in Audio settings: one "<Android device id>\t<name>" per
+// line, where the name is what the settings store. Android lists input devices to Java only, and a
+// device gets a new id each time it is plugged in, so the app sends the list again before a game
+// starts (oboe_capture).
+extern "C" void _rpcsx_setMicDevices(std::string_view list) {
+  std::vector<std::pair<std::string, s32>> devices;
+
+  for (const std::string &line : fmt::split(list, {"\n"})) {
+    const usz tab = line.find('\t');
+    s32 id = 0;
+
+    if (tab == std::string::npos ||
+        std::from_chars(line.data(), line.data() + tab, id).ec != std::errc{}) {
+      continue;
+    }
+
+    devices.emplace_back(line.substr(tab + 1), id);
+  }
+
+  oboe_capture::set_devices(std::move(devices));
+}
+
+// The microphone test in Audio settings: the capture a game gets (oboe_capture, at the rate and channel
+// count cellMic asks for most), reduced to how loud it is
+static std::mutex s_mic_test_mutex;
+static std::unique_ptr<oboe_capture> s_mic_test;
+static float s_mic_test_level = 0.0f;
+
+extern "C" bool _rpcsx_micTestStart(std::string_view device) {
+  std::lock_guard lock(s_mic_test_mutex);
+
+  s_mic_test = std::make_unique<oboe_capture>();
+  s_mic_test_level = 0.0f;
+
+  if (!s_mic_test->open(std::string(device), 48000, 1) || !s_mic_test->start()) {
+    s_mic_test.reset();
+    return false;
+  }
+
+  return true;
+}
+
+// How loud what arrived since the last call was, 0 to 1 over -60 to 0 dBFS; -1 with no test running
+extern "C" float _rpcsx_micTestLevel() {
+  std::lock_guard lock(s_mic_test_mutex);
+
+  if (!s_mic_test) {
+    return -1.0f;
+  }
+
+  std::array<s16, 2400> buf;
+  u64 count = 0;
+  f64 sum = 0;
+
+  while (true) {
+    const u32 read = s_mic_test->read(buf.data(), ::size32(buf));
+
+    for (u32 i = 0; i < read; i++) {
+      sum += static_cast<f64>(buf[i]) * buf[i];
+    }
+
+    count += read;
+
+    if (read < buf.size()) {
+      break;
+    }
+  }
+
+  // Nothing new since the last call: keep the last reading rather than flicker to silence
+  if (count) {
+    const f64 rms = std::sqrt(sum / count) / 32768.0;
+    s_mic_test_level = static_cast<float>(std::clamp((20.0 * std::log10(std::max(rms, 1e-6)) + 60.0) / 60.0, 0.0, 1.0));
+  }
+
+  return s_mic_test_level;
+}
+
+extern "C" void _rpcsx_micTestStop() {
+  std::lock_guard lock(s_mic_test_mutex);
+  s_mic_test.reset();
+}
+
+// ---- Skylanders portal and USB passthrough ------------------------------------------------------
+//
+// The emulated portal is always attached (sys_usbd adds it unless a real one is passed through), and
+// these put figure files on it and take them off, as RPCS3's Skylanders manager does: the game sees a
+// figure placed or lifted. The portal keeps the file open and writes the game's changes to the figure
+// (experience, gold, upgrades) back into it, as a real toy keeps them.
+
+static std::mutex s_sky_mutex;
+// Which of the portal's 8 places hold a figure. load_skylander ensure()s a free one, which RPCS3's own
+// manager guarantees with its 8 slots; here a ninth figure is refused instead of aborting the emulator.
+static std::array<bool, 8> s_sky_used{};
+
+// The place the figure took, -1 when the file is not a figure (1024 bytes), -2 when all 8 are taken
+extern "C" s32 _rpcsx_skylanderLoad(std::string_view path) {
+  std::lock_guard lock(s_sky_mutex);
+
+  if (std::all_of(s_sky_used.begin(), s_sky_used.end(), [](bool used) { return used; })) {
+    return -2;
+  }
+
+  fs::file file(std::string(path), fs::read + fs::write + fs::lock);
+  std::array<u8, 0x40 * 0x10> data{};
+
+  if (!file || file.size() < data.size() || file.read(data.data(), data.size()) != data.size()) {
+    return -1;
+  }
+
+  const u8 slot = g_skyportal.load_skylander(data, std::move(file));
+  s_sky_used[slot] = true;
+  return slot;
+}
+
+// The colour the game lit the portal, 0xRRGGBB; 0 until it sets one. Skylanders games light it for
+// the element of the character in play, which the Portal panel's drawing shows.
+extern "C" s32 _rpcsx_skylanderLight() {
+  const auto [r, g, b] = g_skyportal.get_leds();
+  return (s32{r} << 16) | (s32{g} << 8) | s32{b};
+}
+
+extern "C" bool _rpcsx_skylanderRemove(s32 slot) {
+  std::lock_guard lock(s_sky_mutex);
+
+  if (slot < 0 || slot >= static_cast<s32>(s_sky_used.size()) ||
+      !g_skyportal.remove_skylander(static_cast<u8>(slot))) {
+    return false;
+  }
+
+  s_sky_used[slot] = false;
+  return true;
+}
+
+// Disney Infinity base and Lego Dimensions toy pad: the same, at a position the player picks. Positions
+// are RPCS3's dialogs' own. Infinity 0 to 8: play set or power disc, power discs two and three, then
+// each player and their two abilities; 320-byte figures. Dimensions 0 to 6, the pad following from the
+// index as in its dialog (1 the centre pad, 0, 3 and 4 the left, 2, 5 and 6 the right); 180-byte
+// figures. A taken position is cleared first, as those dialogs do. False when the file is not a figure.
+static std::array<bool, 9> s_infinity_used{};
+static std::array<bool, 7> s_dimensions_used{};
+
+static u8 dimensions_pad(s32 index) {
+  return index == 1 ? 1 : (index == 0 || index == 3 || index == 4) ? 2 : 3;
+}
+
+template <usz Size>
+static bool read_figure(std::string_view path, fs::file &file, std::array<u8, Size> &data) {
+  file = fs::file(std::string(path), fs::read + fs::write + fs::lock);
+  return file && file.read(data.data(), data.size()) == data.size();
+}
+
+extern "C" bool _rpcsx_infinityLoad(std::string_view path, s32 position) {
+  std::lock_guard lock(s_sky_mutex);
+
+  fs::file file;
+  std::array<u8, 0x14 * 0x10> data{};
+
+  if (position < 0 || position >= static_cast<s32>(s_infinity_used.size()) || !read_figure(path, file, data)) {
+    return false;
+  }
+
+  if (s_infinity_used[position]) {
+    g_infinitybase.remove_figure(static_cast<u8>(position));
+  }
+
+  g_infinitybase.load_figure(data, std::move(file), static_cast<u8>(position));
+  s_infinity_used[position] = true;
+  return true;
+}
+
+extern "C" bool _rpcsx_infinityRemove(s32 position) {
+  std::lock_guard lock(s_sky_mutex);
+
+  if (position < 0 || position >= static_cast<s32>(s_infinity_used.size()) || !s_infinity_used[position]) {
+    return false;
+  }
+
+  g_infinitybase.remove_figure(static_cast<u8>(position));
+  s_infinity_used[position] = false;
+  return true;
+}
+
+extern "C" bool _rpcsx_dimensionsLoad(std::string_view path, s32 index) {
+  std::lock_guard lock(s_sky_mutex);
+
+  fs::file file;
+  std::array<u8, 0x2D * 0x04> data{};
+
+  if (index < 0 || index >= static_cast<s32>(s_dimensions_used.size()) || !read_figure(path, file, data)) {
+    return false;
+  }
+
+  if (s_dimensions_used[index]) {
+    g_dimensionstoypad.remove_figure(dimensions_pad(index), static_cast<u8>(index), true, true);
+  }
+
+  g_dimensionstoypad.load_figure(data, std::move(file), dimensions_pad(index), static_cast<u8>(index), true);
+  s_dimensions_used[index] = true;
+  return true;
+}
+
+extern "C" bool _rpcsx_dimensionsRemove(s32 index) {
+  std::lock_guard lock(s_sky_mutex);
+
+  if (index < 0 || index >= static_cast<s32>(s_dimensions_used.size()) || !s_dimensions_used[index]) {
+    return false;
+  }
+
+  g_dimensionstoypad.remove_figure(dimensions_pad(index), static_cast<u8>(index), true, true);
+  s_dimensions_used[index] = false;
+  return true;
+}
+
+// ---- New figures, made as RPCS3's portal managers make them (rpcs3qt/*_dialog.cpp) ------------
+//
+// For players without dumps of their own toys: a blank figure of any character the game knows,
+// which the game sets up the first time it is placed. Each writes a new file and never replaces one.
+static bool write_new_figure(std::string_view path, const u8* data, usz size) {
+  fs::file file(std::string(path), fs::write + fs::create + fs::excl);
+  return file && file.write(data, size) == size;
+}
+
+// skylander_creator_dialog: block permissions, a serial made from the id and variant, then the id,
+// the variant and a CRC-16/CCITT of the first 0x1E bytes (skylander_crc16)
+extern "C" bool _rpcsx_skylanderCreate(std::string_view path, s32 id, s32 variant) {
+  std::array<u8, 0x40 * 0x10> buf{};
+  write_to_ptr<le_t<u32>>(buf, 0x36, 0x690F0F0F);
+  for (u32 index = 1; index < 0x10; index++) {
+    write_to_ptr<le_t<u32>>(buf, (index * 0x40) + 0x36, 0x69080F7F);
+  }
+  write_to_ptr<le_t<u16>>(buf, static_cast<u16>((id | variant) + 1));
+  write_to_ptr<le_t<u16>>(buf, 0x10, static_cast<u16>(id));
+  write_to_ptr<le_t<u16>>(buf, 0x1C, static_cast<u16>(variant));
+
+  u16 crc = 0xFFFF;
+  for (u32 i = 0; i < 0x1E; i++) {
+    crc ^= static_cast<u16>(buf[i] << 8);
+    for (int bit = 0; bit < 8; bit++) {
+      crc = (crc & 0x8000) ? static_cast<u16>((crc << 1) ^ 0x1021) : static_cast<u16>(crc << 1);
+    }
+  }
+  write_to_ptr<le_t<u16>>(buf, 0x1E, crc);
+
+  return write_new_figure(path, buf.data(), buf.size());
+}
+
+// figure_creator_dialog::create_blank_figure: a random tag id, then the figure number, series and the
+// series' release date with a CRC-32 (infinity_crc32), encrypted with a key made from the tag id
+extern "C" bool _rpcsx_infinityCreate(std::string_view path, s32 figure, s32 series) {
+  static constexpr std::array<u8, 32> sha1_constant = {
+      0xAF, 0x62, 0xD2, 0xEC, 0x04, 0x91, 0x96, 0x8C, 0xC5, 0x2A, 0x1A, 0x71, 0x65, 0xF8, 0x65, 0xFE,
+      0x28, 0x63, 0x29, 0x20, 0x44, 0x69, 0x73, 0x6e, 0x65, 0x79, 0x20, 0x32, 0x30, 0x31, 0x33};
+
+  // Standard NFC read/write permissions
+  std::array<u8, 0x14 * 0x10> file_data{};
+  constexpr u32 first_block = 0x17878E;
+  constexpr u32 other_blocks = 0x778788;
+  for (u8 i = 0; i < 3; i++) {
+    file_data[0x36 + i] = u8((first_block >> (2 - i) * 8) & 0xFF);
+  }
+  for (u32 index = 1; index < 5; index++) {
+    for (u8 i = 0; i < 3; i++) {
+      file_data[((index * 0x40) + 0x36) + i] = u8((other_blocks >> (2 - i) * 8) & 0xFF);
+    }
+  }
+
+  std::vector<u8> sha1_calc = {sha1_constant.begin(), sha1_constant.end() - 1};
+  std::array<u8, 16> uid_data = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x89, 0x44, 0x00, 0xC2};
+  std::mt19937 rng(std::random_device{}());
+  std::uniform_int_distribution<int> random_byte(0, 254); // rand() % 255 there
+  for (u8 i = 0; i < 7; i++) {
+    const u8 random = static_cast<u8>(random_byte(rng));
+    sha1_calc.push_back(random);
+    uid_data[i] = random;
+  }
+
+  std::array<u8, 16> figure_data = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                    0x00, static_cast<u8>(series), 0xD1, 0x1F};
+  figure_data[1] = u8((figure >> 16) & 0xFF);
+  figure_data[2] = u8((figure >> 8) & 0xFF);
+  figure_data[3] = u8(figure & 0xFF);
+
+  // Manufacture date, YY/MM/DD: the series' release
+  if (series == 1) {
+    figure_data[4] = 0x0D, figure_data[5] = 0x08, figure_data[6] = 0x12;
+  } else if (series == 2) {
+    figure_data[4] = 0x0E, figure_data[5] = 0x09, figure_data[6] = 0x12;
+  } else if (series == 3) {
+    figure_data[4] = 0x0F, figure_data[5] = 0x08, figure_data[6] = 0x1C;
+  }
+
+  u32 crc = 0;
+  for (u32 i = 0; i < 12; i++) {
+    crc ^= figure_data[i];
+    for (int bit = 0; bit < 8; bit++) {
+      crc = (crc & 1) ? (crc >> 1) ^ 0xEDB88320u : crc >> 1;
+    }
+  }
+  for (s8 i = 0; i < 4; i++) {
+    figure_data[12 + i] = u8((crc >> (3 - i) * 8) & 0xFF);
+  }
+
+  if (figure_data[1] == 0) {
+    return false;
+  }
+
+  sha1_context ctx;
+  u8 output[20];
+  sha1_starts(&ctx);
+  sha1_update(&ctx, sha1_calc.data(), sha1_calc.size());
+  sha1_finish(&ctx, output);
+
+  u8 key[0x10];
+  for (int i = 0; i < 4; i++) {
+    for (int x = 0; x < 4; x++) {
+      key[x + (i * 4)] = output[(3 - x) + (i * 4)];
+    }
+  }
+
+  aes_context aes;
+  aes_setkey_enc(&aes, key, 128);
+  const std::array<u8, 16> blank_block{};
+  std::array<u8, 16> encrypted_block{};
+  std::array<u8, 16> encrypted_blank{};
+  aes_crypt_ecb(&aes, AES_ENCRYPT, figure_data.data(), encrypted_block.data());
+  aes_crypt_ecb(&aes, AES_ENCRYPT, blank_block.data(), encrypted_blank.data());
+
+  std::memcpy(&file_data[0], uid_data.data(), uid_data.size());
+  std::memcpy(&file_data[16], encrypted_block.data(), encrypted_block.size());
+  for (const u32 block : {0x04u, 0x08u, 0x0Cu, 0x0Du}) {
+    std::memcpy(&file_data[16 * block], encrypted_blank.data(), encrypted_blank.size());
+  }
+
+  return write_new_figure(path, file_data.data(), file_data.size());
+}
+
+// minifig_creation_dialog: the core's own blank tag for the character
+extern "C" bool _rpcsx_dimensionsCreate(std::string_view path, s32 id) {
+  std::array<u8, 0x2D * 0x04> file_data{};
+  dimensions_toypad::create_blank_character(file_data, static_cast<u16>(id));
+  return write_new_figure(path, file_data.data(), file_data.size());
+}
+
+// The real toy portals the app opened for a game, as comma-separated file descriptors
+// (usb_android_set_devices). Before the game boots: its USB scan runs once, then.
+extern "C" void _rpcsx_usbSetPassthrough(std::string_view fds) {
+  std::vector<int> list;
+
+  for (const std::string &item : fmt::split(fds, {","})) {
+    int fd = -1;
+
+    if (std::from_chars(item.data(), item.data() + item.size(), fd).ec == std::errc{} && fd >= 0) {
+      list.push_back(fd);
+    }
+  }
+
+  usb_android_set_devices(std::move(list));
+}
+
+// Why a game thread died of a fatal error since the last call, or "". Its first line is the reason
+// RPCS3 gave; the lines under it are where, for the log.
+extern "C" const char *_rpcsx_takeGameError() {
+  static thread_local std::string result;
+  std::lock_guard lock(s_game_error_mutex);
+  result = std::exchange(s_game_error, {});
+  return result.c_str();
+}
+
+// Which real portals the game's USB scan took, as bits (1 Skylanders, 2 Infinity, 4 Dimensions): the
+// Portal panel shows the emulated one for any the app opened that the core could not take.
+extern "C" s32 _rpcsx_usbPassedThrough() {
+  return static_cast<s32>(usb_android_passed_through());
 }
 
 // ---- Saved servers -------------------------------------------------------------------
@@ -3370,40 +3857,197 @@ extern "C" const char *_rpcsx_rpcnRemoveFriend(std::string_view npid) {
   });
 }
 
-// The friend list as JSON, or an empty array when not signed in.
+// The friend list and the requests waiting on either side, as JSON:
+//   {"signedIn":true,"friends":[{"npid":"a","online":true,"title":"...","status":"...","comment":"..."}],
+//    "received":["b"],"sent":["c"]}
+// title, status and comment are the friend's presence as their game sets it: what RPCN has about
+// a friend beyond their name and whether they are online. It sends no pictures of other users.
+// and signedIn false with empty lists when no session is signed in.
 //
-// Deliberately does NOT sign in on its own: this is polled to draw a list, and a screen that
-// silently opens a network session just by being looked at is not what anyone expects. Adding a
-// friend is an explicit action and can afford to authenticate; showing a list cannot.
+// Requests are half of it: on RPCN two people are friends only once both have added each other,
+// and until then the request sits in requests_received on one side and requests_sent on the
+// other. A game's invite list offers friends only, so a request nobody can see was an invite
+// nobody could send.
+//
+// Deliberately does NOT sign in, nor even create a client (peek_instance): this is polled to draw
+// a list, and a screen that silently opens a network session just by being looked at is not what
+// anyone expects. The session is a running game's, or the one _rpcsx_rpcnFriendsSession holds
+// open while a friends list is showing.
 extern "C" const char *_rpcsx_rpcnGetFriends() {
   static thread_local std::string result;
 
-  const auto rpcn = rpcn::rpcn_client::get_instance(0);
+  const auto rpcn = rpcn::rpcn_client::peek_instance();
 
   if (!rpcn || !rpcn->is_authentified()) {
+    result = R"({"signedIn":false,"friends":[],"received":[],"sent":[]})";
+    return result.c_str();
+  }
+
+  // One copy under the client's lock, so the three lists agree with each other.
+  rpcn::friend_data data;
+  rpcn->get_friends(data);
+
+  std::string friends;
+
+  for (const auto &[npid, presence] : data.friends) {
+    if (!friends.empty()) friends += ",";
+
+    fmt::append(friends, R"({"npid":"%s","online":%s,"title":"%s","status":"%s","comment":"%s"})",
+                json_escape(npid), presence.online ? "true" : "false",
+                json_escape(presence.pr_title), json_escape(presence.pr_status),
+                json_escape(presence.pr_comment));
+  }
+
+  const auto names = [](const std::set<std::string> &npids) {
+    std::string out;
+
+    for (const auto &npid : npids) {
+      if (!out.empty()) out += ",";
+      fmt::append(out, R"("%s")", json_escape(npid));
+    }
+
+    return out;
+  };
+
+  result = fmt::format(R"({"signedIn":true,"friends":[%s],"received":[%s],"sent":[%s]})",
+                       friends, names(data.requests_received), names(data.requests_sent));
+  return result.c_str();
+}
+
+// Game invites received and not yet used, as JSON: [{"id":1,"from":"a","subject":"...","body":"..."}].
+//
+// A game sends an invite through RPCN with its own session data in it (only the game can make one,
+// which is why inviting is the game's own menu), and the receiving game takes it when the system
+// says one was selected. On a PS3 that is the XMB's friends list; RPCS3's is the friends page of its
+// home menu, which nothing in this app opens. Read from the session already signed in, never
+// creating one: an invite is only any use to a game that is running.
+//
+// Only invites for the game that is running and online, as RPCS3's home menu lists them: the game
+// registers its NP communication id with its basic handler, and an invite carries the id of the
+// game that sent it. Handed to any other game (a single-player one, another title) an invite does
+// nothing useful and is used up all the same; listed only here, it waits for its own game.
+static std::optional<SceNpCommunicationId> running_game_np_context() {
+  if (Emu.IsStopped()) {
+    return std::nullopt;
+  }
+
+  auto *nph = g_fxo->try_get<named_thread<np::np_handler>>();
+
+  if (!nph || !nph->basic_handler_registered) {
+    return std::nullopt;
+  }
+
+  return nph->get_basic_handler_context();
+}
+
+static bool invite_is_for(const message_data &message, const SceNpCommunicationId &context) {
+  return std::strncmp(message.commId.data, context.data, sizeof(context.data) - 1) == 0;
+}
+
+extern "C" const char *_rpcsx_rpcnGetInvites() {
+  static thread_local std::string result;
+
+  const auto rpcn = rpcn::rpcn_client::peek_instance();
+  const auto context = running_game_np_context();
+
+  if (!rpcn || !rpcn->is_authentified() || !context) {
     result = "[]";
     return result.c_str();
   }
 
   std::string entries;
 
-  for (u32 i = 0, count = rpcn->get_num_friends(); i < count; i++) {
-    const auto presence = rpcn->get_friend_presence_by_index(i);
-
-    if (!presence) {
-      continue;
-    }
+  for (const auto &[id, message] :
+       rpcn->get_messages(SCE_NP_BASIC_MESSAGE_MAIN_TYPE_INVITE, true)) {
+    if (!invite_is_for(message->second, *context)) continue;
 
     if (!entries.empty()) entries += ",";
 
-    fmt::append(entries, R"({"npid":"%s","online":%s})",
-                json_escape(presence->first),
-                presence->second.online ? "true" : "false");
+    fmt::append(entries, R"({"id":%d,"from":"%s","subject":"%s","body":"%s"})", id,
+                json_escape(message->first), json_escape(message->second.subject),
+                json_escape(message->second.body));
   }
 
   result = fmt::format("[%s]", entries);
   return result.c_str();
 }
+
+// Hands an invite to the running game, as selecting it in the XMB would: the game is told one was
+// selected and loads it (CELL_SYSUTIL_NP_INVITATION_SELECTED). np_handler marks it used once sent.
+extern "C" const char *_rpcsx_rpcnAcceptInvite(u64 id) {
+  const auto context = running_game_np_context();
+  const auto rpcn = rpcn::rpcn_client::peek_instance();
+  const auto message = rpcn ? rpcn->get_message(id) : std::nullopt;
+
+  // The list only offers invites for the running game; checked again here because the game can
+  // have changed between drawing the list and the press.
+  if (!context || !message || !invite_is_for(message.value()->second, *context)) {
+    return rpcn_fail("That invite is for another game. Start that game to join.");
+  }
+
+  auto *nph = g_fxo->try_get<named_thread<np::np_handler>>();
+
+  if (!nph || !nph->select_invitation(id)) {
+    return rpcn_fail("The game did not take the invite. It may be for another game, or "
+                     "this game may only accept invites from its own menus.");
+  }
+
+  return rpcn_ok();
+}
+
+extern "C" const char *_rpcsx_rpcnDeclineInvite(u64 id) {
+  const auto rpcn = rpcn::rpcn_client::peek_instance();
+
+  if (!rpcn) {
+    return rpcn_fail("Not signed in to RPCN.");
+  }
+
+  rpcn->mark_message_used(id);
+  return rpcn_ok();
+}
+
+// Keeps a signed-in session open while a friends screen is showing, so the list above has
+// something to read outside a game.
+//
+// The client lives only as long as someone holds it. In a game the NP handler does; in the
+// library nothing does, so the session an add or remove signs in is gone again the moment the
+// request is sent, and the list showed nothing there. A friends list opens one here while it is
+// showing and closes it when it goes away. Opens are counted, so one closing does not end another's.
+static std::mutex s_rpcn_friends_session_mutex;
+static std::shared_ptr<rpcn::rpcn_client> s_rpcn_friends_session;
+static u32 s_rpcn_friends_session_users = 0;
+
+extern "C" const char *_rpcsx_rpcnFriendsSession(bool open) {
+  if (!open) {
+    std::shared_ptr<rpcn::rpcn_client> last;
+
+    {
+      std::lock_guard lock(s_rpcn_friends_session_mutex);
+
+      if (s_rpcn_friends_session_users && --s_rpcn_friends_session_users == 0) {
+        last = std::move(s_rpcn_friends_session);
+      }
+    }
+
+    // Dropped outside the lock: the last reference tears the client down and joins its threads.
+    last.reset();
+    return rpcn_ok();
+  }
+
+  {
+    std::lock_guard lock(s_rpcn_friends_session_mutex);
+
+    if (!s_rpcn_friends_session) {
+      s_rpcn_friends_session = rpcn::rpcn_client::get_instance(0);
+    }
+
+    s_rpcn_friends_session_users++;
+  }
+
+  // Signs the held client in with the saved account, if it is not already.
+  return rpcn_with_auth([](rpcn::rpcn_client &) { return true; });
+}
+
 
 extern "C" const char *_rpcsx_rpcnCreateAccount(std::string_view npid,
                                                 std::string_view password,
@@ -3413,7 +4057,8 @@ extern "C" const char *_rpcsx_rpcnCreateAccount(std::string_view npid,
   static constexpr std::string_view avatar =
       "https://rpcs3.net/cdn/netplay/DefaultAvatar.png";
 
-  const std::string s_npid{npid}, s_pass{password}, s_name{onlineName}, s_email{email};
+  // Made with the derived password, as RPCS3 makes accounts, so it signs in from RPCS3 too
+  const std::string s_npid{npid}, s_pass{rpcn_password_forms(password).front()}, s_name{onlineName}, s_email{email};
 
   return rpcn_with_connection([&](rpcn::rpcn_client &client) {
     const auto err = client.create_user(s_npid, s_pass, s_name, avatar, s_email);
@@ -3442,13 +4087,175 @@ extern "C" const char *_rpcsx_rpcnDeleteTrophies() {
   });
 }
 
+// ---- Avatar, for the RPCN tab's picker ----------------------------------------------------------
+//
+// Upstream's np_avatar does the work: it lists the PSN avatars installed for the user (avatar PKGs
+// land in home/<user>/psn_avatar), decrypts them with their RAP, and keeps the choice in
+// home/<user>/rpcs3_avatar, which sceNp reads whenever a game asks for the player's picture. These
+// hand the picker what RPCS3's avatar_selection_dialog takes from it.
+
+// {"userDir", "selected", "default", "builtin": [path], "avatars": [{"path", "usable"}]}.
+//
+// Builtin is the firmware's own user icons, the ones a PS3 offers when a user picks a picture; the
+// default avatar is one of them, and every player with the firmware installed has them. Avatars are
+// the PSN avatar packages, and usable is RPCS3's dialog's own test: one whose RAP is missing cannot
+// be decrypted, so the picker leaves it out and counts it.
+extern "C" const char *_rpcsx_avatarList() {
+  static thread_local std::string result;
+
+  const std::string user = Emu.GetUsr();
+  const std::string icon_dir = g_cfg_vfs.get_dev_flash() + "vsh/resource/explore/user/";
+
+  std::vector<std::string> icons;
+
+  for (const auto &entry : fs::dir(icon_dir)) {
+    if (!entry.is_directory && fmt::to_lower(entry.name).ends_with(".png")) {
+      icons.push_back(icon_dir + entry.name);
+    }
+  }
+
+  std::sort(icons.begin(), icons.end());
+
+  std::string builtin;
+
+  for (const std::string &path : icons) {
+    if (!builtin.empty()) builtin += ",";
+    fmt::append(builtin, R"("%s")", json_escape(path));
+  }
+
+  std::string avatars;
+
+  for (const std::string &path : np::avatar::get_installed_avatars(user)) {
+    if (!avatars.empty()) avatars += ",";
+    fmt::append(avatars, R"({"path":"%s","usable":%s})", json_escape(path),
+                np::avatar::is_file_usable(path) ? "true" : "false");
+  }
+
+  result = fmt::format(R"({"userDir":"%s","selected":"%s","default":"%s","builtin":[%s],"avatars":[%s]})",
+                       json_escape(rpcs3::utils::get_hdd0_dir() + "home/" + user + "/"),
+                       json_escape(np::avatar::get_selected_avatar(user)),
+                       json_escape(np::avatar::get_default_avatar_path(user)), builtin, avatars);
+  return result.c_str();
+}
+
+// The file games are given for the player now: the chosen avatar, or the firmware's default one.
+// For the Friends headers, which show it beside the RPCN name and need no list of every avatar.
+extern "C" const char *_rpcsx_avatarCurrent() {
+  static thread_local std::string result;
+
+  const std::string user = Emu.GetUsr();
+  result = np::avatar::get_selected_avatar(user);
+
+  if (result.empty()) {
+    result = np::avatar::get_default_avatar_path(user);
+  }
+
+  return result.c_str();
+}
+
+// The PNG inside an avatar file, decrypted when it is an EDAT. False when there is none.
+extern "C" bool _rpcsx_avatarImage(std::string_view path, const u8 **data, usz *size) {
+  static thread_local std::vector<u8> image;
+
+  image = np::avatar::load_file(std::string(path));
+  *data = image.data();
+  *size = image.size();
+  return !image.empty();
+}
+
+// Choose an avatar by path, or the default with an empty one. Read first, as the dialog does, so a
+// file that cannot be loaded never becomes the selection.
+extern "C" bool _rpcsx_avatarSelect(std::string_view path) {
+  const std::string s_path{path};
+
+  if (!s_path.empty() && np::avatar::load_file(s_path).empty()) {
+    return false;
+  }
+
+  return np::avatar::set_selected_avatar(Emu.GetUsr(), s_path);
+}
+
+// A picture of the player's own, already a square PNG (the picker crops and scales it), stored in
+// their home folder and chosen. Named after its contents: sceNp caches converted avatars by path
+// for the rest of the session, so a new picture needs a new name to be seen at all. The picture it
+// replaces is removed, so a home folder holds one at most.
+extern "C" bool _rpcsx_avatarUseImage(const u8 *data, usz size) {
+  static constexpr u8 png_signature[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+
+  if (!data || size < sizeof(png_signature) || size > 16 * 1024 * 1024 ||
+      std::memcmp(data, png_signature, sizeof(png_signature)) != 0) {
+    return false;
+  }
+
+  const std::string user = Emu.GetUsr();
+  const std::string user_dir = rpcs3::utils::get_hdd0_dir() + "home/" + user + "/";
+
+  u8 digest[20];
+  sha1(data, size, digest);
+  const u64 tag = read_from_ptr<be_t<u64>>(digest);
+  const std::string name = fmt::format("armsx3_avatar_%016x.png", tag);
+  const std::string path = user_dir + name;
+
+  if (!fs::is_file(path)) {
+    // Through a temporary, so a failed write never leaves a broken file under the final name
+    const std::string part = path + ".part";
+    fs::file file(part, fs::rewrite);
+
+    if (!file || file.write(data, size) != size) {
+      file.close();
+      fs::remove_file(part);
+      return false;
+    }
+
+    file.close();
+
+    if (!fs::rename(part, path, true)) {
+      fs::remove_file(part);
+      return false;
+    }
+  }
+
+  if (!np::avatar::set_selected_avatar(user, path)) {
+    return false;
+  }
+
+  // Names first: fs::dir is a live handle on the folder being changed
+  std::vector<std::string> previous;
+
+  for (const auto &entry : fs::dir(user_dir)) {
+    if (!entry.is_directory && entry.name != name && entry.name.starts_with("armsx3_avatar_") &&
+        entry.name.ends_with(".png")) {
+      previous.push_back(entry.name);
+    }
+  }
+
+  for (const std::string &old_name : previous) {
+    fs::remove_file(user_dir + old_name);
+  }
+
+  return true;
+}
+
 extern "C" const char *_rpcsx_rpcnResendToken(std::string_view npid,
                                               std::string_view password) {
-  const std::string s_npid{npid}, s_pass{password};
+  const std::string s_npid{npid};
+  const char *result = rpcn_ok();
 
-  return rpcn_with_connection([&](rpcn::rpcn_client &client) {
-    return client.resend_token(s_npid, s_pass);
-  });
+  // The account checks the password, so it goes in the form the account was made with
+  for (const std::string &form : rpcn_password_forms(password)) {
+    rpcn::ErrorType error = rpcn::ErrorType::NoError;
+
+    result = rpcn_with_connection([&](rpcn::rpcn_client &client) {
+      error = client.resend_token(s_npid, form);
+      return error;
+    });
+
+    if (error != rpcn::ErrorType::LoginInvalidPassword) {
+      break;
+    }
+  }
+
+  return result;
 }
 
 extern "C" const char *_rpcsx_rpcnSendResetToken(std::string_view npid,
@@ -3463,7 +4270,8 @@ extern "C" const char *_rpcsx_rpcnSendResetToken(std::string_view npid,
 extern "C" const char *_rpcsx_rpcnResetPassword(std::string_view npid,
                                                 std::string_view token,
                                                 std::string_view password) {
-  const std::string s_npid{npid}, s_token{token}, s_pass{password};
+  // The new password is derived, as RPCS3 sets it, so RPCS3 signs in with it too
+  const std::string s_npid{npid}, s_token{token}, s_pass{rpcn_password_forms(password).front()};
 
   return rpcn_with_connection([&](rpcn::rpcn_client &client) {
     const auto err = client.reset_password(s_npid, s_token, s_pass);
@@ -3478,17 +4286,19 @@ extern "C" const char *_rpcsx_rpcnResetPassword(std::string_view npid,
   });
 }
 
-// Connect and authenticate with the saved account, so "is my account set up" can be
-// answered here instead of by booting a game and guessing.
+// Connect and authenticate with the saved account. Empty when it signed in, else what went wrong;
+// [state] is how the client ended, which tells a refused password from everything else. [keep]
+// takes the client when it signed in, or it goes with this call.
 //
 // wait_for_authentified is the public path -- login() itself is private -- but it is only
 // half of it, and the half that hangs on its own. See below.
-extern "C" const char *_rpcsx_rpcnTestLogin() {
+static std::string rpcn_saved_login(rpcn::rpcn_state &state,
+                                    std::shared_ptr<rpcn::rpcn_client> *keep = nullptr) {
+  state = rpcn::rpcn_state::failure_other;
   g_cfg_rpcn.load();
 
   if (g_cfg_rpcn.get_npid().empty() || g_cfg_rpcn.get_password().empty()) {
-    return rpcn_fail("No account set up yet. Create one, or enter an existing username "
-                     "and password.");
+    return "No account set up yet. Sign in, or create an account.";
   }
 
   // get_instance's check_config flag does NOT return an error -- it calls
@@ -3498,7 +4308,7 @@ extern "C" const char *_rpcsx_rpcnTestLogin() {
   const auto rpcn = rpcn::rpcn_client::get_instance(0);
 
   if (!rpcn) {
-    return rpcn_fail("Could not create the RPCN client.");
+    return "Could not create the RPCN client.";
   }
 
   // Connect FIRST. rpcn_thread's state machine only acts on want_conn while disconnected:
@@ -3506,19 +4316,117 @@ extern "C" const char *_rpcsx_rpcnTestLogin() {
   // no connection request, breaks back to its semaphore and never releases sem_authentified.
   // The call then blocks forever with nothing in the log after "Loading RPCN config" --
   // which is exactly what it did. np_handler does these two in this order for this reason.
-  if (const auto state = rpcn->wait_for_connection();
-      state != rpcn::rpcn_state::failure_no_failure) {
-    return rpcn_fail(fmt::format("Could not reach the RPCN server: %s",
-                                 rpcn::rpcn_state_to_string(state)));
+  if (state = rpcn->wait_for_connection(); state != rpcn::rpcn_state::failure_no_failure) {
+    return fmt::format("Could not reach the RPCN server: %s", rpcn::rpcn_state_to_string(state));
   }
 
-  if (const auto state = rpcn->wait_for_authentified();
-      state != rpcn::rpcn_state::failure_no_failure) {
-    return rpcn_fail(fmt::format("Sign-in failed: %s",
-                                 rpcn::rpcn_state_to_string(state)));
+  if (state = rpcn->wait_for_authentified(); state != rpcn::rpcn_state::failure_no_failure) {
+    return fmt::format("Sign-in failed: %s", rpcn::rpcn_state_to_string(state));
+  }
+
+  if (keep) {
+    *keep = rpcn;
+  }
+
+  return {};
+}
+
+// Answers "is my account set up" here instead of by booting a game and guessing.
+extern "C" const char *_rpcsx_rpcnTestLogin() {
+  rpcn::rpcn_state state;
+
+  if (std::string message = rpcn_saved_login(state); !message.empty()) {
+    return rpcn_fail(std::move(message));
   }
 
   return rpcn_ok();
+}
+
+// Save the account and sign in with it, offering the password in each form it may be wanted in
+// (rpcn_password_forms): derived, as RPCS3 sends it, then as typed for an account made with an
+// older ARMSX3. The form the server takes is the one saved. When the server turns the details
+// down, the account saved before comes back; when it cannot be reached, the derived form stays,
+// being what RPCS3 itself would save for that password.
+//
+// Each form is tried on a fresh client. A client keeps the first failure it met and answers every
+// later wait with it, so a friends list holding one open (s_rpcn_friends_session) lets go of it
+// here and is given the signed-in one afterwards.
+extern "C" const char *_rpcsx_rpcnSignIn(std::string_view host, std::string_view npid,
+                                         std::string_view password, std::string_view token) {
+  if (npid.empty()) {
+    return rpcn_fail("Enter your RPCN username.");
+  }
+
+  if (password.empty()) {
+    return rpcn_fail("Enter your password.");
+  }
+
+  const std::vector<std::string> forms = rpcn_password_forms(password);
+
+  // The account saved before, put back if the server turns these details down: a mistyped
+  // password while switching accounts should not cost the account that worked
+  g_cfg_rpcn.load();
+  const std::string prev_host = g_cfg_rpcn.get_host(), prev_npid = g_cfg_rpcn.get_npid(),
+                    prev_password = g_cfg_rpcn.get_password(), prev_token = g_cfg_rpcn.get_token();
+
+  std::shared_ptr<rpcn::rpcn_client> held;
+  {
+    std::lock_guard lock(s_rpcn_friends_session_mutex);
+    held = std::move(s_rpcn_friends_session);
+  }
+  held.reset();
+
+  std::string message;
+  rpcn::rpcn_state state = rpcn::rpcn_state::failure_other;
+
+  for (const std::string &form : forms) {
+    g_cfg_rpcn.load();
+    if (!host.empty()) g_cfg_rpcn.set_host(host);
+    g_cfg_rpcn.set_npid(npid);
+    g_cfg_rpcn.set_password(form);
+    if (!token.empty()) g_cfg_rpcn.set_token(token);
+    g_cfg_rpcn.save();
+
+    std::shared_ptr<rpcn::rpcn_client> signed_in;
+    message = rpcn_saved_login(state, &signed_in);
+
+    if (message.empty()) {
+      std::lock_guard lock(s_rpcn_friends_session_mutex);
+
+      if (s_rpcn_friends_session_users) {
+        s_rpcn_friends_session = std::move(signed_in);
+      }
+
+      return rpcn_ok();
+    }
+
+    if (state != rpcn::rpcn_state::failure_id_password) {
+      break;
+    }
+  }
+
+  g_cfg_rpcn.load();
+
+  switch (state) {
+  case rpcn::rpcn_state::failure_id:
+  case rpcn::rpcn_state::failure_id_username:
+  case rpcn::rpcn_state::failure_id_password:
+  case rpcn::rpcn_state::failure_id_token:
+    g_cfg_rpcn.set_host(prev_host);
+    g_cfg_rpcn.set_npid(prev_npid);
+    g_cfg_rpcn.set_password(prev_password);
+    g_cfg_rpcn.set_token(prev_token);
+    break;
+  default:
+    // Not turned down, only not reached (or in use elsewhere): kept, as RPCS3 keeps what is
+    // typed, so games sign in with it once the server answers
+    g_cfg_rpcn.set_password(forms.front());
+    break;
+  }
+
+  g_cfg_rpcn.save();
+
+  return rpcn_fail(std::move(message));
 }
 
 // Hand the core Android's exact SoC identity. Deliberately a separate export
@@ -4169,6 +5077,19 @@ extern "C" int _rpcsx_boot(std::string_view path_) {
     }
   }
 
+  // An RSX capture (.rrc, as written by the in-game Capture button to config/captures) replays
+  // its one frame in a loop instead of booting a game: the way to look at a graphics bug again
+  // without the game, or on another machine. Started like any file, e.g. a VIEW intent with its
+  // file:// path:
+  //   adb shell am start -a android.intent.action.VIEW -d file://<path>.rrc.gz
+  //       -n com.armsx3/com.armsx2.BootSplashActivity
+  if (const std::string lower = fmt::to_lower(path);
+      lower.ends_with(".rrc") || lower.ends_with(".rrc.gz") || lower.ends_with(".rrc.zst")) {
+    rpcsx_android.notice("boot: '%s' is an RSX capture, replaying it", path);
+    return static_cast<int>(Emu.BootRsxCapture(path) ? game_boot_result::no_errors
+                                                     : game_boot_result::generic_error);
+  }
+
   return static_cast<int>(Emu.BootGame(path, "", false, cfg_mode::custom));
 }
 
@@ -4180,6 +5101,11 @@ extern "C" void _rpcsx_kill() {
   stop_session();
 }
 extern "C" void _rpcsx_resume() { Emu.Resume(); }
+
+// From the activity's onStart/onStop. See Emu/android_app_state.h for who reads it.
+extern "C" void _rpcsx_setAppBackgrounded(bool backgrounded) {
+  g_android_app_backgrounded = backgrounded;
+}
 
 // The counterpart to _rpcsx_resume, which had none. Rpcs3Bridge.pause() set a bool and returned,
 // on the belief that "RPCS3 has no explicit pause entry point" -- but Emu.Pause() is right here,
@@ -4241,7 +5167,21 @@ extern "C" void _rpcsx_openHomeMenu() { open_home_menu_async(); }
 // config/captures/ and pauses the emulator.
 extern "C" void _rpcsx_captureFrame() { g_user_asked_for_frame_capture = true; }
 
+// Arm a frame dump of the next frame (rsx_frame_dump.h): 1 = final image, 2 = every render pass.
+// False when the renderer cannot do it, which the menu says rather than arming nothing.
+extern "C" bool _rpcsx_dumpFrame(int mode) {
+  if (mode != 1 && mode != 2) {
+    return false;
+  }
+
+  return rsx::frame_dump::request(static_cast<rsx::frame_dump::dump_mode>(mode));
+}
+
 extern "C" std::string _rpcsx_getTitleId() { return Emu.GetTitleID(); }
+
+// The running game's title, from its PARAM.SFO. The app names a game it launched from outside
+// its library with this, since it has no scanned entry for it.
+extern "C" std::string _rpcsx_getTitle() { return Emu.GetTitle(); }
 
 // ADPF: what the last frame actually cost, and which OS thread presents it. The app feeds
 // these to PerformanceHintManager. Zero means 'not measured yet' -- the caller must skip.
@@ -4814,8 +5754,18 @@ static std::string disc_games_json(const std::string &disc_root, std::string_vie
 
 extern "C" std::string _rpcsx_probeDiscInfo(std::string_view isoPath,
                                             std::string_view iconOut) {
-  if (isoPath.empty() || !Emu.IsStopped()) {
+  // Busy, not empty, while the core is not stopped: the library scans again once the core is
+  // idle. Answering "{}" here listed every disc with no title ID, title or cover until a manual
+  // refresh, which is what a new user got, because their first scan lands in the firmware compile
+  // that follows setup.
+  static constexpr std::string_view k_busy = R"({"busy":true})";
+
+  if (isoPath.empty()) {
     return "{}";
+  }
+
+  if (!Emu.IsStopped()) {
+    return std::string(k_busy);
   }
 
   const std::string path(isoPath);
@@ -4850,7 +5800,7 @@ extern "C" std::string _rpcsx_probeDiscInfo(std::string_view isoPath,
   // Re-checked under the lock: a boot may have started while we were waiting for it,
   // and mounting into a live VM's vfs would shadow the disc it is running from.
   if (!Emu.IsStopped()) {
-    return "{}";
+    return std::string(k_busy);
   }
 
   // g_fxo has to be set up before anything mounts, and being STOPPED is exactly when it is not.
@@ -5175,7 +6125,34 @@ extern "C" bool _rpcsx_patchSetEnabled(std::string_view hash,
   entry.version = h->second.version;
 
   auto &info = entry.patch_info_map[std::string(description)];
+
+  // The patch's details come from the database, but every serial's switch comes from the config
+  // read just above.
+  //
+  // The cached database carries the enabled state the config had when the cache was built, and
+  // it is rebuilt only when a patch FILE changes, never when the config does. Copying it over the
+  // entry wholesale put every other serial back the way it was at that moment, so switching one
+  // patch on for several serials in a row kept only the last. Ps3PatchRepo.BUNDLED does exactly
+  // that: on a clean install GTA IV's collision fix came out on for NPUB30702 alone, and the
+  // Complete Edition (BLUS30682) would have run Approximate without it.
+  const patch_engine::patch_titles current = std::move(info.titles);
   info = p->second;
+
+  for (auto &[title, serials] : info.titles)
+    for (auto &[ser, versions] : serials)
+      for (auto &[ver, values] : versions) {
+        // Absent from the config means off.
+        values.enabled = false;
+
+        if (const auto t = current.find(title); t != current.end())
+          if (const auto s = t->second.find(ser); s != t->second.end())
+            if (const auto v = s->second.find(ver); v != s->second.end()) {
+              values.enabled = v->second.enabled;
+
+              if (!v->second.config_values.empty())
+                values.config_values = v->second.config_values;
+            }
+      }
 
   // patch_key::all is spelled "All"; the lowercase literal this used to compare
   // against never matched, so a wildcard patch toggled from a game's own list
@@ -5344,13 +6321,6 @@ extern "C" void _rpcsx_setPadSensor(int port, int x, int y, int z, int g) {
   pad->m_sensors[3].m_value = clamp10(g);
 }
 
-// What the game is currently asking the rumble motors to do, packed as
-// (large << 8) | small, both 0..255.
-//
-// Polled rather than pushed: the guest writes these through cellPadSetActDirect
-// whenever it likes, and there is no notification to hook. The caller reads it on a
-// timer and drives the phone's vibrator. Returns 0 when nothing is running, so a
-// caller that keeps polling after the game stops simply sees silence.
 // Device temperatures, pushed from the app layer -- see the note in overlay_perf_metrics.h for
 // why discovery lives there and not here. Values are degrees Celsius, or the 'none' sentinel.
 extern "C" void _rpcsx_setThermals(float cpu, float gpu, float battery, bool show) {
@@ -5426,6 +6396,18 @@ extern "C" void _rpcsx_setPadDeviceClasses(const int *classes, int count) {
   pad::reset(Emu.GetTitleID());
 }
 
+// The motor speeds for what the game is currently asking the rumble motors to do,
+// packed as (large << 8) | small, both 0..255.
+//
+// The request goes through the player's pad config, the same conversion a physical pad
+// gets before its motors are driven. That includes the vibration threshold: a DS3
+// ignores low large-motor values, so a game can leave the motor at one to keep it still.
+//
+// Polled rather than pushed: the guest writes the motors through cellPadSetActDirect
+// whenever it likes, and there is no notification to hook. Returns 0 when nothing is
+// running, so a caller that keeps polling after the game stops simply sees silence.
+//
+// Fix contributed by mariobob (PR #200)
 extern "C" int _rpcsx_getPadRumble(int port) {
   std::lock_guard lock(g_virtual_pad_mutex);
 
@@ -5439,8 +6421,13 @@ extern "C" int _rpcsx_getPadRumble(int port) {
     return 0;
   }
 
-  const int large = pad->m_vibrate_motors[0].value;
-  const int small = pad->m_vibrate_motors[1].value;
+  if (static_cast<usz>(port) >= g_cfg_input.player.size() || !g_cfg_input.player[port]) {
+    return 0;
+  }
+
+  const cfg_pad &config = g_cfg_input.player[port]->config;
+  const int large = config.get_large_motor_speed(pad->m_vibrate_motors);
+  const int small = config.get_small_motor_speed(pad->m_vibrate_motors);
   return (large << 8) | small;
 }
 
@@ -6843,16 +7830,100 @@ extern void reset_debug_overlay();
 
 // Settings batching.
 //
-// Every settingsSet used to end in Emulator::SaveSettings(g_cfg.to_string(), ""), which
-// serialises the WHOLE PS3 config to YAML and writes it to disk. The app pushes its full
-// settings block on each change -- ~165 keys -- so one toggle in the in-game menu cost 165
-// whole-config serialisations and 165 file writes, synchronously, on the UI thread. That is
-// the reported "lag when switching settings in the in game menu".
+// Every settingsSet used to end in a save of the WHOLE PS3 config, serialised to YAML and
+// written to disk. The app pushes its full settings block on each change -- ~165 keys -- so
+// one toggle in the in-game menu cost 165 whole-config serialisations and 165 file writes,
+// synchronously, on the UI thread. That is the reported "lag when switching settings in the
+// in game menu".
 //
 // Between begin/end the save is deferred and coalesced into exactly one write. Single
 // settingsSet calls (the dynamic settings screen) are unaffected and still save immediately.
 static std::atomic<int> g_settings_batch_depth{0};
-static std::atomic<bool> g_settings_batch_dirty{false};
+
+// What settingsSet saves to config.yml.
+//
+// It used to save the live config, which is config.yml plus whatever the running or last game
+// put over it: Emulator::Load applies the title's database entry after reading config.yml, and
+// nothing takes it off again when the game stops. So the next save, normally the push before
+// the next launch, made one title's entry every title's. Sonic '06 booted with Blitz: The
+// League II's SPU MMIO Delay (300) and compile pause out of config.yml, at half its frame rate.
+//
+// Now the file gets what it already holds plus the values pushed to it, and nothing else.
+struct global_cfg_edit {
+  std::string path;
+  std::string value;           // decoded, for a value node
+  std::set<std::string> items; // for a set node
+  bool is_set = false;
+};
+
+static std::mutex g_global_cfg_mutex;
+static std::vector<global_cfg_edit> g_global_cfg_edits; // under g_global_cfg_mutex
+
+// Under g_global_cfg_mutex.
+static void write_global_cfg_edits() {
+  if (g_global_cfg_edits.empty()) {
+    return;
+  }
+
+  const std::string cfg_path = fs::get_config_dir(true) + "config.yml";
+  const auto file_cfg = std::make_unique<cfg_root>();
+
+  // A missing or unparseable file starts over the way Emulator::Init would run without it.
+  const auto from_init_defaults = [&] {
+    file_cfg->from_default();
+    file_cfg->video.renderer.set(g_cfg.video.renderer.get());
+    file_cfg->video.vk.adapter.from_string(g_cfg.video.vk.adapter.to_string());
+  };
+
+  if (const fs::file file{cfg_path}) {
+    file_cfg->from_default();
+
+    if (!file_cfg->from_string(file.to_string())) {
+      rpcsx_android.error("settingsSet: %s does not parse, saving it afresh", cfg_path);
+      from_init_defaults();
+    }
+  } else if (fs::is_file(cfg_path)) {
+    // There but unreadable. Defaults written over it would lose every other setting it holds;
+    // these values are live already and the app pushes them again before the next boot.
+    rpcsx_android.error("settingsSet: cannot read %s (%s), not saved", cfg_path, fs::g_tls_error);
+    g_global_cfg_edits.clear();
+    return;
+  } else {
+    from_init_defaults();
+  }
+
+  for (auto &edit : g_global_cfg_edits) {
+    cfg::_base *node = find_cfg_node(file_cfg.get(), edit.path);
+
+    // The live tree accepted it, and this is the same tree.
+    if (node == nullptr || !cfg_is_editable(node)) {
+      continue;
+    }
+
+    if (edit.is_set) {
+      if (node->get_type() == cfg::type::set) {
+        static_cast<cfg::set_entry *>(node)->set_set(std::move(edit.items));
+      }
+    } else if (!node->from_string(edit.value)) {
+      rpcsx_android.error("settingsSet: %s = '%s' not saved to %s", edit.path, edit.value, cfg_path);
+    }
+  }
+
+  g_global_cfg_edits.clear();
+  Emulator::SaveSettingsFile(file_cfg->to_string(), "");
+
+  // As SaveSettings did: RPCS3's home menu tells changed settings apart by comparing with it.
+  g_backup_cfg.from_string(g_cfg.to_string());
+}
+
+static void save_global_cfg_edit(global_cfg_edit edit) {
+  std::lock_guard lock(g_global_cfg_mutex);
+  g_global_cfg_edits.push_back(std::move(edit));
+
+  if (g_settings_batch_depth.load() <= 0) {
+    write_global_cfg_edits();
+  }
+}
 
 extern "C" void _rpcsx_settingsBeginBatch() { g_settings_batch_depth.fetch_add(1); }
 
@@ -6861,9 +7932,8 @@ extern "C" void _rpcsx_settingsEndBatch() {
   if (g_settings_batch_depth.fetch_sub(1) != 1) {
     return;
   }
-  if (g_settings_batch_dirty.exchange(false)) {
-    Emulator::SaveSettings(g_cfg.to_string(), "");
-  }
+  std::lock_guard lock(g_global_cfg_mutex);
+  write_global_cfg_edits();
 }
 
 // Import the Lossless Scaling shaders from a file the user chose.
@@ -6916,6 +7986,8 @@ extern "C" bool _rpcsx_settingsSet(std::string_view path,
     // The app re-pushes every remembered value on each settings change, so an unchanged list
     // must not count as a write, or the running-game refusal below would fire on every one.
     if (items == set->get_set()) {
+      // The file still gets it: the live list can be the last game's, and a boot reads the file.
+      save_global_cfg_edit({.path = std::string(path), .items = std::move(items), .is_set = true});
       return true;
     }
 
@@ -6928,13 +8000,8 @@ extern "C" bool _rpcsx_settingsSet(std::string_view path,
       return false;
     }
 
-    set->set_set(std::move(items));
-
-    if (g_settings_batch_depth.load() > 0) {
-      g_settings_batch_dirty.store(true);
-    } else {
-      Emulator::SaveSettings(g_cfg.to_string(), "");
-    }
+    set->set_set(std::set<std::string>(items));
+    save_global_cfg_edit({.path = std::string(path), .items = std::move(items), .is_set = true});
     return true;
   }
 
@@ -6963,17 +8030,23 @@ extern "C" bool _rpcsx_settingsSet(std::string_view path,
     decoded.assign(valueString);
   }
 
+  // Clocks scale is read on every guest clock read, against an offset taken at boot with the
+  // boot-time scale (initialize_timebased_time). Changed under a running game the clock jumps:
+  // lowered, it drops below that offset and wraps to ~2^64 (convert_to_timebased_time then fails
+  // its ensure); raised, it leaps ahead by most of the device's uptime. RPCS3 keeps it to the
+  // boot for that reason. The app remembers the edit and applies it before the next boot.
+  if (root == &g_cfg.core.clocks_scale && !Emu.IsStopped(true) && decoded != root->to_string()) {
+    rpcsx_android.notice("settingsSet: %s changes at the next boot, not under a running game", path);
+    return false;
+  }
+
   if (!root->from_string(decoded, !Emu.IsStopped())) {
     rpcsx_android.error("settingsSet: node %s does not accept value '%s'", path,
                         decoded);
     return false;
   }
 
-  if (g_settings_batch_depth.load() > 0) {
-    g_settings_batch_dirty.store(true);
-  } else {
-    Emulator::SaveSettings(g_cfg.to_string(), "");
-  }
+  save_global_cfg_edit({.path = std::string(path), .value = decoded});
 
   // The overlays own live objects built from the config; they are not re-read
   // per frame. reset_*_overlay() is what applies a change to the running one

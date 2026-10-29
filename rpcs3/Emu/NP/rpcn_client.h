@@ -224,6 +224,10 @@ namespace rpcn
 		atomic_t<bool> authentified = false;
 		atomic_t<bool> want_conn    = false;
 		atomic_t<bool> want_auth    = false;
+		// ARMSX3: set when the connection of a signed-in session drops, until rpcn_thread has signed it in again
+		atomic_t<bool> session_lost = false;
+		// ARMSX3: set by terminate_connection(), after which the server closes the connection on purpose
+		atomic_t<bool> session_ending = false;
 		u32 binding_address = 0;
 		std::binary_semaphore sem_connected, sem_authentified;
 		std::mutex mutex_connected, mutex_authentified;
@@ -280,6 +284,9 @@ namespace rpcn
 		bool connect(std::string_view host);
 		bool login(std::string_view npid, std::string_view password, std::string_view token);
 		void disconnect();
+		void lose_connection();
+		void close_connection();
+		void give_up_session();
 
 	public:
 		~rpcn_client();
@@ -323,6 +330,8 @@ namespace rpcn
 		std::vector<u64> get_new_messages();
 		std::optional<shared_ptr<std::pair<std::string, message_data>>> get_message(u64 id) const;
 		std::vector<std::pair<u64, shared_ptr<std::pair<std::string, message_data>>>> get_messages_and_register_cb(SceNpBasicMessageMainType type, bool include_bootable, message_cb_func cb_func, void* cb_param);
+		// ARMSX3: the same list without registering for new ones, for a UI that polls it.
+		std::vector<std::pair<u64, shared_ptr<std::pair<std::string, message_data>>>> get_messages(SceNpBasicMessageMainType type_filter, bool include_bootable) const;
 		void remove_message_cb(message_cb_func cb_func, void* cb_param);
 		void mark_message_used(u64 id);
 
@@ -374,6 +383,7 @@ namespace rpcn
 		bool tus_get_multiuser_data_status(u32 req_id, SceNpCommunicationId& communication_id, const std::vector<SceNpOnlineId>& targetNpIdArray, SceNpTusSlotId slotId, s32 arrayNum, bool vuser);
 		bool tus_get_friends_data_status(u32 req_id, SceNpCommunicationId& communication_id, SceNpTusSlotId slotId, bool includeSelf, s32 sortType, s32 arrayNum);
 		bool tus_delete_multislot_data(u32 req_id, SceNpCommunicationId& communication_id, const SceNpOnlineId& targetNpId, vm::cptr<SceNpTusSlotId> slotIdArray, s32 arrayNum, bool vuser);
+		bool get_tss(u32 req_id, const SceNpCommunicationId& communication_id, s32 slot_id, u64 timestamp);
 		bool send_presence(const SceNpCommunicationId& pr_com_id, const std::string& pr_title, const std::string& pr_status, const std::string& pr_comment, const std::vector<u8>& pr_data);
 		bool unlock_trophy(const SceNpCommunicationId& communication_id, s32 trophy_id, s64 timestamp);
 		std::vector<std::pair<s32, s64>> sync_trophies(const SceNpCommunicationId& communication_id, const std::vector<std::pair<s32, s64>>& local_unlocked);

@@ -1023,6 +1023,9 @@
     <ClCompile Include="Emu\NP\np_helpers.cpp">
       <Filter>Emu\NP</Filter>
     </ClCompile>
+    <ClCompile Include="Emu\NP\np_avatar.cpp">
+      <Filter>Emu\NP</Filter>
+    </ClCompile>
     <ClCompile Include="Emu\NP\np_notifications.cpp">
       <Filter>Emu\NP</Filter>
     </ClCompile>
@@ -1678,6 +1681,12 @@
       <Filter>Emu\GPU\RSX\Common</Filter>
     </ClInclude>
     <ClInclude Include="Emu\RSX\Common\BufferUtils_avx512.h">
+      <Filter>Emu\GPU\RSX\Common</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\RSX\Common\BufferUtils_neon.h">
+      <Filter>Emu\GPU\RSX\Common</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\RSX\Common\BufferUtils_compact.h">
       <Filter>Emu\GPU\RSX\Common</Filter>
     </ClInclude>
     <ClInclude Include="util\types.hpp">
@@ -2512,6 +2521,9 @@
     <ClInclude Include="Emu\NP\np_helpers.h">
       <Filter>Emu\NP</Filter>
     </ClInclude>
+    <ClInclude Include="Emu\NP\np_avatar.h">
+      <Filter>Emu\NP</Filter>
+    </ClInclude>
     <ClInclude Include="Emu\Io\music_handler_base.h">
       <Filter>Emu\Io</Filter>
     </ClInclude>
@@ -3021,6 +3033,9 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
+    <None Include="Emu\RSX\Program\GLSLSnippets\E4M12Conversion.glsl">
+      <Filter>Emu\GPU\RSX\Program\Snippets</Filter>
+    </None>
     <None Include="Emu\RSX\Program\GLSLSnippets\GPUDeswizzle.glsl">
       <Filter>Emu\GPU\RSX\Program\Snippets</Filter>
     </None>
@@ -3053,6 +3068,9 @@
     </None>
     <None Include="Emu\RSX\Program\GLSLSnippets\OverlayRenderFS.glsl">
       <Filter>Emu\GPU\RSX\Program\Snippets</Filter>
+    </None>
+    <None Include="Emu\RSX\Program\GLSLSnippets\RSXProg\RSXFragmentEpilogue.glsl">
+      <Filter>Emu\GPU\RSX\Program\Snippets\RSXProg</Filter>
     </None>
     <None Include="Emu\RSX\Program\GLSLSnippets\RSXProg\RSXFragmentPrologue.glsl">
       <Filter>Emu\GPU\RSX\Program\Snippets\RSXProg</Filter>

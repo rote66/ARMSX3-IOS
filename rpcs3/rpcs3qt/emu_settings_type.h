@@ -102,6 +102,7 @@ enum class emu_settings_type
 	RelaxedZCULL,
 	PreciseZCULL,
 	DriverWakeUpDelay,
+	PPUEventWakeUpDelay,
 	VulkanAsyncTextureUploads,
 	VulkanAsyncSchedulerDriver,
 	AllowHostGPULabels,
@@ -233,6 +234,8 @@ enum class emu_settings_type
 	EmptyHdd0Tmp,
 	LimitCacheSize,
 	MaximumCacheSize,
+	EmulateHddSpeed,
+	EmulateBdvdSpeed,
 
 	// Log
 	Log,

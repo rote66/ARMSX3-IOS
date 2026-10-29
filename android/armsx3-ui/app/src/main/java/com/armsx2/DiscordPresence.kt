@@ -20,6 +20,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import com.armsx2.discord.DiscordIpc
 
@@ -73,6 +75,7 @@ object DiscordPresence {
     private const val PREF_ENABLED = "discord.enabled"
     private const val PREF_TOKEN = "discord.token"
     private const val PREF_NOTIFY = "discord.notifyInGame"
+    private const val PREF_SHOW_GAME = "discord.showGameInStatus"
 
     /** Seconds between RA rich-presence re-checks. Discord rate-limits presence updates, so this
      *  stays well clear of it while still following the game within a few seconds. */
@@ -97,6 +100,21 @@ object DiscordPresence {
     private var pollJob: Job? = null
     private var presenceJob: Job? = null
     private var started = false
+
+    // Whether the app is on screen. Out of sight nothing shows the status or the friends list, and
+    // the device may be locked for hours: the helper drains the SDK once a second instead of twenty
+    // times, and the poll below waits for the app to come back.
+    private val foreground = MutableStateFlow(true)
+
+    /** From the activity's onStart (true) and onStop (false). */
+    fun setForeground(fg: Boolean) {
+        if (foreground.value == fg) return
+        foreground.value = fg
+        sendIdle()
+    }
+
+    private fun sendIdle() =
+        send(DiscordIpc.MSG_IDLE, Bundle().apply { putBoolean(DiscordIpc.DATA_IDLE, !foreground.value) })
 
     // ---- helper-process link -------------------------------------------------------------
     //
@@ -124,6 +142,7 @@ object DiscordPresence {
             // remembers nothing, so anything set before the bind has to be replayed.
             send(DiscordIpc.MSG_START, Bundle().apply { putString(DiscordIpc.DATA_TOKEN, savedToken) })
             pushPresence()
+            sendIdle()
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -220,15 +239,61 @@ object DiscordPresence {
         else line.take(RA_STATE_MAX)
     }
 
+    /**
+     * A remote play session with both players in it, on either device. While there is one, Discord
+     * reads "Playing remote play (2 of 2)" under the game, and both devices publish the same [id]
+     * so Discord knows they are together. [hostGame] and [hostSerial] are the host's game, for the
+     * friend's device, which runs no game of its own; on the host they stay null and it publishes
+     * its own game as usual. Nobody's name or device goes into it.
+     */
+    data class RemotePlayParty(val id: String, val hostGame: String? = null, val hostSerial: String = "")
+
+    val remotePlay = mutableStateOf<RemotePlayParty?>(null)
+
+    /** Both players are in: the host has started streaming, or the friend shows its first frame. */
+    fun joinRemotePlay(party: RemotePlayParty) {
+        remotePlay.value = party
+    }
+
+    /** That session is over. A newer one is left alone. */
+    fun leaveRemotePlay(id: String) {
+        if (remotePlay.value?.id == id) remotePlay.value = null
+    }
+
+    // What the bridge (discord_bridge.cpp) publishes outside a game; a friend's status is read
+    // back with it, so the two must match.
+    private const val LIBRARY_DETAILS = "In the library"
+
+    // A PS3 title id, the only thing taken from a friend's cover caption as a serial. The
+    // filename form (BLUS-30443) counts too; the cover repository names it without the dash.
+    private val TITLE_ID = Regex("([A-Z]{4})-?([0-9]{5})")
+
     /** Re-publish the current game; used on (re)connect and whenever the running game changes. */
     private fun pushPresence() {
         val game = MainActivityRuntime.currentGame.value
         lastRaPresence = raPresence()
+        val party = remotePlay.value
+        val hostGame = party?.hostGame
+        if (party != null && hostGame != null) {
+            // The friend's side of remote play: the host's game, with the cover this device would
+            // show for it, derived from the serial the way a friend's row is.
+            send(DiscordIpc.MSG_SET_PLAYING, Bundle().apply {
+                putString(DiscordIpc.DATA_SERIAL, party.hostSerial)
+                putString(DiscordIpc.DATA_TITLE, hostGame)
+                putString(DiscordIpc.DATA_COVER, DiscordFriend("", hostGame, party.hostSerial, "").coverUrl.orEmpty())
+                putString(DiscordIpc.DATA_RA, "")
+                putString(DiscordIpc.DATA_PARTY, party.id)
+                putBoolean(DiscordIpc.DATA_SHOW_GAME, showGameInStatus)
+            })
+            return
+        }
         send(DiscordIpc.MSG_SET_PLAYING, Bundle().apply {
             putString(DiscordIpc.DATA_SERIAL, game?.serial.orEmpty())
             putString(DiscordIpc.DATA_TITLE, game?.let { it.displayTitle(false) }.orEmpty())
             putString(DiscordIpc.DATA_COVER, game?.coverUrl.orEmpty())
             putString(DiscordIpc.DATA_RA, lastRaPresence)
+            putString(DiscordIpc.DATA_PARTY, party?.id.orEmpty())
+            putBoolean(DiscordIpc.DATA_SHOW_GAME, showGameInStatus)
         })
     }
 
@@ -268,6 +333,18 @@ object DiscordPresence {
 
     /** Mirror of [notifyInGame] for Compose, which cannot observe SharedPreferences. */
     val notifyState = mutableStateOf(true)
+
+    /** Name the game in the "Playing" status rather than ARMSX3. Default on. */
+    var showGameInStatus: Boolean
+        get() = runCatching { MainActivityRuntime.prefs.getBoolean(PREF_SHOW_GAME, true) }.getOrDefault(true)
+        set(value) {
+            runCatching { MainActivityRuntime.prefs.edit().putBoolean(PREF_SHOW_GAME, value).apply() }
+            showGameState.value = value
+            pushPresence()
+        }
+
+    /** Mirror of [showGameInStatus] for Compose. */
+    val showGameState = mutableStateOf(true)
 
     // Who we had last poll, so a friend appearing can be told apart from a friend still being here.
     private var knownFriends: Set<String> = emptySet()
@@ -309,6 +386,7 @@ object DiscordPresence {
         if (!available() || !enabled || started) return
         started = true
         notifyState.value = notifyInGame
+        showGameState.value = showGameInStatus
         bindHelper()
         // Send it here TOO, not only from onServiceConnected.
         //
@@ -375,6 +453,8 @@ object DiscordPresence {
             // and some games update their RA line every few seconds.
             var sinceRaCheck = 0
             while (true) {
+                // Nothing to show while out of sight, so wait here instead of asking every second.
+                foreground.first { it }
                 // No pump here any more: the SDK's callback queue is drained inside the helper, on
                 // the thread that created the client. This loop only asks for a snapshot.
                 bindHelper()
@@ -475,10 +555,20 @@ object DiscordPresence {
             val f = record.split(FIELD_SEP)
             val name = f.getOrNull(0).orEmpty()
             if (name.isBlank()) return@mapNotNull null
+            val details = f.getOrNull(1).orEmpty()
+            val state = f.getOrNull(2).orEmpty()
+            // In the library a friend publishes LIBRARY_DETAILS and no second line.
+            val inLibrary = details == LIBRARY_DETAILS && state.isBlank()
+            // The serial is their cover's caption, as on ARMSX2. The second line is never one: it
+            // is the RetroAchievements line or remote play's, and reading it as a serial was why
+            // no friend ever had a cover here. Only a title id counts, so an older ARMSX3, which
+            // captions the cover with the game's name, shows no cover rather than a broken one.
+            val caption = f.getOrNull(4).orEmpty()
             DiscordFriend(
                 name = name,
-                game = f.getOrNull(1).orEmpty(),
-                serial = f.getOrNull(2).orEmpty(),
+                game = if (inLibrary) "" else details,
+                serial = TITLE_ID.matchEntire(caption)?.takeIf { !inLibrary }
+                    ?.let { it.groupValues[1] + it.groupValues[2] }.orEmpty(),
                 avatarUrl = f.getOrNull(3).orEmpty(),
             )
         }
@@ -523,7 +613,7 @@ object DiscordPresence {
             // pushPresence reads currentGame itself, so this only needs to know it changed. The
             // cover it sends is the same URL the library renders — Discord takes a URL, so there
             // is nothing to upload per game and a title with no published cover falls back.
-            snapshotFlow { MainActivityRuntime.currentGame.value }.collect { pushPresence() }
+            snapshotFlow { MainActivityRuntime.currentGame.value to remotePlay.value }.collect { pushPresence() }
         }
     }
 }

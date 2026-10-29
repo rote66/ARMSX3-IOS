@@ -169,6 +169,8 @@ fun HomeScreen(
     // The saved backgrounds to pick from (BackgroundSheet), and the one a long press asked to remove.
     var backgroundSheet by remember { mutableStateOf(false) }
     var removingBackground by remember { mutableStateOf<LibraryBackground.Saved?>(null) }
+    var themeInfo by remember { mutableStateOf(false) }
+    var screensaverDelay by remember { mutableStateOf(false) }
     // #9 custom library background — inert until the user picks an image.
     LaunchedEffect(Unit) {
         LibraryBackground.ensureLoaded()
@@ -227,6 +229,11 @@ fun HomeScreen(
         }
     }
     LaunchedEffect(directories, nativeReady) { viewModel.load(directories, nativeReady) }
+    // Back from another app, say one that turned an .iso into a .chd: rescan if the library's
+    // folders changed meanwhile. load() asks the same on the first start.
+    androidx.lifecycle.compose.LifecycleEventEffect(androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+        viewModel.checkForChanges()
+    }
     DisposableEffect(viewModel, onOpenMenu) {
         HomeInputController.bind(viewModel, onOpenMenu)
         onDispose { HomeInputController.unbind(viewModel) }
@@ -330,6 +337,9 @@ fun HomeScreen(
             // so normal browsing never followed the selector.)
             val allGamesHeaderShown = shownRecents.isNotEmpty() &&
                 state.initialized && state.visibleGames.isNotEmpty()
+            // The cover the pad is on, or none under touch: the index is 0 from the start, so the
+            // first cover wore the highlight whether or not a controller was ever used.
+            val gridSelected = if (com.armsx2.ui.common.PadInput.active.value) state.selectedIndex else -1
             LaunchedEffect(state.selectedIndex, state.visibleGames.size, state.layout, HomeInputController.zone.value) {
                 if (HomeInputController.zone.value != HomeZone.Grid) return@LaunchedEffect
                 // Don't follow (and thus don't scroll away from the top) until the user
@@ -383,11 +393,15 @@ fun HomeScreen(
                         { overflowMenu = true },
                     ),
                 )
-                val tb = HomeInputController.zone.value == HomeZone.Toolbar
+                // Highlights only while the pad drives the library: under touch the zones and the
+                // grid's index still exist (0 from the start), but nobody chose them.
+                val tb = HomeInputController.zone.value == HomeZone.Toolbar && com.armsx2.ui.common.PadInput.active.value
                 val tbi = HomeInputController.toolbarIndex.intValue
                 ArmsTopBar(
                     title = str("games.section.library"),
-                    subtitle = if (state.scanning) {
+                    // The firmware compile after setup first: until it ends the core reads no disc,
+                    // so titles and covers wait on it, and a scan says nothing about why.
+                    subtitle = com.armsx2.FirmwareCompile.progress.value?.let(com.armsx2.FirmwareCompile::headerLine) ?: if (state.scanning) {
                         str("games.scanningRoms")
                     } else {
                         "${str("games.library.totalGames")}: ${state.allGames.size}"
@@ -469,6 +483,8 @@ fun HomeScreen(
                                     // A picture an older version used in place, not copied in, is not ours to delete.
                                     LibraryBackground.current()?.let(LibraryBackground::remove) ?: LibraryBackground.useDefault()
                                 },
+                                onThemeInfo = { themeInfo = true },
+                                onScreensaverDelay = { screensaverDelay = true },
                                 onExitApp = { showExitConfirm = true },
                             )
                             if (showExitConfirm) {
@@ -547,13 +563,13 @@ fun HomeScreen(
                             onClick = { LibraryKeyboard.open(viewModel.state.value.query, viewModel::setQuery, searchPlaceholder) },
                             placeholder = searchPlaceholder,
                             modifier = Modifier.fillMaxWidth(),
-                            selected = HomeInputController.zone.value == HomeZone.Search,
+                            selected = HomeInputController.zone.value == HomeZone.Search && com.armsx2.ui.common.PadInput.active.value,
                         )
                     }
                 }
 
                 if (shownRecents.isNotEmpty()) {
-                    val recentsSelected = HomeInputController.zone.value == HomeZone.Recents
+                    val recentsSelected = HomeInputController.zone.value == HomeZone.Recents && com.armsx2.ui.common.PadInput.active.value
                     val recentSel = if (recentsSelected) HomeInputController.recentIndex.intValue else -1
                     item(span = { GridItemSpan(maxLineSpan) }) {
                         Column {
@@ -749,7 +765,7 @@ fun HomeScreen(
                             // Every row lays out on the same perShelf-slot grid, so a
                             // short last row keeps its covers packed left in sequence.
                             slotsPerRow = perShelf,
-                            selectedIndex = state.selectedIndex,
+                            selectedIndex = gridSelected,
                             startIndex = rowIndex * perShelf,
                             onLaunch = { viewModel.launch(it) },
                             onDetails = { menuGame = it },
@@ -776,7 +792,7 @@ fun HomeScreen(
                         if (state.layout == LibraryLayout.Grid) {
                             GameGridCard(
                                 game = game,
-                                selected = index == state.selectedIndex,
+                                selected = index == gridSelected,
                                 onSelect = { viewModel.setSelection(index) },
                                 onLaunch = { viewModel.launch(game) },
                                 onDetails = { menuGame = game },
@@ -784,7 +800,7 @@ fun HomeScreen(
                         } else {
                             GameListCard(
                                 game = game,
-                                selected = index == state.selectedIndex,
+                                selected = index == gridSelected,
                                 onClick = { viewModel.setSelection(index); viewModel.launch(game) },
                                 onDetails = { menuGame = game },
                             )
@@ -1006,8 +1022,11 @@ fun HomeScreen(
                 val addToHomeFailed = str("games.addToHome.unsupported")
                 GameMenuAction("📌", str("games.addToHome")) {
                     menuGame = null
-                    if (!com.armsx2.HomeShortcuts.pin(context, game))
-                        Toast.makeText(context, addToHomeFailed, Toast.LENGTH_LONG).show()
+                    // pin() fetches the cover first, normally from the library's image cache.
+                    backgroundScope.launch {
+                        if (!com.armsx2.HomeShortcuts.pin(context, game))
+                            Toast.makeText(context, addToHomeFailed, Toast.LENGTH_LONG).show()
+                    }
                 }
                 // Only offered when the game is actually in Recently Played — this drops
                 // just this one entry, unlike the library-wide "Show Recently Played" toggle.
@@ -1129,6 +1148,37 @@ fun HomeScreen(
             },
             dismissButton = {
                 TextButton(onClick = { removingBackground = null }) { Text(str("action.cancel")) }
+            },
+        )
+    }
+    if (themeInfo) {
+        AlertDialog(
+            onDismissRequest = { themeInfo = false },
+            title = { Text(str("games.background.themeInfo.title")) },
+            text = { Text(str("games.background.themeInfo.body")) },
+            confirmButton = {
+                TextButton(onClick = { themeInfo = false }) { Text(str("action.ok")) }
+            },
+        )
+    }
+    com.armsx2.FirmwareCompile.progress.value?.let { FirmwareCompileDialog(it) }
+    if (screensaverDelay) {
+        val minutesText = str("app.screensaver.minutes")
+        AlertDialog(
+            onDismissRequest = { screensaverDelay = false },
+            text = {
+                com.armsx2.ui.settings.IntSliderRow(
+                    label = str("app.screensaver.delay"),
+                    value = LibraryScreensaver.minutes.value,
+                    min = LibraryScreensaver.MIN_MINUTES,
+                    max = LibraryScreensaver.MAX_MINUTES,
+                    description = str("app.screensaver.delay.desc"),
+                    valueFormatter = { minutesText.format(it) },
+                    onChange = LibraryScreensaver::setMinutes,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { screensaverDelay = false }) { Text(str("action.ok")) }
             },
         )
     }
@@ -1455,6 +1505,8 @@ private fun LibraryOverflowMenu(
     onChangeBackground: () -> Unit,
     onViewBackground: () -> Unit,
     onRemoveBackground: () -> Unit,
+    onThemeInfo: () -> Unit,
+    onScreensaverDelay: () -> Unit,
     onExitApp: () -> Unit,
 ) {
     fun closeThen(action: () -> Unit) {
@@ -1489,6 +1541,29 @@ private fun LibraryOverflowMenu(
         if (hasCustomBackground) {
             LibraryOverflowItem("×", str("games.background.remove")) {
                 closeThen(onRemoveBackground)
+            }
+        }
+        // Always shown: nothing else in the app says a .p3t can be picked here, and the answer
+        // matters most before anyone has added one.
+        LibraryOverflowItem("ⓘ", str("games.background.themeInfo")) {
+            closeThen(onThemeInfo)
+        }
+        // The screensaver is this background full screen, so it lives with it. The delay opens a
+        // dialog rather than a slider in here, for the same reason as the categories sheet below.
+        LibraryOverflowItem(
+            glyph = "☾",
+            label = str("app.screensaver"),
+            trailing = if (LibraryScreensaver.enabled.value) str("common.on") else str("common.off"),
+        ) {
+            closeThen { LibraryScreensaver.setEnabled(!LibraryScreensaver.enabled.value) }
+        }
+        if (LibraryScreensaver.enabled.value) {
+            LibraryOverflowItem(
+                glyph = "⏱",
+                label = str("app.screensaver.delay"),
+                trailing = str("app.screensaver.minutes").format(LibraryScreensaver.minutes.value),
+            ) {
+                closeThen(onScreensaverDelay)
             }
         }
         OverflowSeparator()
@@ -2117,6 +2192,45 @@ private fun TrialBadge(modifier: Modifier = Modifier) {
     }
 }
 
+/**
+ * Over the library while the firmware compile that follows setup runs, with no way to close it.
+ *
+ * A game booted during the compile tore it down halfway: the compile thread never finished, its
+ * progress stayed on screen, and the compiler stayed wedged until the app restarted. Until it
+ * ends the core also reads no disc, so the library has no titles or covers to offer yet. It runs
+ * once (a minute or more, longer on older devices) and closes itself when the compile reports done
+ * or failed.
+ */
+@Composable
+private fun FirmwareCompileDialog(progress: com.armsx2.FirmwareCompile.Progress) {
+    AlertDialog(
+        onDismissRequest = {},
+        properties = androidx.compose.ui.window.DialogProperties(
+            dismissOnBackPress = false,
+            dismissOnClickOutside = false,
+        ),
+        title = { Text(str("games.compilingFirmware.title")) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(str("games.compilingFirmware.body"))
+                val fraction = progress.fraction
+                if (fraction != null) {
+                    androidx.compose.material3.LinearProgressIndicator(
+                        progress = { fraction },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                } else {
+                    androidx.compose.material3.LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+                progress.countText()?.let {
+                    Text(it, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        },
+        confirmButton = {},
+    )
+}
+
 @Composable
 private fun CoverPlaceholder(title: String, serial: String?, showText: Boolean) {
     Box(
@@ -2243,6 +2357,9 @@ object HomeInputController {
     fun move(dx: Int, dy: Int): Boolean {
         val viewModel = owner ?: return false
         userNavigated = true
+        // The press that switched from touch to the pad shows where the selection is: nothing was
+        // highlighted until now, so moving it would start from a spot nobody could see.
+        if (com.armsx2.ui.common.PadInput.justActivated) return true
         // Snapshot the highlight so we blip the nav sound only when it actually moves (not when a
         // press runs into an edge).
         val beforeZone = zone.value
@@ -2308,6 +2425,9 @@ object HomeInputController {
 
     fun confirm(): Boolean {
         val viewModel = owner ?: return false
+        // As in move(): a first press only shows the selection, so it cannot launch a game that
+        // was never highlighted.
+        if (com.armsx2.ui.common.PadInput.justActivated) return true
         com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.SELECT)
         when (zone.value) {
             HomeZone.Toolbar -> toolbarActions.getOrNull(toolbarIndex.intValue)?.invoke()

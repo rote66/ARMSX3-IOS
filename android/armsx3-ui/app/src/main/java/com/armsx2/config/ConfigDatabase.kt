@@ -131,6 +131,23 @@ object ConfigDatabase {
         "BLUS31213" to "Video:\n  Frame limit: PS3 Native\n",
         "BLES01935" to "Video:\n  Frame limit: PS3 Native\n",
 
+        // Tales of Graces f (issue #210): the database's PS3 Native holds the field at 30 but lets battle
+        // drop to 30 to 50 fps, where the PS3 holds 60, since a frame that misses its vblank by a little
+        // waits a whole extra one. At 60 battle holds 60, and the bundled "Field at 30 fps with a 60 fps
+        // limit" patch keeps the field at 30 and normal speed. Tied to the patch: without it the field
+        // runs at 60 and double speed here.
+        "BLUS30903" to "Video:\n  Frame limit: 60\n",
+
+        // J-Stars Victory VS+: Shader Precision High. On the Android default, Low, a battle draws
+        // nothing: the game keeps presenting at 50 fps with its music playing, but every frame is
+        // black, while the menus draw fine. Half-precision math in the battle's shaders is the
+        // difference; High draws the battle (BLUS31519, Odin 3, Turnip, 2026-10-24). EU (BLES02136)
+        // and JP (BLJS10257) run the same game, and High is the accurate setting, so it cannot hurt
+        // them. A Shader Precision set for the game itself still wins.
+        "BLUS31519" to "Video:\n  Shader Precision: High\n",
+        "BLES02136" to "Video:\n  Shader Precision: High\n",
+        "BLJS10257" to "Video:\n  Shader Precision: High\n",
+
         // Helldivers: the database forces the PPU interpreter because the recompiler hung it on a
         // black screen (RPCS3 issue #5831). The hang was LuaJIT's integer arithmetic on
         // mullwo./subfo. and bso, whose overflow flag the recompiler never set correctly; fixed in
@@ -157,6 +174,108 @@ object ConfigDatabase {
         // Pinned here, per title, so a global 3 cannot bring it back.
         "BCUS98234" to "Video:\n  Write Color Buffers: false\nCore:\n  Preferred SPU Threads: 0\n",
         "BCES01007" to "Video:\n  Write Color Buffers: false\nCore:\n  Preferred SPU Threads: 0\n",
+
+        // Spider-Man: Web of Shadows: Accurate SPU Reservations off.
+        //
+        // With it on, the SPURS kernel's own atomics on its control block (swap, compare-and-swap
+        // and decrement helpers at LS 0x0221c / 0x01e68 / 0x01f28, each changing one quadword)
+        // take vm::writer_lock about 550,000 times a second, and each one stops every PPU thread.
+        // Off, they take the SPURS shortcut and the one-quadword path from RPCS3 PR #19568: about
+        // 1,400 barriers a second, long writer_lock stalls down from 50-75 ms to 1.6 ms per second
+        // of play, and the game runs clearly smoother swinging through the city (Odin 3, 09-29).
+        //
+        // Off is off-spec and has broken other titles (see ConfigStore KEY_PERGAME_RSV_CLEARED), so
+        // it is this title only, and the per-game database toggle takes it back.
+        "BLUS30218" to "Core:\n  Accurate SPU Reservations: false\n",
+
+        // The Elder Scrolls V: Skyrim: Accurate SPU Reservations off, for the same reason as Web of
+        // Shadows.
+        //
+        // With it on, the SPURS kernel's stores to its control block (LS 0x011e4, 0x00660, 0x01238,
+        // 0x00c24) take vm::writer_lock about 380,000 times a second in busy scenes: 48 ms of PPU
+        // waits a second, single waits up to 36 ms. Off, about 21,000 a second, 18 ms, longest 7 ms,
+        // and the game plays normally from the title screen through a loaded save (Odin 3, 10-27).
+        // Measured on the US Legendary Edition. The original release (patched to 1.09) is the same
+        // engine build, so every release gets it.
+        "BLUS31202" to "Core:\n  Accurate SPU Reservations: false\n",
+        "BLES01885" to "Core:\n  Accurate SPU Reservations: false\n",
+        "BLES01886" to "Core:\n  Accurate SPU Reservations: false\n",
+        "BLUS30778" to "Core:\n  Accurate SPU Reservations: false\n",
+        "BLES01329" to "Core:\n  Accurate SPU Reservations: false\n",
+        "BLES01330" to "Core:\n  Accurate SPU Reservations: false\n",
+
+        // Blades of Time: SPU Cache off.
+        //
+        // When the game's saved SPU list is built at startup, its JobMgr#1 thread reads a null
+        // pointer 0.1 s after it starts (guest pc 0x002af630) and the emulator freezes. That is
+        // every boot after the first, since the first one writes the list. A boot that compiles
+        // SPU code as the game runs gets past it, with the PPU cache warm too (Odin 3, Turnip,
+        // 10-02). Off keeps every boot on that path; the cost is SPU compile stutter early in each
+        // session. The EU disc is the same game and was not tested on its own.
+        "BLUS30833" to "Core:\n  SPU Cache: false\n",
+        "BLES01395" to "Core:\n  SPU Cache: false\n",
+
+        // Grand Theft Auto IV: SPU XFloat Accuracy on Approximate instead of the database's Accurate.
+        //
+        // The database pins Accurate because Niko falls through the world on Approximate: the
+        // collision job seeds its searches with the SPU's largest float, which Approximate reads as
+        // a NaN. The bundled "ARMSX3 Approximate collision fix" (Ps3PatchRepo.BUNDLED, on by default
+        // for these three serials) seeds them with FLT_MAX instead, and with it the game stays on
+        // the ground on Approximate (Odin 3, 10-12). Accurate costs SPU time the game is short of.
+        //
+        // The patch finds the job by hash, taken from BLUS30682 v01.02, which is the same executable
+        // as BLUS30127 / NPUB30702 v01.08. A version without the update may carry a different job,
+        // and there Approximate drops Niko through the world again; the per-game database toggle
+        // takes this back. Tied to the patch: anyone who turns the patch off needs Accurate back.
+        "BLUS30682" to "Core:\n  SPU XFloat Accuracy: Approximate\n",
+        "BLUS30127" to "Core:\n  SPU XFloat Accuracy: Approximate\n",
+        "NPUB30702" to "Core:\n  SPU XFloat Accuracy: Approximate\n",
+
+        // 3D Dot Game Heroes: PPU Event Wake-Up Delay 35 us (upstream yahfz #19824, RPCS3 issue #4433).
+        //
+        // An SPU signals the PPU through an event queue when a SPURS task is done, and the PPU can
+        // wake and free the task's context before the SPU has finished saving it; the late save
+        // corrupts the heap and the next malloc crashes. The delay holds the woken PPU back for this
+        // long. yahfz found 25 us on his PC; a tester (nassau-tk, Retroid Pocket 6) plays at 35 with
+        // no freeze, 10-25, so ARMSX3 uses 35. Off (0) for every other game. Installs that cached 25
+        // get this appended after it at the next start (applyLocalOverrides), and the last one wins.
+        "BLUS30490" to "Core:\n  PPU Event Wake-Up Delay: 35\n",
+        "BLES00875" to "Core:\n  PPU Event Wake-Up Delay: 35\n",
+        "BLJM60180" to "Core:\n  PPU Event Wake-Up Delay: 35\n",
+        "BLUD80019" to "Core:\n  PPU Event Wake-Up Delay: 35\n",
+
+        // Blitz: The League II: SPU MMIO Delay on at 300 us (upstream elad335 #19851, RPCS3 issue
+        // #11529), Pause Game During SPU Compilation, and a 3072 MB VRAM allocation limit.
+        //
+        // The game runs its jobs on three raw SPUs, which park themselves after a set number of idle
+        // passes; that is what stalled the data install and froze matches, and the bundled "ARMSX3
+        // raw SPU park fix" patch (canary_patches.yml) keeps them running. The delay holds the PPU
+        // back after every mailbox write, as RPCS3 needs for this game; Elad's 100 us is enough on his
+        // PC, 300 is what a ROG Ally X player needed and what the Odin 3 runs. The pause hides
+        // on-demand SPU compiles from the game; with it a cold install went through on the first try
+        // (10-19), before the park fix existed, so it may no longer be needed.
+        //
+        // A match load peaks at about 2.2 GB of video memory here (ring buffers ~1.1 GB, texture cache
+        // ~0.9 GB; Odin 3, 10-19), past the 2048 MB cap phones get, and the RSX thread died on it;
+        // 3072 MB holds it with about 870 MB to spare. This title only: the cap exists because video
+        // memory is the phone's RAM. All of this is off for every other game: in Sonic '06 the delay
+        // alone halves the frame rate (Odin 3, 10-14). The EU disc is the same game and was not tested.
+        "BLUS30203" to "Core:\n  SPU MMIO Delay Enabled: true\n  SPU MMIO Delay: 300\n  Pause Game During SPU Compilation: true\nVideo:\n  Vulkan:\n    VRAM allocation limit (MB): 3072\n",
+        "BLES00397" to "Core:\n  SPU MMIO Delay Enabled: true\n  SPU MMIO Delay: 300\n  Pause Game During SPU Compilation: true\nVideo:\n  Vulkan:\n    VRAM allocation limit (MB): 3072\n",
+        // Sonic Generations: MFC command shuffling at 1, upstream's "Delay Each Odd MFC Command"
+        // (elad335, RPCS3 #19873 + #19891: "stable and graphics are good with the MFC option").
+        // Without it the RSDX job system stops an SPU with STOP 0 after a while (RPCS3 issue #13072).
+        // Retail US/EU, the EU PSN release and the six demos. Off for every other game.
+        "BLUS30612" to "Core:\n  MFC Commands Shuffling Limit: 1\n",
+        "BLES01236" to "Core:\n  MFC Commands Shuffling Limit: 1\n",
+        "NPEB00813" to "Core:\n  MFC Commands Shuffling Limit: 1\n",
+        "NPEB90337" to "Core:\n  MFC Commands Shuffling Limit: 1\n",
+        "NPEB90343" to "Core:\n  MFC Commands Shuffling Limit: 1\n",
+        "NPHB00369" to "Core:\n  MFC Commands Shuffling Limit: 1\n",
+        "NPHB00446" to "Core:\n  MFC Commands Shuffling Limit: 1\n",
+        "NPUB90567" to "Core:\n  MFC Commands Shuffling Limit: 1\n",
+        "NPUB90604" to "Core:\n  MFC Commands Shuffling Limit: 1\n",
+
     )
 
     /**

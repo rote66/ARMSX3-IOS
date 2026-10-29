@@ -38,6 +38,9 @@ struct cfg_root : cfg::node
 		cfg::_enum<spu_block_size_type> spu_block_size{ this, "SPU Block Size", spu_block_size_type::safe };
 		cfg::_bool spu_accurate_dma{ this, "Accurate SPU DMA", false };
 		cfg::_bool spu_accurate_reservations{ this, "Accurate SPU Reservations", true };
+		cfg::_bool spu_mmio_delay_enabled{ this, "SPU MMIO Delay Enabled", false, true};
+		cfg::uint<3, 1000> spu_mmio_delay{ this, "SPU MMIO Delay", 100, true };
+		cfg::_bool spu_compile_pause{ this, "Pause Game During SPU Compilation", false, true }; // ARMSX3: hide on-demand SPU compiles from the guest (Blitz: The League II)
 		cfg::_bool accurate_cache_line_stores{ this, "Accurate Cache Line Stores", false };
 		cfg::_bool rsx_accurate_res_access{this, "Accurate RSX reservation access", false, true};
 		cfg::_bool ppu_reservation_priority_over_spu{this, "PPU Reservation Priority Over SPUs", false, true};
@@ -59,7 +62,7 @@ struct cfg_root : cfg::node
 		cfg::_bool spu_prof{ this, "SPU Profiler", false };
 		cfg::_bool ppu_prof{ this, "PPU Profiler", false };
 		cfg::uint<0, 16> mfc_transfers_shuffling{ this, "MFC Commands Shuffling Limit", 0 };
-		cfg::uint<0, 10000> mfc_transfers_timeout{ this, "MFC Commands Timeout", 0, true };
+		cfg::uint<5, 400> mfc_shuffling_instructions{ this, "MFC Shuffle Instructions Decrementer", 30, true };
 		cfg::_bool mfc_shuffling_in_steps{ this, "MFC Commands Shuffling In Steps", false, true };
 		cfg::_enum<xfloat_accuracy> spu_xfloat_accuracy{ this, "SPU XFloat Accuracy", xfloat_accuracy::approximate, false };
 		cfg::_int<-1, 14> ppu_128_reservations_loop_max_length{ this, "Accurate PPU 128-byte Reservation Op Max Length", 0, true }; // -1: Always accurate, 0: Never accurate, 1-14: max accurate loop length
@@ -83,6 +86,7 @@ struct cfg_root : cfg::node
 		cfg::uint<0, 3000> spu_wakeup_delay{ this, "SPU Wake-Up Delay", 0, true };
 		cfg::uint<0, (1 << 6) - 1> spu_wakeup_delay_mask{ this, "SPU Wake-Up Delay Thread Mask", (1 << 6) - 1, true };
 		cfg::uint<0, 400> max_cpu_preempt_count_per_frame{ this, "Max CPU Preempt Count", 0, true };
+		cfg::uint<0, 200> ppu_event_wakeup_delay{ this, "PPU Event Wake-Up Delay", 0, true };
 		cfg::_bool allow_rsx_cpu_preempt{ this, "Allow RSX CPU Preemptions", true, true };
 #if defined (__linux__) || defined (__APPLE__)
 		cfg::_enum<sleep_timers_accuracy_level> sleep_timers_accuracy{ this, "Sleep Timers Accuracy", sleep_timers_accuracy_level::_as_host, true };
@@ -106,6 +110,8 @@ struct cfg_root : cfg::node
 		cfg::_bool limit_cache_size{ this, "Limit disk cache size", false };
 		cfg::_int<0, 10240> cache_max_size{ this, "Disk cache maximum size (MB)", 5120 };
 		cfg::_bool empty_hdd0_tmp{ this, "Empty /dev_hdd0/tmp/", true };
+		cfg::_bool emulate_hdd_speed{ this, "Emulate HDD Read Speed", false, true };
+		cfg::_bool emulate_bdvd_speed{ this, "Emulate BD-ROM Read Speed", false, true };
 
 	} vfs{ this };
 
@@ -125,7 +131,17 @@ struct cfg_root : cfg::node
 		cfg::_float<0, 1000> second_frame_limit{ this, "Second Frame Limit", 0, true }; // 0 disables its effect
 		cfg::_enum<msaa_level> antialiasing_level{ this, "MSAA", msaa_level::_auto };
 		cfg::_enum<shader_mode> shadermode{ this, "Shader Mode", shader_mode::async_with_interpreter };
-		cfg::_enum<gpu_preset_level> shader_precision{ this, "Shader Precision", gpu_preset_level::high };
+		// Low on Android. Phone GPUs run fp16 at up to twice the fp32 rate, and Low is what lets the
+		// PS3's half-precision shader math use it. It used to also run math the RSX does at full
+		// precision in half, which overflowed (Metal Gear Solid V's flat sky); since the fragment
+		// decompiler keeps that math in fp32, Low costs nothing in correctness where it counts.
+		cfg::_enum<gpu_preset_level> shader_precision{ this, "Shader Precision",
+#ifdef __ANDROID__
+			gpu_preset_level::low
+#else
+			gpu_preset_level::high
+#endif
+		};
 		cfg::_enum<vsync_mode> vsync{ this, "VSync Mode", vsync_mode::off, true };
 
 		cfg::_bool write_color_buffers{ this, "Write Color Buffers" };
@@ -153,6 +169,7 @@ struct cfg_root : cfg::node
 		cfg::_bool disable_vertex_cache{ this, "Disable Vertex Cache", false };
 		cfg::_bool disable_FIFO_reordering{ this, "Disable FIFO Reordering", false };
 		cfg::_bool emulate_depth_compare{ this, "Emulate Special Depth Comparison", false };
+		cfg::_bool emulate_extended_depth_range{ this, "Emulate Extended Depth Range", false };
 		cfg::_bool frame_skip_enabled{ this, "Enable Frame Skip", false, true };
 		cfg::_bool force_cpu_blit_processing{ this, "Force CPU Blit", false, true }; // Debugging option
 		cfg::_bool disable_on_disk_shader_cache{ this, "Disable On-Disk Shader Cache", false };
@@ -447,8 +464,18 @@ struct cfg_root : cfg::node
 		cfg::_bool prevent_display_sleep{ this, "Prevent display sleep while running games", true, true };
 		cfg::_bool show_trophy_popups{ this, "Show trophy popups", true, true };
 		cfg::_bool show_rpcn_popups{ this, "Show RPCN popups", true, true };
-		cfg::_bool show_shader_compilation_hint{ this, "Show shader compilation hint", false, true };
+		// On by default on Android: a phone compiles shaders far slower than a PC, and without the
+		// hint a first-run stutter reads as the emulator being slow.
+		cfg::_bool show_shader_compilation_hint{ this, "Show shader compilation hint",
+#ifdef __ANDROID__
+			true,
+#else
+			false,
+#endif
+			true };
 		cfg::_bool show_ppu_compilation_hint{ this, "Show PPU compilation hint", true, true };
+		// SPU code compiled on demand during play, the first time a game runs it.
+		cfg::_bool show_spu_compilation_hint{ this, "Show SPU compilation hint", true, true };
 		cfg::_bool show_autosave_autoload_hint{ this, "Show autosave/autoload hint", false, true };
 		cfg::_bool show_pressure_intensity_toggle_hint{ this, "Show pressure intensity toggle hint", true, true };
 		cfg::_bool show_analog_limiter_toggle_hint{ this, "Show analog limiter toggle hint", true, true };

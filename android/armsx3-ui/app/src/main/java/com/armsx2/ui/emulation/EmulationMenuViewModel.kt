@@ -155,7 +155,7 @@ class EmulationMenuViewModel(application: Application) : AndroidViewModel(applic
             EmulationMenuTab.Fixes -> Unit
             EmulationMenuTab.Performance -> when (state.value.selectedAction) {
                 0 -> updateSettings { it.copy(frameLimitEnable = !it.frameLimitEnable) }
-                1 -> setSpeed(it = state.value.settings.nominalSpeedPercent + 5)
+                1 -> setSpeed(it = state.value.settings.ps3.clocksScale + 5)
                 2 -> setFrameSkip((state.value.settings.frameSkip + 1) % 6)
             }
             EmulationMenuTab.Controls -> when (state.value.selectedAction) {
@@ -216,6 +216,8 @@ class EmulationMenuViewModel(application: Application) : AndroidViewModel(applic
 
     fun openSkins() = com.armsx2.ui.WindowImpl.openInGameScreen(com.armsx2.ui.InGameScreen.Skins)
 
+    fun openHotkeys() = com.armsx2.ui.WindowImpl.openInGameScreen(com.armsx2.ui.InGameScreen.Hotkeys)
+
     fun saveState() {
         MainActivityRuntime.instance?.saveState()
     }
@@ -274,7 +276,8 @@ class EmulationMenuViewModel(application: Application) : AndroidViewModel(applic
 
     fun setEeCycleSkip(value: Int) = updateSettings { it.copy(eeCycleSkip = value.coerceIn(0, 3)) }
 
-    fun setSpeed(it: Int) = updateSettings { settings -> settings.copy(nominalSpeedPercent = it.coerceIn(50, 200)) }
+    /** The Speed Limit % row: Emulated Clock Speed (Core@@Clocks scale), on the next boot. */
+    fun setSpeed(it: Int) = updateSettings { settings -> settings.copy(ps3 = settings.ps3.copy(clocksScale = it.coerceIn(10, 300))) }
 
     fun setFpsLimit(value: Int) = updateSettings { it.copy(fpsLimit = value.coerceIn(-1, 240)) } // -1 = PS3 native pacing
 
@@ -425,6 +428,10 @@ object EmulationMenuInputController {
     // is on top visually, so it has to be on top for input too.
     var overlayDismiss: (() -> Unit)? = null
 
+    // Set with overlayDismiss by a panel that scrolls (the toy portals): Up or Down with no control
+    // left that way scrolls it to that end instead, so the lines under the last control can be read
+    var overlayEdgeScroll: ((Int) -> Unit)? = null
+
     fun bind(viewModel: EmulationMenuViewModel) {
         owner = viewModel
         viewModel.load(pendingTab)
@@ -458,7 +465,7 @@ object EmulationMenuInputController {
         // A panel is over the menu: everything is registry nav, there is no tab column to walk.
         if (overlayDismiss != null) {
             when {
-                dy != 0 -> nav.moveSpatial(0, dy)
+                dy != 0 -> if (!nav.moveSpatial(0, dy)) overlayEdgeScroll?.invoke(dy)
                 dx != 0 -> if (!nav.adjust(dx)) nav.moveSpatial(dx, 0)
             }
             return true

@@ -213,8 +213,13 @@ PPU-ed460e668a491f5e39f6547f3a24c2f20e2cb39b:
     Patch:
       - [ be32, 0x005f7128, 0x4082fff4 ]
 
+# Into the Nexus v01.01 is named apart from the Artemis collection's "Freeze fix" for this same
+# executable. That one is the identical change (Juhn, 0x005f8ca8) but lists NPUA80908 alone at
+# Patch Version 1.2, and the loader keeps only the higher version of one hash and name, so with
+# Artemis installed it replaced this entry and the other four versions ran with no fix at all.
+# For NPUA80908 both can now apply; they write the same word.
 PPU-fadb0af6fb7bd0113e88fb9af3eb78fe3be05d08:
-  "Freeze fix":
+  "Freeze fix (all regions)":
     Games:
       "Ratchet & Clank: Into the Nexus":
         BCUS99245: [ 01.01 ]
@@ -390,9 +395,13 @@ PPU-30ce8c9f0a9552914275c90e2980749630f3ea18:
 # any more (patch_engine::apply, Utilities/bin_patch.cpp).
 # Disable Motion Blur: without it replays and track intros render black.
 #
-# Keyed by PPU hash, so they apply only to these two v01.22 executables. RPCS3's database knows a
-# different v01.22 executable for BCUS98296 (PPU-6ac472e1...): these patches do not touch it, and
-# neither do the buffer settings, which stay whatever that game's configuration says.
+# Keyed by PPU hash, so they apply only to the executables listed: every GT6 v01.22 executable we
+# know of. They share one layout, since RPCS3's database patches the six it knows at the same
+# addresses. mlgprorektm8 confirmed these on PPU-4f1e9acd... (BCUS98296) and PPU-42367707...
+# (BCUS99247). A tester confirmed them on PPU-6ac472e1..., the BCUS98296 executable RPCS3's
+# database lists. With MLAA on, his game fell to 1 fps a few minutes in and wedged: the RSX waited a
+# full second every frame on a label nothing cleared, the same wedge Soulcalibur V has without its
+# own Disable MLAA. The other five from that database are here on the strength of the shared layout.
 PPU-42367707f4caac2668f10cb46498f64bde9db440:
   "Disable MLAA":
     Games:
@@ -432,3 +441,478 @@ PPU-4f1e9acd7d98961b4b742fb324a2faba6212ea67:
     Patch Version: 1.0
     Patch:
       - [ be32, 0x008C2B4C, 0x38600000 ]
+
+PPU-6ac472e1f334f54ec4753cde9e8e1515bfab4d17:
+  "Disable MLAA":
+    Games:
+      "Gran Turismo 6":
+        BCUS98296: [ 01.22 ]
+    Author: "illusion"
+    Notes: "Turns off the game's MLAA pass, which needed Write and Read Color Buffers. ARMSX3 turns both off while this patch is on."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x00ED2E88, 0x39E00001 ]
+  "Disable Motion Blur":
+    Games:
+      "Gran Turismo 6":
+        BCUS98296: [ 01.22 ]
+    Author: "illusion"
+    Notes: "Fixes the black screen in replays and track intros."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x008C2B4C, 0x38600000 ]
+
+PPU-638ef307e2b35d593f599efec0dc0c37059a984b:
+  "Disable MLAA":
+    Games:
+      "Gran Turismo 6":
+        BCES01893: [ 01.22 ]
+    Author: "illusion"
+    Notes: "Turns off the game's MLAA pass, which needed Write and Read Color Buffers. ARMSX3 turns both off while this patch is on."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x00ED2E88, 0x39E00001 ]
+  "Disable Motion Blur":
+    Games:
+      "Gran Turismo 6":
+        BCES01893: [ 01.22 ]
+    Author: "illusion"
+    Notes: "Fixes the black screen in replays and track intros."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x008C2B4C, 0x38600000 ]
+
+PPU-80f0d67b29d3d17ac885a309a3fc4cd8dcf50658:
+  "Disable MLAA":
+    Games:
+      "Gran Turismo 6":
+        NPEA00502: [ 01.22 ]
+    Author: "illusion"
+    Notes: "Turns off the game's MLAA pass, which needed Write and Read Color Buffers. ARMSX3 turns both off while this patch is on."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x00ED2E88, 0x39E00001 ]
+  "Disable Motion Blur":
+    Games:
+      "Gran Turismo 6":
+        NPEA00502: [ 01.22 ]
+    Author: "illusion"
+    Notes: "Fixes the black screen in replays and track intros."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x008C2B4C, 0x38600000 ]
+
+PPU-4213aba5ed17f7e3cd3f299fa44d9d9acef0ba18:
+  "Disable MLAA":
+    Games:
+      "Gran Turismo 6":
+        NPUA81049: [ 01.22 ]
+    Author: "illusion"
+    Notes: "Turns off the game's MLAA pass, which needed Write and Read Color Buffers. ARMSX3 turns both off while this patch is on."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x00ED2E88, 0x39E00001 ]
+  "Disable Motion Blur":
+    Games:
+      "Gran Turismo 6":
+        NPUA81049: [ 01.22 ]
+    Author: "illusion"
+    Notes: "Fixes the black screen in replays and track intros."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x008C2B4C, 0x38600000 ]
+
+PPU-6a7de7fdfd7e7cbd1031bf28a7104b29c308136c:
+  "Disable MLAA":
+    Games:
+      "Gran Turismo 6":
+        NPHA80269: [ 01.22 ]
+    Author: "illusion"
+    Notes: "Turns off the game's MLAA pass, which needed Write and Read Color Buffers. ARMSX3 turns both off while this patch is on."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x00ED2E88, 0x39E00001 ]
+  "Disable Motion Blur":
+    Games:
+      "Gran Turismo 6":
+        NPHA80269: [ 01.22 ]
+    Author: "illusion"
+    Notes: "Fixes the black screen in replays and track intros."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x008C2B4C, 0x38600000 ]
+
+PPU-43e618448eed82aa96856338d072f1e4978c36a8:
+  "Disable MLAA":
+    Games:
+      "Gran Turismo 6":
+        NPJA00113: [ 01.22 ]
+    Author: "illusion"
+    Notes: "Turns off the game's MLAA pass, which needed Write and Read Color Buffers. ARMSX3 turns both off while this patch is on."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x00ED2E88, 0x39E00001 ]
+  "Disable Motion Blur":
+    Games:
+      "Gran Turismo 6":
+        NPJA00113: [ 01.22 ]
+    Author: "illusion"
+    Notes: "Fixes the black screen in replays and track intros."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x008C2B4C, 0x38600000 ]
+
+# SPLATTERHOUSE, BLUS30335 and BLES01120 (one executable) -- ours. Crash a few seconds into a
+# phase, "Access violation reading location 0x11e" on main_thread, the same as RPCS3 #5837 in
+# 2019; upstream lists the title as Ingame.
+#
+# The game hands work to the SPUs through 8 type-0 job slots (0x1597e80, 0x180 bytes each,
+# state halfword at +0x11c: 0 free, 1 taken, 6 finished). The allocator at 0x6c7758 walks
+# them and, when all 8 are still in flight, reaches 0x6c7860 (li r31,0) and returns NULL;
+# every caller hands that NULL to the job-fill function, which reads +0x11e from it. A slot
+# only comes back after the main thread's own dispatcher (0x6c67c0) polls the SPU channels
+# and marks it 6, so when a phase starts and the jobs queue faster than they retire, the
+# 9th request crashes. On a PS3 the slots evidently never run out.
+#
+# The cave at 0x6c7860 does what the game would have done a moment later: drops the slot
+# lock, runs that dispatcher (polls, recycles finished slots, starts queued jobs), sleeps
+# 100us and searches again. It keeps the original NULL for the allocator's cleanup pass
+# (second argument != 0), for type-1 requests, for a call made from inside the dispatcher
+# (its lock depth at ctx+0x250 is non-zero) and, after 5000 tries, for good. Tested on an
+# Odin 3: the crash every time before, well past it after.
+#
+# Needs 425d0680e (the arm64 far-jump stub): without it every calloc/jump/jumpl in any
+# patch dies at fault 0x475.
+PPU-0e747cbf4d807d363b085d983fff749c2c9cbdee:
+  "ARMSX3 phase start crash fix":
+    Games:
+      "Splatterhouse":
+        BLUS30335: [ All ]
+        BLES01120: [ All ]
+    Author: "jpolo1224"
+    Notes: "Fixes the crash a few seconds after a new phase starts."
+    Patch Version: 1.0
+    Patch:
+      - [ calloc, 0x006c7860, 0x25 ]
+      - [ be32, 0x00000000, 0x40920090 ] # bne cr4,null: a cleanup pass, keep the original
+      - [ be32, 0x00000000, 0x2f9b0000 ] # cmpwi cr7,r27,0
+      - [ be32, 0x00000000, 0x409e0088 ] # bne cr7,null: a type-1 request, keep the original
+      - [ be32, 0x00000000, 0x3d200158 ] # lis r9,0x158
+      - [ be32, 0x00000000, 0x80697e00 ] # lwz r3,0x7e00(r9): the job context
+      - [ be32, 0x00000000, 0x2f830000 ] # cmpwi cr7,r3,0
+      - [ be32, 0x00000000, 0x419e0078 ] # beq cr7,null: no context yet
+      - [ be32, 0x00000000, 0x80030250 ] # lwz r0,0x250(r3): dispatcher lock depth
+      - [ be32, 0x00000000, 0x2f800000 ] # cmpwi cr7,r0,0
+      - [ be32, 0x00000000, 0x409e006c ] # bne cr7,null: already inside the dispatcher
+      - [ be32, 0x00000000, 0x7b390002 ] # rotldi r25,r25,32: retry count in the high half
+      - [ be32, 0x00000000, 0x3b390001 ] # addi r25,r25,1
+      - [ be32, 0x00000000, 0x2b991388 ] # cmplwi cr7,r25,5000
+      - [ be32, 0x00000000, 0x7b390002 ] # rotldi r25,r25,32: slot count back in the low half
+      - [ be32, 0x00000000, 0x419d0058 ] # bgt cr7,null: give up the original way
+      - [ be32, 0x00000000, 0x813a3c20 ] # lwz r9,0x3c20(r26)
+      - [ be32, 0x00000000, 0x3929ffff ] # addi r9,r9,-1
+      - [ be32, 0x00000000, 0x913a3c20 ] # stw r9,0x3c20(r26)
+      - [ be32, 0x00000000, 0x7f83e378 ] # mr r3,r28
+      - [ jumpl, 0x00000000, 0x010acb98 ] # sys_lwmutex_unlock(slot lock)
+      - [ be32, 0x00000000, 0x3d200158 ] # lis r9,0x158
+      - [ be32, 0x00000000, 0x80697e00 ] # lwz r3,0x7e00(r9)
+      - [ be32, 0x00000000, 0x78630020 ] # clrldi r3,r3,32
+      - [ jumpl, 0x00000000, 0x006c67c0 ] # the game's dispatcher: polls the SPUs, recycles finished slots, starts queued jobs
+      - [ be32, 0x00000000, 0x38600064 ] # li r3,100
+      - [ be32, 0x00000000, 0x3960008d ] # li r11,141
+      - [ be32, 0x00000000, 0x44000002 ] # sc: sys_timer_usleep(100)
+      - [ be32, 0x00000000, 0x7f83e378 ] # mr r3,r28
+      - [ be32, 0x00000000, 0x38800000 ] # li r4,0
+      - [ jumpl, 0x00000000, 0x010acb60 ] # sys_lwmutex_lock(slot lock, 0)
+      - [ be32, 0x00000000, 0x813a3c20 ] # lwz r9,0x3c20(r26)
+      - [ be32, 0x00000000, 0x39290001 ] # addi r9,r9,1
+      - [ be32, 0x00000000, 0x913a3c20 ] # stw r9,0x3c20(r26)
+      - [ be32, 0x00000000, 0x7f5dd378 ] # mr r29,r26: back to the first slot
+      - [ be32, 0x00000000, 0x3bc00000 ] # li r30,0
+      - [ jump, 0x00000000, 0x006c77f8 ] # search again
+      - [ be32, 0x00000000, 0x3be00000 ] # null: li r31,0, the instruction this replaced; then back to 0x6c7864
+
+# GRAND THEFT AUTO IV, BLUS30682 v01.02 (Complete Edition) and the same executable sold as
+# BLUS30127 / NPUB30702 v01.08 -- ours. With SPU XFloat Accuracy on Approximate, Niko falls
+# through floors, roads and cars; RPCS3's database pins the game to Accurate for that, which
+# costs a lot of SPU time. With this patch on, ConfigDatabase.LOCAL_OVERRIDES puts these three
+# serials back on Approximate.
+#
+# The collision job SpuCollide_psn_final.task.elf starts its searches with "max distance"
+# set to 0x7FFFFFFF, the SPU's largest float (~6.8e38; the SPU has no NaN or infinity). On
+# Approximate that bit pattern is a NaN, so the search's first "still converging?" test,
+# (prev - dist) > prev * 1e-6 with prev = max (LS 0xea28..0xea54), comes out false and it
+# stops before it finds the ground. 0x7F7FFFFF (FLT_MAX) gives every test in the job the
+# same answer and is a number on both. All 14 places build the value with ilhu 0x7fff +
+# iohl 0xffff; this changes the ilhu half. None is a bit mask: every AND they meet is with
+# the xyz mask at LS 0x1d890. numeric_limits<float>::max() in .data (LS 0x1dc18) must NOT be
+# changed: lowest() is compared bit for bit against 0xffffffff "unset" fill.
+#
+# Harmless on Accurate, where both values are finite. On the Complete Edition the two
+# Episodes from Liberty City run inside this same executable as add-on content (ELC/DLC1,
+# ELC/DLC2): a Ballad of Gay Tony boot loaded the same SpuCollide and took all 14 lines. The
+# standalone Episodes from Liberty City disc is a different executable and is not covered.
+#
+# Offsets are LS addresses: apply_modification subtracts p_vaddr (0x3000).
+# Ps3PatchRepo.BUNDLED must list this, or it is imported but never enabled.
+SPU-d0a1508208613e2184fbd64906d34d5f07890033:
+  "ARMSX3 Approximate collision fix":
+    Games:
+      "Grand Theft Auto IV":
+        BLUS30682: [ All ]
+        BLUS30127: [ All ]
+        NPUB30702: [ All ]
+    Author: "jpolo1224"
+    Notes: "Lets the game run with SPU XFloat Accuracy on Approximate without falling through the world."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x0c4f4, 0x413fbfd4 ] # ilhu r84,0x7f7f (was 0x413fffd4): FLT_MAX instead of SPU max
+      - [ be32, 0x0e3b0, 0x413fbf90 ] # ilhu r16,0x7f7f (was 0x413fff90): FLT_MAX instead of SPU max
+      - [ be32, 0x0eca0, 0x413fbfa3 ] # ilhu r35,0x7f7f (was 0x413fffa3): FLT_MAX instead of SPU max
+      - [ be32, 0x0f630, 0x413fbf82 ] # ilhu r2,0x7f7f (was 0x413fff82): FLT_MAX instead of SPU max
+      - [ be32, 0x0fa38, 0x413fbf91 ] # ilhu r17,0x7f7f (was 0x413fff91): FLT_MAX instead of SPU max
+      - [ be32, 0x10e30, 0x413fbf9b ] # ilhu r27,0x7f7f (was 0x413fff9b): FLT_MAX instead of SPU max
+      - [ be32, 0x11470, 0x413fbfde ] # ilhu r94,0x7f7f (was 0x413fffde): FLT_MAX instead of SPU max
+      - [ be32, 0x11508, 0x413fbfc4 ] # ilhu r68,0x7f7f (was 0x413fffc4): FLT_MAX instead of SPU max
+      - [ be32, 0x154b0, 0x413fbfbc ] # ilhu r60,0x7f7f (was 0x413fffbc): FLT_MAX instead of SPU max
+      - [ be32, 0x15528, 0x413fbfb2 ] # ilhu r50,0x7f7f (was 0x413fffb2): FLT_MAX instead of SPU max
+      - [ be32, 0x157a0, 0x413fbfcb ] # ilhu r75,0x7f7f (was 0x413fffcb): FLT_MAX instead of SPU max
+      - [ be32, 0x158d8, 0x413fbfa0 ] # ilhu r32,0x7f7f (was 0x413fffa0): FLT_MAX instead of SPU max
+      - [ be32, 0x17098, 0x413fbfbd ] # ilhu r61,0x7f7f (was 0x413fffbd): FLT_MAX instead of SPU max
+      - [ be32, 0x175f8, 0x413fbfcf ] # ilhu r79,0x7f7f (was 0x413fffcf): FLT_MAX instead of SPU max
+
+# THE IDOLM@STER 2, NPJB00337 v01.00 -- ours. Crash as the boot screen gives way to the logo,
+# "Access violation reading location 0x0" on NU::Draw::RequestManager (0x44ba8c). About one boot
+# in four at default settings and every boot with PPU Threads 1; the PPU interpreter only hid it
+# by being slower, it crashes there too with PPU Threads 1.
+#
+# Each frame the main thread's frame sync (0x42bd48) swaps the draw lists and wakes the draw
+# thread (KickDraw, 0x435384) to turn last frame's list into RSX commands, then goes straight on
+# to the frame's update. A draw request (vtable 0x648428) holds plain pointers to the objects it
+# draws and takes no reference, and the update is where a scene change releases its objects
+# (count at +4, Release 0x42d864). On a PS3 the draw thread starts on the other hardware thread at
+# once and is long done with the list before the update gets that far. Here the update can win: a
+# write watch on the object saw the main thread drop its count to 0 and free it 1.4 ms before the
+# draw thread called through it.
+#
+# KickDraw now waits for the draw thread to finish that list before it returns, with the game's
+# own WaitDrawIdle (0x435354, which the blocking frame sync at 0x42bee8 already calls before its
+# flip). The twelve words fit KickDraw exactly: set the draw event to 1 as before, then tail-call
+# WaitDrawIdle. Only the two frame syncs call KickDraw, on the main thread with no lock held, and
+# the draw thread clears the event as soon as the list is done, before it waits for the flip, so
+# the wait cannot deadlock. It costs the main thread one list's worth of draw thread time per
+# frame (about 0.2 ms on the logo screen).
+#
+# Tested on an Odin 3: with PPU Threads 1 the crash came on 8 of 8 boots before and 0 of 6 after;
+# 3 of 3 boots at default settings reached the title screen. The tester's crash log is the same
+# executable. Ps3PatchRepo.BUNDLED must list this, or it is imported but never enabled.
+PPU-f942422316f63af3d64dc940b35ec8fddade0f44:
+  "ARMSX3 boot crash fix":
+    Games:
+      "THE IDOLM@STER 2":
+        NPJB00337: [ 01.00 ]
+    Author: "jpolo1224"
+    Notes: "Fixes the crash when the boot screen changes to the logo."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x00435384, 0x7c0802a6 ] # mflr r0
+      - [ be32, 0x00435388, 0xf8010010 ] # std r0,0x10(r1)
+      - [ be32, 0x0043538c, 0xf821ff81 ] # stdu r1,-0x80(r1)
+      - [ be32, 0x00435390, 0xf8610070 ] # std r3,0x70(r1): the request manager
+      - [ be32, 0x00435394, 0x38630068 ] # addi r3,r3,0x68: its draw event
+      - [ be32, 0x00435398, 0x38800001 ] # li r4,1
+      - [ be32, 0x0043539c, 0x4bffa939 ] # bl 0x42fcd4: set the event to 1, wakes the draw thread (as before)
+      - [ be32, 0x004353a0, 0xe8610070 ] # ld r3,0x70(r1)
+      - [ be32, 0x004353a4, 0x38210080 ] # addi r1,r1,0x80
+      - [ be32, 0x004353a8, 0xe8010010 ] # ld r0,0x10(r1)
+      - [ be32, 0x004353ac, 0x7c0803a6 ] # mtlr r0
+      - [ be32, 0x004353b0, 0x4bffffa4 ] # b 0x435354: WaitDrawIdle, returns once the list is drawn
+
+# BLITZ: THE LEAGUE II, BLUS30203 v01.00 -- ours. The game runs its own job system on three raw
+# SPUs. Each one's main loop counts its passes and parks itself (stop 0x1300) when the count
+# reaches a limit, after which the PPU is expected to restart it. On a PS3 every pass waits on a
+# DMA, so the 2,097,152 passes take long enough that the SPUs never park in the middle of a load;
+# here a DMA completes at once, the limit runs out during the data install or a match load,
+# nothing restarts the parked SPU, and the game waits for its work forever: the install stalls
+# (behind a black screen on the first boot) and matches freeze on one frame.
+#
+# The patch turns the program's own "no limit" test (brz r3, taken when the limit is 0) into an
+# unconditional branch back to the loop, so the SPUs never park. The limit itself cannot be
+# patched: the PPU writes each program's parameter block, limit included, into LS at run time
+# (raw SPU 1's carries a heap pointer, 0x0149cc00), and a patched data word was overwritten.
+# The stop handler's sys_mutex_lock ESRCH in the log is the game's own and harmless: its mutex
+# id global (0x1318b10) holds 0 and the handler ignores the error. Found with a probe build on
+# the Odin 3, 10-19: limit 0x00200000 at LS 0xcd2c, counter at the same value.
+#
+# The two programs are embedded in the executable and copied into LS by the game itself.
+# Offsets are LS addresses: apply_modification maps them into the image's code segment.
+# Ps3PatchRepo.BUNDLED must list these, or they are imported but never enabled.
+SPU-30d17ae952dd9ccc1abc46b631654e1fe432fde9:
+  "ARMSX3 raw SPU park fix":
+    Games:
+      "Blitz: The League II":
+        BLUS30203: [ All ]
+        BLES00397: [ All ]
+    Author: "jpolo1224"
+    Notes: "Keeps the game's SPU workers from parking during loads, which froze the data install and matches."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x0ab8c, 0x327f8a00 ] # br 0x0a7dc (was brz r3,0x0a7dc, 0x207f8a03): never count toward the park limit
+SPU-93f3b15e03c594d9eaf5a0d8521854fd6eb2a8c7:
+  "ARMSX3 raw SPU park fix":
+    Games:
+      "Blitz: The League II":
+        BLUS30203: [ All ]
+        BLES00397: [ All ]
+    Author: "jpolo1224"
+    Notes: "Keeps the game's SPU workers from parking during loads, which froze the data install and matches."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x075ac, 0x327fd700 ] # br 0x07464 (was brz r3,0x07464, 0x207fd703): never count toward the park limit
+
+# BATMAN: ARKHAM ORIGINS, US releases (BLUS31147, BLUS31207, NPUB31261) update 01.06, multiplayer executable
+# (MP.SELF) -- ours, OFF by default. The US releases run the same MP.SELF.
+#
+# Online play on Arkham: Revived meets only RPCN players, and a private lobby's host gets no START GAME
+# button until 3 players are in. The lobby script (BmScript GDGFxMovieUI_LobbyMenu, cooked into the
+# disc's MULTIPLAYER/BMGAME/COOKEDPS3/FRONTEND.XXX) decides it with
+#     IsReadyToStartPrivateGame(NumPlayers) = NumPlayers >= (class'GDWorldInfo'.static.IsShippingBuild() ? 3 : 1)
+# and PopulateLobbyListTeam only asks after bIsLobbyHost, so only the host needs this patch: players
+# with and without it can share a lobby. Public lobbies (start once full) are left alone.
+#
+# IsShippingBuild() cannot simply return false: RGameInfo.AllowCheats is "return !IsShippingBuild()",
+# so that would allow cheats online. Nor can 0xcfe50, the li r3,1 it calls: that function is shared by
+# 29 callers. The cave replaces that call inside AWorldInfo::execIsShippingBuild (0xf76ec4) and answers
+# "not shipping" only when the script bytes right after the call are the private check's own
+# "? 3 : 1": 00 02 7c 03 00 01 0f 5e (skip 2, byte 3, skip 1, one, end of parms; Arkham Origins
+# shuffles the bytecode token values). There r4 is the script frame and r5 its code pointer, already
+# past the call (P_FINISH). Every other caller still gets "shipping", and the private minimum becomes
+# 1, the developers' own rule.
+#
+# Deliberately NOT in Ps3PatchRepo.BUNDLED: it changes a game rule rather than fixing a broken game,
+# so it stays off until the host turns it on.
+PPU-602e58994456e14dfd80a6e0f376729b53c3109a:
+  "Private matches start with fewer players":
+    Games:
+      "Batman: Arkham Origins":
+        BLUS31147: [ All ]
+        BLUS31207: [ All ]
+        NPUB31261: [ All ]
+    Author: "jpolo1224"
+    Notes: "Lets the host start a private match with fewer than 3 players. Only the host needs it on."
+    Patch Version: 1.0
+    Patch:
+      - [ calloc, 0x00f76ec4, 0x0c ] # in place of bl 0xcfe50 (li r3,1); returns to stw r3,0(r31)
+      - [ be32, 0x00000000, 0x80c50000 ] # lwz r6,0(r5): the script bytes after the call
+      - [ be32, 0x00000000, 0x3ce00002 ] # lis r7,0x0002
+      - [ be32, 0x00000000, 0x60e77c03 ] # ori r7,r7,0x7c03
+      - [ be32, 0x00000000, 0x38600001 ] # li r3,1: shipping, as before
+      - [ be32, 0x00000000, 0x7c063800 ] # cmpw r6,r7
+      - [ be32, 0x00000000, 0x4082001c ] # bne +0x1c: some other caller
+      - [ be32, 0x00000000, 0x80c50004 ] # lwz r6,4(r5)
+      - [ be32, 0x00000000, 0x3ce00001 ] # lis r7,0x0001
+      - [ be32, 0x00000000, 0x60e70f5e ] # ori r7,r7,0x0f5e
+      - [ be32, 0x00000000, 0x7c063800 ] # cmpw r6,r7
+      - [ be32, 0x00000000, 0x40820008 ] # bne +8
+      - [ be32, 0x00000000, 0x38600000 ] # li r3,0: the private check, so its minimum is 1
+
+# TALES OF GRACES F, BLUS30903 -- ours. Keeps the field at 30 fps under a 60 fps limit, so battles run at 60.
+#
+# The game paces itself with label 0xc0, which the GPU waits on before every flip. Its flip handler
+# (0x477370) sets a countdown of interval - 1 vblanks (interval 2 on the field, 1 in battle) and clears
+# the label when that is not 0; its vblank handler (0x477314) counts down and sets the label again at 0.
+# On a PS3 a flip always lands on a vblank, so the field gets exactly 2 vblanks a frame.
+#
+# PS3 Native keeps that, but battle runs 30 to 50 fps there: a frame that misses its vblank by a little
+# waits a whole extra one. A 60 fps limit holds battle at 60, but flips then land between vblanks, and
+# the countdown, started at the flip, frees the field again at the very next vblank: 60 fps, double speed.
+#
+# The cave counts from the vblank the frame was released on instead: countdown = release + interval - now,
+# kept within 0..interval, and the next release (now + countdown) is stored in the label's spare word,
+# label + 4 (libgcm spaces labels 16 bytes apart and the GPU uses only the first word). Battle (interval
+# 1) keeps the game's own path. Under PS3 Native a flip lands one vblank after its release, so the
+# countdown comes out at interval - 1 as before. ConfigDatabase.LOCAL_OVERRIDES gives this title the
+# 60 fps limit to go with it.
+PPU-3e9032a3f7857057ef783810bd8f34a439baaa59:
+  "Field at 30 fps with a 60 fps limit":
+    Games:
+      "Tales of Graces f":
+        BLUS30903: [ All ]
+    Author: "jpolo1224"
+    Notes: "Keeps the field at 30 fps and normal speed with the frame limit at 60, so battles run at 60."
+    Patch Version: 1.0
+    Patch:
+      - [ calloc, 0x0047739c, 0x11 ] # in place of lwz r0,0x1e0(r31) after cellGcmGetLabelAddress(0xc0); returns to cmpwi cr7,r0,0
+      - [ be32, 0x00000000, 0x813f01e4 ] # lwz r9,0x1e4(r31): interval
+      - [ be32, 0x00000000, 0x2f890001 ] # cmpwi cr7,r9,1
+      - [ be32, 0x00000000, 0x409d0038 ] # ble cr7,+0x38: battle keeps the game's countdown
+      - [ be32, 0x00000000, 0x817f01dc ] # lwz r11,0x1dc(r31): vblank count, low word
+      - [ be32, 0x00000000, 0x81430004 ] # lwz r10,4(r3): the vblank this frame was released on
+      - [ be32, 0x00000000, 0x7d4a4a14 ] # add r10,r10,r9: when the next frame is due
+      - [ be32, 0x00000000, 0x7c0b5050 ] # subf r0,r11,r10: vblanks from now
+      - [ be32, 0x00000000, 0x2f800000 ] # cmpwi cr7,r0,0
+      - [ be32, 0x00000000, 0x409c0008 ] # bge cr7,+8
+      - [ be32, 0x00000000, 0x38000000 ] # li r0,0: a late frame, release at once
+      - [ be32, 0x00000000, 0x7f804800 ] # cmpw cr7,r0,r9
+      - [ be32, 0x00000000, 0x409d0008 ] # ble cr7,+8
+      - [ be32, 0x00000000, 0x7d204b78 ] # mr r0,r9: never more than interval
+      - [ be32, 0x00000000, 0x901f01e0 ] # stw r0,0x1e0(r31): countdown
+      - [ be32, 0x00000000, 0x7d4b0214 ] # add r10,r11,r0
+      - [ be32, 0x00000000, 0x91430004 ] # stw r10,4(r3): the next frame's release
+      - [ be32, 0x00000000, 0x801f01e0 ] # lwz r0,0x1e0(r31): the replaced instruction
+
+PPU-db1e09abb1a2785532b89e9a366d2510ba8e070c:
+  "Battle freeze fix":
+    Games:
+      "J-Stars Victory VS+":
+        BLUS31519: [ 01.00 ]
+    Author: "jpolo1224"
+    Notes: "Stops battles freezing with the music still playing, most often during ultimate attacks. An effect job that reaches a record the game has already reused now ends its list there instead of halting the SPU."
+    Patch Version: 1.0
+    Patch:
+      # SPU code of the SPURS effect job, embedded in the EBOOT (LS address = address - 0x853380).
+      # Its first pass prefetches each record's successor and halts (heqi) on a misaligned link,
+      # which a recycled record carries. Rewritten so that link makes this record the last one.
+      - [ be32, 0x00858988, 0x3fbf2eb5 ] # rotqmbyi r53,r93,-4
+      - [ be32, 0x0085898c, 0x3fe11aae ] # shlqbyi r46,r53,4: the link
+      - [ be32, 0x00858990, 0x1403d734 ] # andi r52,r46,15
+      - [ be32, 0x00858994, 0x210008b4 ] # brnz r52,+0x44: misaligned, end the list
+      - [ be32, 0x00858998, 0x7c003136 ] # ceqi r54,r98,0
+      - [ be32, 0x0085899c, 0x0c001b62 ] # sfi r98,r54,0: the other buffer
+      - [ be32, 0x008589a0, 0x754c3133 ] # mpyui r51,r98,304
+      - [ be32, 0x008589a4, 0x180cf2b0 ] # a r48,r101,r51
+      - [ be32, 0x008589a8, 0x4080002f ] # il r47,0
+      - [ be32, 0x008589ac, 0x3280002c ] # fsmbi r44,0
+      - [ be32, 0x008589b0, 0x4080982d ] # il r45,0x130
+      - [ be32, 0x008589b4, 0x4080202b ] # il r43,0x40
+      - [ be32, 0x008589b8, 0x21a00830 ] # wrch ch16,r48
+      - [ be32, 0x008589bc, 0x21a008af ] # wrch ch17,r47
+      - [ be32, 0x008589c0, 0x21a0092e ] # wrch ch18,r46
+      - [ be32, 0x008589c4, 0x21a009ad ] # wrch ch19,r45
+      - [ be32, 0x008589c8, 0x21a00a2c ] # wrch ch20,r44
+      - [ be32, 0x008589cc, 0x21a00aab ] # wrch ch21,r43: GET the next record
+      - [ be32, 0x008589d0, 0x32000200 ] # br +0x10
+      - [ be32, 0x008589d4, 0x00200000 ] # lnop
+      - [ be32, 0x008589d8, 0x1c007076 ] # ai r118,r96,1: count = this record + 1
+      - [ be32, 0x008589dc, 0x24133fe0 ] # stqd r96,0x4c0(r127): count - 1, read by the sort and the second pass
+
+# Skylanders: Spyro's Adventure freezes a minute or two into play (most often during Hugo's dialogue after a
+# figure goes on the portal): no new frames, music and portal traffic carrying on. The job system's worker
+# thread ("JobQueue PPU Worker") is created at priority 1010, below the main thread and a second game thread
+# (both 1001). When those two wake while the worker holds a job-system lock, they take both PPU slots and
+# spin on the lock with sys_ppu_thread_yield, which only hands the CPU to threads of their own priority, so
+# the worker never runs again to let go of it. Seen on two devices with two different locks (the job
+# queue's own and the global job allocator's), the worker the holder each time. At 1001 the worker is in
+# the yielding threads' group and gets its turn on their next yield.
+PPU-6e828d3466bb1272243213bef0df0e499f3965a5:
+  "Freeze fix":
+    Games:
+      "Skylanders: Spyro's Adventure":
+        BLUS30779: [ 01.00 ]
+    Author: "jpolo1224"
+    Notes: "Stops the game freezing a minute or two in, most often during dialogue after placing a figure. The game's job worker now runs at the main thread's priority, so it always gets its turn."
+    Patch Version: 1.0
+    Patch:
+      # Priority the worker is created with, read by lwz r6,-0x22bc(r29) at 0xd7b0c0 (r29 = rtoc 0xedfa50 + 0x80000)
+      # for sys_ppu_thread_create at 0xd7b0f4. Read nowhere else and never written.
+      - [ be32, 0x00f5d794, 0x000003e9 ] # 1010 -> 1001

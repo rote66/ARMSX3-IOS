@@ -87,10 +87,15 @@ object SettingsCategoryNav {
     /** -1 = previous tab, +1 = next. Null whenever the settings screen isn't showing. */
     @Volatile
     var cycle: ((Int) -> Unit)? = null
+
+    /** Claimed by an overlay with tabs of its own while it is up (the avatar picker's All and
+     *  Favorites), so L1/R1 move those instead of the settings tabs behind it. Taken first. */
+    @Volatile
+    var overlayCycle: ((Int) -> Unit)? = null
 }
 
-/** Retains the settings page's scroll offset across close/reopen. The selected category already
- *  persists in the view-model, so restoring this one offset returns you to where you were (esp.
+/** Retains the settings page's scroll offset across close/reopen. The selected category is
+ *  remembered by SettingsViewModel, so restoring this one offset returns you to where you were (esp.
  *  useful in long lists like Fixes) instead of snapping to the top every time. */
 private object SettingsScrollMemory {
     var lastOffset = 0
@@ -280,6 +285,11 @@ fun SettingsScreen(
         // Controller-native search overlay (own keyboard + result nav); inside ArmsBackdrop's
         // BoxScope so its keyboard can dock to the bottom edge over everything.
         SettingsSearchOverlay(this, scopeGame != null)
+    }
+
+    // The RPCN tab's avatar picker, drawn over everything here as the reset prompt is (RpcnAvatar.kt)
+    if (com.armsx2.ui.settings.RpcnAvatarPicker.open.value) {
+        com.armsx2.ui.settings.RpcnAvatarPickerOverlay()
     }
 
     if (showReset) {

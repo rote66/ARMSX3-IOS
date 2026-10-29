@@ -118,7 +118,7 @@ void lv2_socket::handle_events(const pollfd& native_pfd, [[maybe_unused]] bool u
 {
 	bs_t<lv2_socket::poll_t> events_happening{};
 
-	if (native_pfd.revents & (POLLIN | POLLHUP) && events.test_and_reset(lv2_socket::poll_t::read))
+	if (native_readable(native_pfd.revents) && events.test_and_reset(lv2_socket::poll_t::read))
 		events_happening += lv2_socket::poll_t::read;
 	if (native_pfd.revents & POLLOUT && events.test_and_reset(lv2_socket::poll_t::write))
 		events_happening += lv2_socket::poll_t::write;
@@ -188,4 +188,19 @@ lv2_socket& lv2_socket::operator=(thread_state s) noexcept
 
 lv2_socket::~lv2_socket() noexcept
 {
+}
+
+s32 lv2_socket::validate_so_rcvbuf(s32 size)
+{
+	if (size <= 0)
+	{
+		return -SYS_NET_EINVAL;
+	}
+
+	if (size > MAX_RCVBUF_SIZE)
+	{
+		return -SYS_NET_ENOBUFS;
+	}
+
+	return CELL_OK;
 }

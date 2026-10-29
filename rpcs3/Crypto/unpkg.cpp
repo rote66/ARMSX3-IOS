@@ -17,6 +17,116 @@
 
 LOG_CHANNEL(pkg_log, "PKG");
 
+// Every path in here is UTF-8, and these two conversions never fail: on Windows a byte no sequence accounts for
+// becomes U+FFFD, elsewhere a path is the bytes themselves
+static std::filesystem::path fs_path_from_utf8(std::string_view utf8)
+{
+#ifdef _WIN32
+	return utf8_to_wchar(utf8);
+#else
+	return std::filesystem::path(utf8);
+#endif
+}
+
+static std::string fs_path_to_utf8(const std::filesystem::path& path)
+{
+#ifdef _WIN32
+	return wchar_to_utf8(path.native());
+#else
+	return path.native();
+#endif
+}
+
+// Whether a name read from the package could reach outside the directory it is joined to: a leading "/", or a "."
+// or ".." component. "/" is the only separator that counts, vfs::escape writes any other one the host may know, and
+// ":", as plain characters
+static bool leaves_directory(std::string_view name)
+{
+	if (name.starts_with('/'))
+	{
+		return true;
+	}
+
+	for (std::string_view rest = name; !rest.empty();)
+	{
+		const usz sep = rest.find('/');
+		const std::string_view component = rest.substr(0, sep);
+		rest = sep == umax ? std::string_view{} : rest.substr(sep + 1);
+
+		if (component == "." || component == "..")
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+// Where a name that leaves its directory lands, for a package unpacking on the emulated hard drive. "Custom installer"
+// packages (PS3 avatar and mod packs) declare an ordinary content type, then name their files from the root:
+// "../../dev_hdd0/home/psn_avatar/PSNA_....edat" from dev_hdd0/theme/, which a PS3 resolves from the install directory.
+// Resolved the same way from install_dir, the install directory's PS3 path ("dev_hdd0/theme/"). The result is the path
+// below dev_hdd0 (empty for dev_hdd0 itself), or nothing when the name leaves the emulated hard drive.
+static std::optional<std::string> resolve_on_hdd0(std::string_view install_dir, std::string_view name)
+{
+	if (install_dir.empty() || name.starts_with('/'))
+	{
+		return std::nullopt;
+	}
+
+	std::vector<std::string_view> parts;
+
+	const auto append = [&parts](std::string_view path)
+	{
+		for (std::string_view rest = path; !rest.empty();)
+		{
+			const usz sep = rest.find('/');
+			const std::string_view component = rest.substr(0, sep);
+			rest = sep == umax ? std::string_view{} : rest.substr(sep + 1);
+
+			if (component.empty() || component == ".")
+			{
+				continue;
+			}
+
+			if (component == "..")
+			{
+				// Above the root: a PS3 has nothing there
+				if (parts.empty())
+				{
+					return false;
+				}
+
+				parts.pop_back();
+				continue;
+			}
+
+			parts.push_back(component);
+		}
+
+		return true;
+	};
+
+	if (!append(install_dir) || !append(name) || parts.empty() || parts[0] != "dev_hdd0")
+	{
+		return std::nullopt;
+	}
+
+	std::string result;
+
+	for (usz i = 1; i < parts.size(); i++)
+	{
+		if (i > 1)
+		{
+			result += '/';
+		}
+
+		result += parts[i];
+	}
+
+	return result;
+}
+
 package_reader::package_reader(const std::string& path, fs::file file)
 	: m_path(path)
 	, m_file(std::move(file))
@@ -900,15 +1010,15 @@ bool package_reader::set_install_path()
 		// anywhere else.
 		const std::string_view name = m_install_dir.c_str();
 
-		if (name.empty() || name == "." || name == ".." || name.find_first_of("/\\") != umax)
+		if (name.empty() || name == "." || name == ".." || name.find_first_of("/\\") != umax || leaves_directory(name))
 		{
 			pkg_log.error("PKG has no usable install directory (content_type=0x%x, name='%s'). "
 				"Refusing to unpack into '%s'.", static_cast<u32>(m_metadata.content_type), name, dir);
 			return false;
 		}
 
-		dir += name;
-		dir += '/';
+		// Escaped like every other host path built from guest data (upstream c4d834480).
+		dir += vfs::escape(name) + '/';
 	}
 
 	// If false, an existing directory is being overwritten: cannot cancel the operation
@@ -957,13 +1067,34 @@ bool package_reader::fill_data(std::map<std::string, install_entry*>& all_instal
 			m_header.data_size / (1024 * 1024), dev.avail_free / (1024 * 1024));
 	}
 
-	std::error_code path_ec;
-	auto install_path = std::filesystem::weakly_canonical(m_install_path, path_ec);
-	if (path_ec)
+	const auto canonicalize = [](std::string_view utf8_path)
 	{
-		pkg_log.warning("Failed to canonicalize installation path '%s' (%s); falling back to lexical normalization.", m_install_path, path_ec.message());
-		install_path = std::filesystem::path(m_install_path).lexically_normal();
+		std::error_code ec;
+		auto result = std::filesystem::weakly_canonical(fs_path_from_utf8(utf8_path), ec);
+
+		if (ec)
+		{
+			pkg_log.warning("Failed to canonicalize path '%s' (%s); falling back to lexical normalization.", utf8_path, ec.message());
+			result = fs_path_from_utf8(utf8_path).lexically_normal();
+		}
+
+		return result;
+	};
+
+	// weakly_canonical stats every prefix of a path that does not exist yet, and a package holds thousands of files in a
+	// few hundred directories: a directory is resolved once, and a file not on disk is that result plus its own name
+	std::map<std::string, std::filesystem::path, std::less<>> canonical_dirs;
+
+	// The installation directory is resolved without its closing "/", like every entry below it: on a file system that
+	// cannot resolve it, the lexical form would keep that separator as an empty last element no entry can match
+	std::string_view install_dir = m_install_path;
+
+	while (install_dir.ends_with('/'))
+	{
+		install_dir.remove_suffix(1);
 	}
+
+	const std::filesystem::path install_path = canonicalize(install_dir);
 
 	if (install_path.empty())
 	{
@@ -974,6 +1105,27 @@ bool package_reader::fill_data(std::map<std::string, install_entry*>& all_instal
 	const auto is_inside_install_path = [&install_path](const std::filesystem::path& path)
 	{
 		return std::mismatch(install_path.begin(), install_path.end(), path.begin(), path.end()).first == install_path.end();
+	};
+
+	// The install directory's PS3 path, for the names a custom installer gives from the root (resolve_on_hdd0). Only for a
+	// package unpacking where its content type puts it on the emulated hard drive: a root the caller chose has no PS3 path,
+	// so there such names are still refused. What they reach is held to dev_hdd0 instead of the install directory.
+	const std::string hdd0_dir = rpcs3::utils::get_hdd0_dir();
+	const std::string guest_install_dir = s_install_root_override.empty() && m_install_path.starts_with(hdd0_dir)
+		? "dev_hdd0/" + m_install_path.substr(hdd0_dir.size()) : std::string{};
+
+	std::string_view hdd0_trimmed = hdd0_dir;
+
+	while (hdd0_trimmed.ends_with('/'))
+	{
+		hdd0_trimmed.remove_suffix(1);
+	}
+
+	const std::filesystem::path hdd0_path = guest_install_dir.empty() ? std::filesystem::path{} : canonicalize(hdd0_trimmed);
+
+	const auto is_on_hdd0 = [&hdd0_path](const std::filesystem::path& path)
+	{
+		return !hdd0_path.empty() && std::mismatch(hdd0_path.begin(), hdd0_path.end(), path.begin(), path.end()).first == hdd0_path.end();
 	};
 
 	m_install_entries.clear();
@@ -1013,51 +1165,67 @@ bool package_reader::fill_data(std::map<std::string, install_entry*>& all_instal
 
 		std::string_view name = fmt::trim_back_sv(name_buf, "\0"sv);
 
-		const std::filesystem::path entry_path{name};
-		if (entry_path.is_absolute())
-		{
-			num_failures++;
-			pkg_log.error("PKG entry path is absolute: '%s'", name);
-			break;
-		}
+		std::string path;
 
-		for (const auto& component : entry_path)
-		{
-			if (component == "..")
-			{
-				fmt::throw_exception("PKG entry path contains a parent directory component: '%s'", name);
-			}
+		// Named from the root by a custom installer, and held to dev_hdd0 rather than the install directory
+		bool from_root = false;
 
-			if (component == ".")
+		if (leaves_directory(name))
+		{
+			const std::optional<std::string> below_hdd0 = resolve_on_hdd0(guest_install_dir, name);
+
+			if (!below_hdd0)
 			{
 				num_failures++;
-				pkg_log.error("PKG entry path contains a special component: '%s'", name);
+				pkg_log.error("PKG entry path escapes installation directory: '%s'", name);
 				break;
 			}
-		}
 
-		if (num_failures)
+			path = below_hdd0->empty() ? std::string(hdd0_trimmed) : hdd0_dir + vfs::escape(*below_hdd0);
+			from_root = true;
+		}
+		else
 		{
-			break;
+			path = m_install_path + vfs::escape(name);
 		}
 
-		std::string path = m_install_path + vfs::escape(name);
-		path_ec.clear();
-		auto canonical_path = std::filesystem::weakly_canonical(path, path_ec);
-		if (path_ec)
+		const u8 entry_type = entry.type & 0xff;
+		const bool is_folder = entry_type == PKG_FILE_ENTRY_FOLDER || entry_type == 0x12;
+
+		std::filesystem::path canonical_path;
+
+		// A path already on disk is resolved as a whole: it may be a link, or be spelt otherwise there
+		if (is_folder || fs::exists(path))
 		{
-			pkg_log.warning("Failed to canonicalize package path '%s' (%s); falling back to lexical normalization.", path, path_ec.message());
-			canonical_path = std::filesystem::path(path).lexically_normal();
+			canonical_path = canonicalize(path);
+
+			if (is_folder)
+			{
+				canonical_dirs.emplace(path, canonical_path);
+			}
+		}
+		else
+		{
+			const usz slash = path.rfind('/');
+			const std::string_view dir(path.data(), slash);
+			auto found = canonical_dirs.find(dir);
+
+			if (found == canonical_dirs.end())
+			{
+				found = canonical_dirs.emplace(std::string(dir), canonicalize(dir)).first;
+			}
+
+			canonical_path = found->second / fs_path_from_utf8(std::string_view(path).substr(slash + 1));
 		}
 
-		if (canonical_path.empty() || !is_inside_install_path(canonical_path))
+		if (canonical_path.empty() || !(from_root ? is_on_hdd0(canonical_path) : is_inside_install_path(canonical_path)))
 		{
 			num_failures++;
 			pkg_log.error("PKG entry path escapes installation directory: '%s'", name);
 			break;
 		}
 
-		path = canonical_path.string();
+		path = fs_path_to_utf8(canonical_path);
 
 		if (entry.pad || (entry.type & ~PKG_FILE_ENTRY_KNOWN_BITS))
 		{
@@ -1067,8 +1235,6 @@ bool package_reader::fill_data(std::map<std::string, install_entry*>& all_instal
 		{
 			pkg_log.notice("Entry: type=0x%08x, name='%s'", entry.type, name);
 		}
-
-		const u8 entry_type = entry.type & 0xff;
 
 		switch (entry_type)
 		{
@@ -1094,9 +1260,8 @@ bool package_reader::fill_data(std::map<std::string, install_entry*>& all_instal
 		}
 		default:
 		{
-			// The name reached "path" through "vfs::escape", which turns whatever the host file system cannot take
-			// into characters it can, a byte that is not valid UTF-8 included (macOS refuses a name carrying one)
-			auto map_ptr = &*all_install_entries.try_emplace(path).first;
+			// "path" went through "vfs::escape", which also takes care of the bytes that are not valid UTF-8
+			auto map_ptr = &*all_install_entries.try_emplace(std::move(path)).first;
 
 			m_install_entries.push_back({
 				.weak_reference = map_ptr,

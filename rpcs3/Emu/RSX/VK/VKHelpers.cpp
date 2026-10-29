@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/system_config.h"
 #include "VKHelpers.h"
 #include "VKGSRender.h"
 #include "VKCompute.h"
@@ -202,6 +203,21 @@ namespace vk
 			// wipEout HD and Burnout on Linux. They end the render pass around every occlusion
 			// query, a tile store each on a tiler, and nothing on Android hangs without them.
 			// A Turnip hang report gets Strict Rendering Mode first, then a per-game switch.
+			//
+			// The Adreno 830 hangs on hardware primitive restart. LittleBigPlanet's water at the
+			// first level's water wheel (#201) is one triangle strip with restarts, and the GPU
+			// stopped on it every run with the vertex output stage busy. Rewriting the restarts as
+			// degenerate triangles (the older AMD GCN path) is the one change that made it pass;
+			// dropping point size and sanitising positions were tested alongside and are not
+			// needed. 840 users never hit it, so only the 830 pays for the extra index pass.
+			// ARMSX3_HW_RESTART=1 keeps hardware restart, to recheck on newer drivers.
+			if (gpu_name.find("Adreno (TM) 830") != umax)
+			{
+				const char* const env = std::getenv("ARMSX3_HW_RESTART");
+				g_drv_no_primitive_restart = !(env && env[0] == '1');
+				rsx_log.notice("Adreno 830: primitive restart %s", g_drv_no_primitive_restart ?
+					"emulated with degenerate triangles (GPU hang on hardware restart)" : "on hardware (ARMSX3_HW_RESTART=1)");
+			}
 			break;
 		case driver_vendor::POWERVR:
 		case driver_vendor::XCLIPSE:
@@ -303,6 +319,11 @@ namespace vk
 	bool emulate_conditional_rendering()
 	{
 		return g_drv_emulate_cond_render;
+	}
+
+	bool emulate_extended_depth_range()
+	{
+		return !g_render_device->get_unrestricted_depth_range_support() && g_cfg.video.emulate_extended_depth_range;
 	}
 
 	bool use_strict_query_scopes()

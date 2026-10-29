@@ -239,6 +239,23 @@ open class MainActivityRuntime : ComponentActivity() {
             return if (v.startsWith("content://")) resolveTreeUriToPosix(v) else v
         }
 
+        /**
+         * [systemDirPosix], read from the saved choice instead of [systemDir]. For code that can
+         * run with ARMSX3 closed.
+         *
+         * [systemDir] is loaded by onCreate. A provider queried by another app (the Files app
+         * browsing ARMSX3's storage, a library manager asking what is installed) can start the
+         * process on its own, and then [systemDir] is still null, which reads as the internal
+         * default: with the data folder on an SD card, the Files app showed the internal folder,
+         * and games dropped there never reached the emulator. Setup writes the preference and
+         * [systemDir] together, so in a running app the two agree.
+         */
+        fun savedSystemDirPosix(context: Context): String? {
+            val v = context.getSharedPreferences("ARMSX2", Context.MODE_PRIVATE)
+                .getString("systemDir", null) ?: return null
+            return if (v.startsWith("content://")) resolveTreeUriToPosix(v) else v
+        }
+
         /** `<DataRoot>/inputprofiles/` — the portable folder both touch-layout and
          *  controller-mapping profiles mirror themselves into, so they survive a
          *  data-folder move and can be shared or hand-dropped. Null when no system
@@ -324,17 +341,39 @@ open class MainActivityRuntime : ComponentActivity() {
          * advance and keep writable emulator data in app-private storage.
          */
         fun validateSystemDirWritable(posixPath: String): Boolean {
-            return try {
-                val dir = File(posixPath)
-                if (!dir.exists() && !dir.mkdirs()) return false
-                if (!dir.isDirectory) return false
-                val probe = File(dir, ".armsx3-write-probe")
+            val dir = File(posixPath)
+            // A few tries before calling a folder unwritable: shared storage can refuse a write for
+            // a moment while the app starts, and the answer decides which folder this whole launch
+            // uses (see assetCopyRoot).
+            repeat(3) { attempt ->
+                if (probeWritable(dir)) return true
+                if (attempt < 2) runCatching { Thread.sleep(100) }
+            }
+            return false
+        }
+
+        private fun probeWritable(dir: File): Boolean = try {
+            if (!dir.exists() && !dir.mkdirs()) {
+                false
+            } else if (!dir.isDirectory) {
+                false
+            } else {
+                // A probe name of its own each time. With one fixed name, a probe left behind by a
+                // process that died between create and delete made createNewFile() return false,
+                // "not writable", on every launch after that, and two threads probing at once failed
+                // one of them. Either way the app quietly ran from its own folder instead of the
+                // user's, and their saves looked gone. The old fixed name is cleared if it was left.
+                File(dir, ".armsx3-write-probe").takeIf { it.exists() }?.delete()
+                val probe = File(
+                    dir,
+                    ".armsx3-write-probe-${android.os.Process.myPid()}-${Thread.currentThread().id}-${System.nanoTime()}",
+                )
                 val ok = probe.createNewFile()
                 if (ok) probe.delete()
                 ok
-            } catch (_: Exception) {
-                false
             }
+        } catch (_: Exception) {
+            false
         }
 
         val surface = mutableStateOf<EmulationSurface?>(null)
@@ -516,6 +555,11 @@ open class MainActivityRuntime : ComponentActivity() {
         @JvmStatic
         fun isVmStopInProgress(): Boolean = vmStopInProgress
 
+        /** Nothing booted, booting or shutting down. The library scans only then: a scan mounts disc
+         *  images, and eState alone reads STOPPED while the core is still tearing down. */
+        @JvmStatic
+        fun isVmIdle(): Boolean = eState.value == EmuState.STOPPED && !vmStopInProgress && !vmRunLoopActive
+
         /** True from game/BIOS boot until we are back in the library. This — not currentGame —
          *  decides which rotation tier applyEmulationOrientation() uses: a BIOS boot has no
          *  GameInfo yet is still emulation, so keying on currentGame made the BIOS follow the
@@ -652,6 +696,9 @@ open class MainActivityRuntime : ComponentActivity() {
                 try {
                     eState.value = EmuState.RUNNING
                     println("@@ANDROID_START_VM@@ kind=game path=${m_szGamefile.take(240)}")
+                    // Nothing in this core ever called onVmRunning, so a game launched without a
+                    // library entry never got one. Start looking now; it waits for the boot.
+                    adoptExternalGameIdentity()
 
                     // Push the curated settings before the VM reads them.
                     //
@@ -677,9 +724,14 @@ open class MainActivityRuntime : ComponentActivity() {
                                 game.settingsKey, game.fileStemKey,
                             )
                         }
-                        com.armsx2.config.ConfigStore
-                            .resolveForGame(currentGame.value?.settingsKey)
-                            .applyTo()
+                        val launchKey = currentGame.value?.settingsKey
+                        val launchSettings = com.armsx2.config.ConfigStore.resolveForGame(launchKey)
+                        android.util.Log.i(
+                            "ARMSX3-Config",
+                            "launch $launchKey: Accurate SPU Reservations ${launchSettings.ps3.accurateSpuRsv}, " +
+                                "per-game ${launchKey?.let { com.armsx2.config.ConfigStore.loadOverrides(it) }}",
+                        )
+                        launchSettings.applyTo()
                     } catch (t: Throwable) {
                         android.util.Log.w("ARMSX2", "launch: failed to apply settings", t)
                     }
@@ -704,19 +756,24 @@ open class MainActivityRuntime : ComponentActivity() {
                     // does not spell out its title id resolves per-game settings under its
                     // filename while the core boots it as the serial and reads there. The core
                     // reports the serial about a second into boot, which is too late for the
-                    // settings just pushed above -- but recording it now means every later boot
+                    // settings just pushed above -- but recording it means every later boot
                     // resolves under the right key. See ConfigStore.rememberSerial.
-                    runCatching {
-                        com.armsx2.config.ConfigStore.rememberSerial(
-                            currentGame.value?.settingsKey,
-                            com.armsx3.NativeApp.getGameSerial())
-                    }
+                    //
+                    // Only once the core has read THIS disc. Asked here, before runVMThread, it
+                    // still answered with the last game's serial (Emulator::Kill keeps the title
+                    // id), so playing Batman: Arkham City and then The Idolm@ster 2 filed the
+                    // second under the first: it booted with Arkham's settings and saved into them.
+                    // And only for an entry without a serial, the one case the alias is for.
+                    currentGame.value?.takeIf { it.serial.isNullOrBlank() }?.settingsKey
+                        ?.let { rememberSerialAfterBoot(it) }
                     // Both of these are consumed by native when the VM boots, so they must be
                     // pushed BEFORE runVMThread (which blocks until the VM exits). One resolve,
                     // per-game ∘ global.
+                    // The plain key: resolveForGame follows the serial alias itself, the way the
+                    // settings were saved. Passing effectiveKey() here followed it twice, the same
+                    // walk past the saved settings that kept a per-game Display Resolution off.
                     val bootCfg = com.armsx2.config.ConfigStore
-                        .resolveForGame(
-                            com.armsx2.config.ConfigStore.effectiveKey(currentGame.value?.settingsKey))
+                        .resolveForGame(currentGame.value?.settingsKey)
                     // Read by VMManager::SetEmuThreadAffinities during boot.
                     runCatching { NativeApp.setAffinityMode(bootCfg.affinityMode) }
                     // The hold itself waits for the VM to come up. BIOS boots skip it.
@@ -725,6 +782,10 @@ open class MainActivityRuntime : ComponentActivity() {
                     val bootTarget = takeBootTarget(m_szGamefile)
                     if (bootTarget != m_szGamefile)
                         println("@@ANDROID_START_VM@@ from state=${bootTarget.take(240)}")
+                    // The microphones as they are now, by name, for a game that opens one (MicDevices)
+                    runCatching { com.armsx2.input.MicDevices.push(com.armsx2.Pasx2Application.appContext) }
+                    // Real toy portals the user allowed, for the game's USB scan (UsbPassthrough)
+                    runCatching { com.armsx2.input.UsbPassthrough.openForGame(com.armsx2.Pasx2Application.appContext) }
                     val booted = NativeApp.runVMThread(bootTarget)
                     // A failed boot used to be indistinguishable from an instant game exit:
                     // runVMThread's result was dropped, so the app bounced back to the
@@ -766,6 +827,8 @@ open class MainActivityRuntime : ComponentActivity() {
                     // actually unwound, so users can't launch the next game
                     // while the previous VM is still tearing down.
                     eState.value = EmuState.STOPPED
+                    // The game's RPCN session goes with it (see onStart).
+                    com.armsx2.online.OnlineSession.release(com.armsx2.Pasx2Application.appContext)
                     val restartNow = synchronized(vmLifecycleLock) {
                         vmRunLoopActive = false
                         vmStopInProgress = false
@@ -845,8 +908,12 @@ open class MainActivityRuntime : ComponentActivity() {
             // Resolve via settingsKey (serial for discs, filename stem for
             // serial-less ELF/homebrew) so ELF per-game settings survive a reboot
             // instead of falling back to global (issue #253).
-            var resolved = com.armsx2.config.ConfigStore.resolveForGame(
-                com.armsx2.config.ConfigStore.effectiveKey(currentGame.value?.settingsKey))
+            //
+            // The plain key, as the launch path uses: resolveForGame follows the serial alias
+            // once itself (keyForGame), which is how settings are saved. An effectiveKey() here
+            // made it two hops, and for a title whose alias chains on, the renderer read another
+            // key's settings: Sonic '06 resolved hwScaler 0 with 720 saved for it.
+            var resolved = com.armsx2.config.ConfigStore.resolveForGame(currentGame.value?.settingsKey)
             // Build immutable input maps before the VM starts so the first ABXY
             // edge never pays SharedPreferences parsing on the UI thread.
             ControllerMappings.warmRuntimeCaches()
@@ -904,7 +971,17 @@ open class MainActivityRuntime : ComponentActivity() {
                 if (ctx != null) pickedId?.let { id ->
                     com.armsx2.CustomDriver.listInstalled(ctx).firstOrNull { it.id == id }
                 } else null
-            if (ctx != null) com.armsx2.CustomDriver.applyToNative(ctx, picked)
+            // Turnip options go into the environment before the device is created.
+            com.armsx2.CustomDriver.applyDriverEnv()
+            if (ctx != null && !com.armsx2.CustomDriver.applyToNative(ctx, picked) && picked != null) {
+                // The pack could not be loaded and the system driver runs in its place. Said here
+                // because nothing else would: the game starts and plays, on a driver the player
+                // did not pick, and a pack that never loaded gets reported as working.
+                val notice = com.armsx2.i18n.I18n.get("backend.driver.notLoaded")
+                instance?.runOnUiThread {
+                    android.widget.Toast.makeText(ctx, notice, android.widget.Toast.LENGTH_LONG).show()
+                }
+            }
             when (renderer.value) {
                 "vulkan" -> NativeApp.renderVulkan()
                 "opengl" -> NativeApp.renderOpenGL()
@@ -924,6 +1001,9 @@ open class MainActivityRuntime : ComponentActivity() {
             // dispatchKeyEvent can forward physical-keyboard keys to it. applyTo()
             // already pushed [USB1] Type + the live attach (usbSetKeyboardEnabled).
             usbKeyboardActive = resolved.usbKeyboard
+            // A pressure modifier toggled on in the previous game must not soften this one's
+            // first press.
+            com.armsx2.ui.touch.TouchControls.pressureModifierHeld.value = false
 
             // A PS2 pad block used to sit here: Pad1/Pad2 Deadzone, Pad2 Type =
             // DualShock2 when a second controller was present, and the multitap
@@ -958,6 +1038,17 @@ open class MainActivityRuntime : ComponentActivity() {
                     else -> if (limit) 0 else 3
                 }
             )
+            // The output size (Display Resolution and the screen resolution override), resolved
+            // for this game. The surface sized itself once, when it was laid out at app start with
+            // no game chosen, and nothing re-applied it at boot: a game's own Display Resolution
+            // took effect only when changed in-game, and every relaunch came back at Screen. A
+            // tester saw 14 fps at Screen and 30 at 1080p on 1.0.9, set in-game, gone on reopen.
+            // Posted: it resizes the SurfaceView, and boot runs off the main thread.
+            android.util.Log.i(
+                "ARMSX3-Scaler",
+                "boot: re-applying output scale for ${currentGame.value?.settingsKey}, surface ${if (surface.value == null) "MISSING" else "present"}",
+            )
+            surface.value?.let { s -> s.post { s.applyOutputScale() } }
         }
 
         /**
@@ -1046,15 +1137,6 @@ open class MainActivityRuntime : ComponentActivity() {
         }
 
         /**
-         * Minimal [GameInfo] for a URI arriving from outside the app and NOT in the library.
-         *
-         * The serial probe here is getGameSerialFromFd, which reads a PS2 SYSTEM.CNF and so
-         * answers nothing for a PS3 disc. That is why this is the fallback and not the first
-         * move: for anything the library has scanned, [libraryGameFor] supplies the real
-         * serial. A failed probe is still fine for ELF/homebrew, where settingsKey falls back
-         * to the filename stem, matching issue #253's behaviour.
-         */
-        /**
          * The library's own entry for an incoming launch, matched by path.
          *
          * This is what makes a shortcut launch the SAME game as a library launch rather than a
@@ -1098,6 +1180,18 @@ open class MainActivityRuntime : ComponentActivity() {
             }
         }.getOrNull()
 
+        /**
+         * The [GameInfo] for a URI arriving from outside the app.
+         *
+         * The library's entry when the path matches one ([libraryGameFor]). Otherwise the title id
+         * comes from the disc's own PARAM.SFO, and the library's entry with that id stands in for
+         * it. This used to ask getGameSerialFromFd, ARMSX2's PS2 probe, which the PS3 core never
+         * implemented, so a launch the library could not match by path had no serial at all:
+         * per-game settings resolved under the filename, and the in-game patch list was empty, so
+         * a patch turned on from it was filed under no game. Frontends such as Beacon hand over
+         * their own form of a path, so for them that was most launches. With no title id, ELF and
+         * homebrew still key off the filename stem, as issue #253 has it.
+         */
         private fun externalGameInfo(uriString: String): GameInfo? = runCatching {
             // The library first: a game we already know is not worth re-deriving badly.
             libraryGameFor(uriString)?.let { return@runCatching it }
@@ -1105,29 +1199,49 @@ open class MainActivityRuntime : ComponentActivity() {
             val uri = uriString.toUri()
             val name = uri.lastPathSegment?.substringAfterLast('/')?.substringAfterLast(':').orEmpty()
             val stem = name.substringBeforeLast('.').ifBlank { name }
-            val serial = runCatching {
-                val ctx = instance ?: return@runCatching null
-                // detachFd() hands ownership of the fd to native, which closes it — same
-                // contract GameLibraryRepository.probeDocument/probeRaw use. Do NOT wrap in
-                // use{}: closing an already-detached descriptor is not ours to do.
-                val raw = if (uri.scheme == "content") {
-                    val pfd = ctx.contentResolver.openFileDescriptor(uri, "r") ?: return@runCatching null
-                    NativeApp.getGameSerialFromFd(pfd.detachFd())
-                } else {
-                    val f = java.io.File(uri.path ?: return@runCatching null)
-                    if (!f.isFile) return@runCatching null
-                    val pfd = ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY)
-                    NativeApp.getGameSerialFromFd(pfd.detachFd())
-                }
-                // The probe tags its result "<platform>:<serial>" when SYSTEM.CNF parsed.
-                raw?.takeIf { it.isNotBlank() }?.substringAfterLast(':')?.takeIf { it.isNotBlank() }
-            }.getOrNull()
+            val disc = probeExternalDisc(uriString)
+            val serial = disc?.first
+
+            // The same game the library scanned under another address.
+            libraryGameForSerial(serial)?.let {
+                android.util.Log.i("ARMSX3-Launch", "external launch: '$name' is $serial, the library's entry")
+                return@runCatching it
+            }
+            android.util.Log.i("ARMSX3-Launch", "external launch: '$name' is ${serial ?: "a title with no id"}")
             GameInfo(
                 uri = uri,
-                title = stem,
+                title = disc?.second?.takeIf { it.isNotBlank() } ?: stem,
                 serial = serial,
                 extension = name.substringAfterLast('.', "").uppercase(),
             )
+        }.getOrNull()
+
+        /**
+         * Title id and title from the PARAM.SFO of the disc an external launch names, or null.
+         *
+         * The library scan's own probe, on the path the boot will use. An EBOOT.BIN is read through
+         * the folder two levels up (PS3_GAME, or an installed game's folder), where its PARAM.SFO
+         * is. Skipped unless the VM is idle: the probe mounts the image under the lock a boot holds.
+         * The disc's icon is kept as the title's cover if the library has none for it yet.
+         */
+        private fun probeExternalDisc(uriString: String): Pair<String, String>? = runCatching {
+            if (!isVmIdle()) return null
+            val path = com.armsx2.storage.ContentUri.bootPathFor(uriString)
+            if (path.startsWith("content://")) return null
+            val target = if (path.substringAfterLast('/').equals("EBOOT.BIN", ignoreCase = true)) {
+                java.io.File(path).parentFile?.parentFile?.path ?: return null
+            } else {
+                path
+            }
+            // Its own staging name: the library scan may be probing at the same time.
+            val staged = com.armsx2.DiscIcons.fileFor("__external")
+            val info = org.json.JSONObject(net.rpcsx.RPCSX.instance.probeDiscInfo(target, staged.absolutePath))
+            val id = info.optString("titleId").takeIf { it.isNotBlank() }
+            if (id != null && info.optBoolean("icon") && staged.length() > 0L && !com.armsx2.DiscIcons.has(id)) {
+                staged.renameTo(com.armsx2.DiscIcons.fileFor(id))
+            }
+            staged.delete()
+            id?.let { it to info.optString("title") }
         }.getOrNull()
 
         /**
@@ -1166,6 +1280,7 @@ open class MainActivityRuntime : ComponentActivity() {
                     NativeApp.runVMThread(m_szGamefile)
                 } finally {
                     eState.value = EmuState.STOPPED
+                    com.armsx2.online.OnlineSession.release(com.armsx2.Pasx2Application.appContext)
                     val restartNow = synchronized(vmLifecycleLock) {
                         vmRunLoopActive = false
                         vmStopInProgress = false
@@ -1419,7 +1534,7 @@ open class MainActivityRuntime : ComponentActivity() {
         private fun bootTargetFor(uri: String, name: String): String? {
             val lower = name.lowercase()
             return when {
-                listOf(".iso", ".m3u", ".bin", ".elf", ".self").any(lower::endsWith) -> uri
+                listOf(".iso", ".chd", ".m3u", ".bin", ".elf", ".self").any(lower::endsWith) -> uri
                 // A folder dump is picked by a file inside it, and PS3_DISC.SFB is the one every
                 // disc root has. The folder itself is what boots.
                 lower == "ps3_disc.sfb" -> com.armsx2.storage.ContentUri.bootPathFor(uri)
@@ -1576,21 +1691,25 @@ open class MainActivityRuntime : ComponentActivity() {
         }.getOrNull()
 
         /**
-         * Give an externally-launched game the same identity a library-launched one has.
+         * Give a game launched without a library entry the same identity a library-launched one has.
          *
          * A front-end (Daijisho / Lisi / Cocoon) hands us a bare content:// with no
-         * GameInfo, so [handleExternalLaunchIntent] leaves [currentGame] null. That split
+         * GameInfo, so [handleExternalLaunchIntent] leaves [currentGame] null. So does Launch Game
+         * or Change Disc for a file the library has no entry for: one outside its folders, or one
+         * picked before the rescan that finds it has finished, and the pause menu then showed
+         * "PlayStation 3" instead of the game. That split
          * the game's identity in two: the settings hub keys its Global/Game switch off
          * currentGame, so the switch VANISHED — while the save path resolves the serial
          * from the running core and happily wrote per-game. Hence the report of settings
          * "showing as Global but saving as Per Game" only when launched from a front-end.
          *
          * The core knows the serial once the disc is read, which is the same key the save
-         * path uses — so build the missing GameInfo from it and the two agree again.
+         * path uses — so build the missing GameInfo from it and the two agree again. The title
+         * is the disc's own, as the library would have read it.
          */
 
         private fun adoptExternalGameIdentity() {
-            if (!launchedExternally || currentGame.value != null) return
+            if (currentGame.value != null) return
             val path = m_szGamefile.takeIf { it.isNotEmpty() } ?: return
             val handler = android.os.Handler(android.os.Looper.getMainLooper())
             handler.post(object : Runnable {
@@ -1599,32 +1718,75 @@ open class MainActivityRuntime : ComponentActivity() {
                     // A library launch that lands mid-poll wins: it has the real entry.
                     if (vmStopInProgress || eState.value == EmuState.STOPPED) return
                     if (currentGame.value != null) return
+                    // The core keeps the last game's serial and title until the next boot reads
+                    // its disc, which happens while it is loading. Past that, they are this game's.
+                    val booted = when (runCatching { net.rpcsx.RPCSX.getState() }.getOrNull()) {
+                        net.rpcsx.EmulatorState.Ready, net.rpcsx.EmulatorState.Starting,
+                        net.rpcsx.EmulatorState.Running, net.rpcsx.EmulatorState.Paused,
+                        net.rpcsx.EmulatorState.Frozen -> true
+                        else -> false
+                    }
                     // "00000000" is the placeholder the core reports before the disc is
                     // read — the same value TouchControls.coreSerial() rejects.
-                    val serial = runCatching { NativeApp.getGameSerial() }.getOrNull()
+                    val serial = if (!booted) null else runCatching { NativeApp.getGameSerial() }.getOrNull()
                         ?.trim()?.uppercase()?.takeIf { it.isNotEmpty() && it != "00000000" }
                     if (serial == null) {
-                        // ~10s of looking. A serial-less boot (ELF/homebrew) just never
-                        // adopts one, and settingsKey's filename fallback still applies.
-                        if (++attempts < 40) handler.postDelayed(this, 250)
+                        // A minute of looking, for a slow load. A serial-less boot (ELF/homebrew)
+                        // just never adopts one, and settingsKey's filename fallback still applies.
+                        if (++attempts < 240) handler.postDelayed(this, 250)
                         return
                     }
                     val uri = runCatching { Uri.parse(path) }.getOrNull() ?: return
                     val name = uri.lastPathSegment?.substringAfterLast('/')?.substringAfterLast(':')
                         ?: path.substringAfterLast('/')
-                    val (title, _) = FilenameParser.parse(name)
+                    // The file name only for a boot whose disc has no title, an ELF say.
+                    val title = com.armsx3.Rpcs3Bridge.getTitle().trim().ifEmpty { FilenameParser.parse(name).first }
+                    val folder = runCatching {
+                        java.io.File(com.armsx2.storage.ContentUri.bootPathFor(path)).isDirectory
+                    }.getOrDefault(false)
                     currentGame.value = GameInfo(
                         uri = uri,
                         title = title,
                         serial = serial,
-                        extension = name.substringAfterLast('.', "").uppercase(),
+                        extension = if (folder) "FOLDER" else name.substringAfterLast('.', "").uppercase(),
+                        platform = com.armsx2.GamePlatform.PS3,
                     )
                 }
             })
         }
 
-        /** Fired when the VM reaches RUNNING (from NativeApp.vmSetPaused). A state chosen from the
-         *  library is not loaded here any more: it is the boot target itself, see launchGameFromState. */
+        /**
+         * Alias [stem], a library entry's filename key, to the serial the core boots it as.
+         *
+         * Polled like [adoptExternalGameIdentity]: until the core is past loading, its title id is
+         * still the last game's, and recording that is what linked one game to another's settings.
+         */
+        private fun rememberSerialAfterBoot(stem: String) {
+            val handler = android.os.Handler(android.os.Looper.getMainLooper())
+            handler.post(object : Runnable {
+                var attempts = 0
+                override fun run() {
+                    if (vmStopInProgress || eState.value == EmuState.STOPPED) return
+                    val booted = when (runCatching { net.rpcsx.RPCSX.getState() }.getOrNull()) {
+                        net.rpcsx.EmulatorState.Ready, net.rpcsx.EmulatorState.Starting,
+                        net.rpcsx.EmulatorState.Running, net.rpcsx.EmulatorState.Paused,
+                        net.rpcsx.EmulatorState.Frozen -> true
+                        else -> false
+                    }
+                    val serial = if (!booted) null else runCatching { NativeApp.getGameSerial() }.getOrNull()
+                        ?.trim()?.uppercase()?.takeIf { it.isNotEmpty() && it != "00000000" }
+                    if (serial == null) {
+                        if (++attempts < 240) handler.postDelayed(this, 250)
+                        return
+                    }
+                    runCatching { com.armsx2.config.ConfigStore.rememberSerial(stem, serial) }
+                }
+            })
+        }
+
+        /** From ARMSX2, where the VM reaching RUNNING calls it (NativeApp.vmSetPaused). Nothing in this
+         *  core does: start() looks for the identity itself. A state chosen from the library is not
+         *  loaded here any more: it is the boot target itself, see launchGameFromState. */
         @JvmStatic
         fun onVmRunning() {
             adoptExternalGameIdentity()
@@ -1648,10 +1810,13 @@ open class MainActivityRuntime : ComponentActivity() {
          * launch and a later change to the folder does not put a working install back into
          * setup.
          */
-        private fun adoptPreparedSetup() {
+        private fun adoptPreparedSetup(context: Context) {
             if (setupComplete.value) return
 
-            val root = currentInitDataRoot()?.takeIf { it.isNotBlank() } ?: return
+            // Resolved the way kickoffEmucoreInit pins it. The pinned root is only recorded by that
+            // init, which waits for setupComplete, so on the fresh install this exists for it was
+            // still null and the check gave up before looking (ARMSX3 #205, traced by carter-lilley).
+            val root = currentInitDataRoot()?.takeIf { it.isNotBlank() } ?: assetCopyRoot(context)
             val config = File(root, "config")
 
             // The same file boot checks before starting the XMB, so "firmware is installed"
@@ -1784,11 +1949,34 @@ open class MainActivityRuntime : ComponentActivity() {
             }
         }
 
+        /** The data root this process settled on, and the configured folder it was decided for. */
+        @Volatile private var resolvedDataRoot: Pair<String?, String>? = null
+
         fun assetCopyRoot(context: Context): String {
             val custom = systemDirPosix()
-            return custom?.takeIf { validateSystemDirWritable(it) }
-                ?: context.getExternalFilesDir(null)?.absolutePath
-                ?: context.dataDir.absolutePath
+            // Decided once per configured folder, not on every call. The core pins its root at
+            // startup from this same function, and a later call answering differently (one probe
+            // failing mid-session) sent whatever asked it next to another folder than the emulator.
+            resolvedDataRoot?.let { (decidedFor, root) -> if (decidedFor == custom) return root }
+
+            if (custom != null && validateSystemDirWritable(custom)) {
+                resolvedDataRoot = custom to custom
+                return custom
+            }
+
+            val fallback = context.getExternalFilesDir(null)?.absolutePath ?: context.dataDir.absolutePath
+            if (custom == null) {
+                // The Internal choice: nothing was probed, so the answer cannot change.
+                resolvedDataRoot = null to fallback
+            } else {
+                // Not remembered, so the next call tries the user's folder again: once setup has
+                // them grant access, it must be used, not this. And not silent: onCreate routes this
+                // case to setup before the core starts, so reaching it means something changed
+                // mid-launch. Say where data is going.
+                android.util.Log.e("ARMSX3", "data folder $custom is not writable; using $fallback")
+                println("@@ANDROID_DATA_ROOT@@ fallback custom=$custom using=$fallback")
+            }
+            return fallback
         }
 
         fun copyAssetAll(p_context: Context, srcPath: String) {
@@ -1978,71 +2166,13 @@ open class MainActivityRuntime : ComponentActivity() {
         copyAssetAll(applicationContext, "bios")
         copyAssetAll(applicationContext, "resources")
 
-        // On an app UPDATE (versionCode changed), drop the regenerable GPU caches. Installing a
-        // new build over an old one keeps the compiled GS shader/pipeline cache under
-        // <dataRoot>/cache, and a cache baked by a different core build can render corrupt — the
-        // "scrambled PS2 logo" and post-update graphical glitches users currently fix by
-        // reinstalling clean (#376/#385). The cache is pure derived data (rebuilt on demand),
-        // never user content, so wiping it is always safe. Skipped on first install (no prior
-        // version recorded) — there is nothing stale to clear.
-        // ONLY the GPU caches, never the compiled guest modules.
-        //
-        // This came from ARMSX2, where <dataRoot>/cache held the GS shader/pipeline cache and
-        // nothing else, so deleting the lot was free. In ARMSX3 that same directory is RPCS3's
-        // whole cache root: <dataRoot>/cache/cache/<TITLEID>/ppu-<hash>-EBOOT.BIN/ holds every
-        // compiled PPU module, and deleting it threw away work measured in tens of minutes per
-        // game -- an hour for the XMB's 390 firmware modules. Every update, on purpose, by code
-        // that believed it was clearing shaders. That is the "why do I have to recompile my games
-        // after every update" report, and it is the single worst thing about updating.
-        //
-        // The original worry stands and is preserved: a pipeline cache baked against a different
-        // core build can render corrupt (#376/#385). But that argument is about GPU pipeline blobs,
-        // not guest code. PPU objects already carry their own compatibility key in the filename --
-        // format version, module hash, the settings that affect codegen, and the CPU target -- so a
-        // build that changes any of that simply does not match them, and one that does not change
-        // it has no reason to discard them.
-        //
-        // OFF THE MAIN THREAD. kickoffEmucoreInit runs from onCreate, and this walk covers the
-        // WHOLE cache root -- which holds every compiled PPU module and reaches tens of GB on a
-        // full library. Walking that on the UI thread blocks it for seconds and Android kills the
-        // app as unresponsive, which users report as "crashes during the logo animation after
-        // updating" (#94, seen on Retroid Pocket 6 and AYN Thor).
-        //
-        // It also explains why re-launching eventually works: lastRunVersionCode is only written
-        // once the walk finishes, so a kill part-way through means the next launch retries, each
-        // attempt deleting a few more directories until the walk is finally short enough to
-        // survive. A clean install has no cache to walk, which is why reinstalling "fixes" it.
-        //
-        // Nothing below depends on this having finished -- the caches are regenerable and the core
-        // rebuilds them on demand -- so it is safe to let it run behind startup.
-        val prevVc = prefs.getInt("lastRunVersionCode", 0)
-        val curVc = BuildConfig.VERSION_CODE
-
-        if (prevVc != 0 && prevVc != curVc) {
-            Thread {
-                runCatching {
-                    val root = File(assetCopyRoot(applicationContext), "cache")
-                    var cleared = 0
-                    // Depth-first over the cache root, removing only directories named
-                    // shaders_cache (RPCS3 puts one beside each title's compiled modules).
-                    // walkBottomUp so a match is deleted whole without the walk then descending
-                    // into a directory that is gone.
-                    root.walkBottomUp()
-                        .filter { it.isDirectory && it.name == "shaders_cache" }
-                        .forEach { if (it.deleteRecursively()) cleared++ }
-                    android.util.Log.i(
-                        "ARMSX2",
-                        "Update $prevVc -> $curVc: cleared $cleared shader cache(s); compiled modules kept",
-                    )
-                }
-                // Recorded only after the sweep actually completes, so an interrupted run repeats
-                // rather than silently leaving a build's stale pipeline blobs behind.
-                runCatching { prefs.edit { putInt("lastRunVersionCode", curVc) } }
-            }.apply { isDaemon = true; name = "shader-cache-sweep"; priority = Thread.MIN_PRIORITY }
-                .start()
-        } else if (prevVc != curVc) {
-            runCatching { prefs.edit { putInt("lastRunVersionCode", curVc) } }
-        }
+        // No shader cache sweep on update. ARMSX2 deletes its GPU caches whenever the versionCode
+        // changes, because a PCSX2 GS cache built by another version can render corrupt (#376/#385),
+        // and that sweep came over with the app code. It protected nothing here: RPCS3's shaders_cache
+        // holds the games' own shader programs and pipeline state, the host shaders are rebuilt from
+        // them at every boot by the running build, and RPCS3 versions its pipeline folder itself
+        // (pipelines/vulkan/v1.96-eds). All the sweep did was make every game rebuild its GPU
+        // programs during play after each update, which is a stutter users notice.
 
         // Point the ANGLE EGL env vars at the bundled libs (or clear them) before the
         // GS thread ever opens a GL context. Re-applied per launch below too.
@@ -2224,17 +2354,35 @@ open class MainActivityRuntime : ComponentActivity() {
         // ([fromController] false): they are how people add triggers to touch-only play, and
         // hiding the touch controls on every press left them nothing else to play with.
         if (fromController) com.armsx2.ui.touch.TouchControls.onControllerInputDetected()
+        // A button mapped to a motion action moves the SIXAXIS sensors; it is not a pad button.
+        if (p_keycode_in in com.armsx2.input.MotionButtons.CODES) {
+            com.armsx2.input.MotionButtons.onKey(port, p_keycode_in, p_action == KeyEventType.KeyDown)
+            return
+        }
         // D-pad as left analog stick: a physical d-pad press (arriving as a key,
         // not a HAT) drives the left stick instead of the digital d-pad. The
-        // remapped code is >=110 so the analog-force branch below gives a
-        // (near-)full deflection. HAT-style d-pads are folded into the stick in
-        // dispatchStick instead. 19=Up 20=Down 21=Left 22=Right ->
-        // 110=L_Up 112=L_Down 113=L_Left 111=L_Right.
+        // remapped code is a stick direction, handled just below. HAT-style
+        // d-pads are folded into the stick in dispatchStick instead.
+        // 19=Up 20=Down 21=Left 22=Right -> 110=L_Up 112=L_Down 113=L_Left 111=L_Right.
         val p_keycode = if (ControllerMappings.dpadAsLeftStick()) {
             when (p_keycode_in) {
                 19 -> 110; 20 -> 112; 21 -> 113; 22 -> 111; else -> p_keycode_in
             }
         } else p_keycode_in
+        // A KEY bound to a stick direction (d-pad-as-left-stick, or a button bound to a "(send)"
+        // stick row) deflects that direction fully, and only through the merge layer. It used to
+        // write the code itself, at 90% (a leftover "Joystic test value"), and on release wrote
+        // 0 outright: a stick still pushing that direction then read as centred, because
+        // flushAnalogAxes only resends a code whose value changed, and a stick held at its
+        // stop sends no further motion events (ARMSX3 #198: full up / full left walked).
+        if (p_keycode in 110..123 && port in analogKeyHeld.indices &&
+            (p_action == KeyEventType.KeyDown || p_action == KeyEventType.KeyUp || p_action == KeyEventType.Unknown)) {
+            val down = p_action == KeyEventType.KeyDown
+            if (down) analogKeyHeld[port][p_keycode] = 1f else analogKeyHeld[port].remove(p_keycode)
+            com.armsx2.ui.touch.TouchControls.notePressureKeyState(port, p_keycode, down)
+            writeMergedAnalog(port, p_keycode)
+            return
+        }
         if (p_action == KeyEventType.KeyDown) {
             var pad_force = 0
             if (p_keycode >= 110) {
@@ -2246,17 +2394,10 @@ open class MainActivityRuntime : ComponentActivity() {
                 // buttons while the modifier is held; 0 (full press) otherwise.
                 pad_force = com.armsx2.ui.touch.TouchControls.pressureRangeFor(p_keycode)
             }
-            // KEYS bound to an analog stick code (d-pad-as-left-stick, or a button
-            // bound to a "(send)" stick row): register the held deflection with the
-            // merge layer so a stick MOTION event can't release it mid-hold.
-            if (p_keycode in 110..123 && port in analogKeyHeld.indices)
-                analogKeyHeld[port][p_keycode] = pad_force / 32767f
             // Track for the LIVE pressure modifier (see TouchControls.notePressureKeyState).
             com.armsx2.ui.touch.TouchControls.notePressureKeyState(port, p_keycode, true)
             NativeApp.setPadButtonForPort(port, p_keycode, pad_force, true)
         } else if (p_action == KeyEventType.KeyUp || p_action == KeyEventType.Unknown) {
-            if (p_keycode in 110..123 && port in analogKeyHeld.indices)
-                analogKeyHeld[port].remove(p_keycode)
             com.armsx2.ui.touch.TouchControls.notePressureKeyState(port, p_keycode, false)
             NativeApp.setPadButtonForPort(port, p_keycode, 0, false)
         }
@@ -2320,6 +2461,24 @@ open class MainActivityRuntime : ComponentActivity() {
             if (showSystemBars) show(WindowInsetsCompat.Type.systemBars())
             else hide(WindowInsetsCompat.Type.systemBars())
             systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
+    }
+
+    // Every launcher in the app ends up here, the system document pickers included. On a device
+    // with nothing that handles one (HarmonyOS without Google services, issue #186) the platform
+    // throws ActivityNotFoundException straight out of the click that launched it and the app
+    // closes. Caught here once for all of them: SystemPickers either hands over to a caller's
+    // fallback or tells the user, and the launcher is answered as a cancel so its callback and
+    // the result registry's bookkeeping still complete.
+    @Deprecated("Deprecated in Java")
+    override fun startActivityForResult(intent: Intent, requestCode: Int, options: Bundle?) {
+        try {
+            super.startActivityForResult(intent, requestCode, options)
+        } catch (_: android.content.ActivityNotFoundException) {
+            com.armsx2.ui.common.SystemPickers.onLaunchFailed(this, intent)
+            window.decorView.post {
+                activityResultRegistry.dispatchResult(requestCode, RESULT_CANCELED, null)
+            }
         }
     }
 
@@ -2406,6 +2565,7 @@ open class MainActivityRuntime : ComponentActivity() {
         com.armsx2.SecondScreen.attach(applicationContext)
         com.armsx2.BatteryWatcher.load()
         com.armsx2.BatteryWatcher.start(applicationContext)
+        com.armsx2.packages.ShareInstalled.load()
         // Restore the saved rumble master toggle into the native gate (NativeApp.onPadRumble).
         NativeApp.sRumbleEnabled = ControllerMappings.rumbleEnabled()
         NativeApp.sPhoneRumbleEnabled = ControllerMappings.phoneRumbleEnabled()
@@ -2442,7 +2602,7 @@ open class MainActivityRuntime : ComponentActivity() {
                 if (legacy != null) listOf(legacy) else emptyList()
             }
         }
-        adoptPreparedSetup()
+        adoptPreparedSetup(applicationContext)
         runCatching { com.armsx2.TrophySound.load() }
         // Setup recovery. Auto Backup can restore our prefs (incl. setupComplete + the
         // ROMs URIs) on reinstall, but SAF/all-files PERMISSIONS are never backed up — so
@@ -2450,7 +2610,19 @@ open class MainActivityRuntime : ComponentActivity() {
         // the user in an empty library with the wizard skipped. If no configured ROMs
         // folder is actually reachable, drop setupComplete for this session so the wizard
         // re-runs (and re-requests the permission); finishSetup re-arms it.
-        if (setupComplete.value && !romsAccessible(this, romsDirs.value)) {
+        // Only when there IS a ROMs folder to lose. An install with none keeps its games in the data
+        // folder (a launcher's, see adoptPreparedSetup), and romsAccessible counts an empty list as
+        // lost, which put the wizard straight back after the skip.
+        if (setupComplete.value && romsDirs.value.isNotEmpty() && !romsAccessible(this, romsDirs.value)) {
+            setupComplete.value = false
+            setupRecoveryNeeded.value = true
+        }
+        // The same for a custom data folder (saves, firmware, caches). If it cannot be written,
+        // the app used to fall back to its own folder without a word, and the user's saves and
+        // firmware looked gone (issue #180). Re-run setup instead, before the core starts, so they
+        // can grant access again or pick the folder; nothing is moved or deleted.
+        if (setupComplete.value && systemDirPosix()?.let { !validateSystemDirWritable(it) } == true) {
+            println("@@ANDROID_DATA_ROOT@@ unwritable at launch: ${systemDirPosix()}, setup re-shown")
             setupComplete.value = false
             setupRecoveryNeeded.value = true
         }
@@ -2925,7 +3097,15 @@ open class MainActivityRuntime : ComponentActivity() {
                 Modifier.fillMaxSize(),
                 contentAlignment = Alignment.TopCenter,
             ) {
-                com.armsx2.ui.friends.FriendOnlineBanner()
+                androidx.compose.foundation.layout.Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    // Why the game stopped, when a thread of it died (watched in onStart)
+                    com.armsx2.ui.emulation.GameErrorBanner()
+                    com.armsx2.ui.friends.FriendOnlineBanner()
+                    // An RPCN invite for the running game (watched in onStart).
+                    com.armsx2.ui.friends.RpcnInviteBanner()
+                    // Remote play: a friend joining or leaving as player 2, for the host.
+                    com.armsx2.remoteplay.RemotePlayNoticeBanner()
+                }
             }
             }
         }
@@ -2958,6 +3138,9 @@ open class MainActivityRuntime : ComponentActivity() {
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        // Before anything can consume it: whether the pad is driving the menus decides whether
+        // selection highlights show at all.
+        com.armsx2.ui.common.PadInput.onKey(event)
         // The screensaver sees every key first: one that wakes it goes no further.
         if (com.armsx2.ui.home.LibraryScreensaver.onKey(event)) return true
         // Joy-Con buttons all arrive as KEYCODE_UNKNOWN (no Android key layout for 0x057E,
@@ -3066,7 +3249,8 @@ open class MainActivityRuntime : ComponentActivity() {
         // in-game L1/R1 still goes to the pad untouched. Placed after the capture blocks so
         // binding a shoulder button still works.
         if (kc == KeyEvent.KEYCODE_BUTTON_L1 || kc == KeyEvent.KEYCODE_BUTTON_R1) {
-            val cycleTab = com.armsx2.ui.settingshub.SettingsCategoryNav.cycle
+            val cycleTab = com.armsx2.ui.settingshub.SettingsCategoryNav.overlayCycle
+                ?: com.armsx2.ui.settingshub.SettingsCategoryNav.cycle
             if (cycleTab != null) {
                 if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0)
                     cycleTab(if (kc == KeyEvent.KEYCODE_BUTTON_L1) -1 else 1)
@@ -3145,6 +3329,8 @@ open class MainActivityRuntime : ComponentActivity() {
         // pads that report the D-pad as KEYCODE_DPAD_*. Placed before every other
         // frontend handler so nothing leaks to the grid behind it.
         if (com.armsx2.ui.home.LibraryKeyboard.visible.value) {
+            // The phone's volume keys stay the system's, as they are with any modal up.
+            if (isVolumeKey(kc)) return false
             if (event.action == KeyEvent.ACTION_DOWN) {
                 when (kc) {
                     KeyEvent.KEYCODE_DPAD_UP -> com.armsx2.ui.home.LibraryKeyboard.move(0, -1)
@@ -3167,6 +3353,7 @@ open class MainActivityRuntime : ComponentActivity() {
         // selection, A jumps to the setting, Y re-opens the keyboard, B closes. Owns the pad so
         // nothing leaks to the settings screen behind.
         if (com.armsx2.ui.settingshub.SettingsSearch.visible.value) {
+            if (isVolumeKey(kc)) return false // the system's, as with any modal up
             if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
                 when (kc) {
                     KeyEvent.KEYCODE_DPAD_UP -> com.armsx2.ui.settingshub.SettingsSearch.move(-1)
@@ -3188,6 +3375,9 @@ open class MainActivityRuntime : ComponentActivity() {
         // block above on purpose: naming a preset hands input to LibraryKeyboard, and it
         // must keep it until it closes.
         if (com.armsx2.ui.common.ShaderParamsEditor.visible) {
+            // Except the phone's own volume keys, which are the system's with the editor up or
+            // not: the swallow-everything below left the volume stuck while it was open.
+            if (isVolumeKey(kc)) return false
             val editor = com.armsx2.ui.common.ShaderParamsEditor
             val down = event.action == KeyEvent.ACTION_DOWN
             when (kc) {
@@ -3283,9 +3473,13 @@ open class MainActivityRuntime : ComponentActivity() {
             // model (HomeInputController). It must yield when something is layered
             // ON TOP of the library — the nav drawer, an in-game manager screen, or
             // the pause overlay — so those own the pad instead of the grid behind.
+            // Likewise a modal that claims its own nav layer (ConfirmOverlay, the
+            // install another app asked for): without this the grid kept the pad
+            // behind the question, B opened the drawer and A started the game under it.
             if (!WindowImpl.overlayVisible.value &&
                 WindowImpl.inGameScreen.value == null &&
                 !com.armsx2.navigation.UiNavigator.drawerOpen.value &&
+                com.armsx2.ui.settings.SettingsControllerNav.activeLayer.value == null &&
                 com.armsx2.ui.home.HomeInputController.active()
             ) {
                 // Square button (or the Menu hotkey) opens settings for the
@@ -3415,6 +3609,10 @@ open class MainActivityRuntime : ComponentActivity() {
                     if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) handleFrontendBack()
                     return true
                 }
+                // Triangle: the selected control's second action, where it has one
+                KeyEvent.KEYCODE_BUTTON_Y -> {
+                    if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0 && nav.secondary()) return true
+                }
             }
         }
         // Runtime: bound system hotkeys. Caught here so back-button bindings work
@@ -3462,6 +3660,10 @@ open class MainActivityRuntime : ComponentActivity() {
                 }
                 ControllerMappings.SysHotkey.GYRO_TOGGLE -> {
                     if (down && event.repeatCount == 0) toggleGyro()
+                    return true
+                }
+                ControllerMappings.SysHotkey.PRESSURE_MOD_TOGGLE -> {
+                    if (down && event.repeatCount == 0) togglePressureModifier()
                     return true
                 }
                 ControllerMappings.SysHotkey.GYRO_RECENTER -> {
@@ -3556,15 +3758,12 @@ open class MainActivityRuntime : ComponentActivity() {
         //
         // Deliberately keyed on the PHYSICAL code before remapping: what decides ownership is
         // how the hardware reports the trigger, not what the user bound it to.
+        //
+        // "Where there is an axis" means an axis that has moved, not one the pad merely lists: see
+        // liveTriggerAxes. A listed axis that never moves leaves these keys in charge.
         if (physicalCode == KeyEvent.KEYCODE_BUTTON_L2 || physicalCode == KeyEvent.KEYCODE_BUTTON_R2)
         {
-            val isLeft = physicalCode == KeyEvent.KEYCODE_BUTTON_L2
-            val axisA = if (isLeft) MotionEvent.AXIS_LTRIGGER else MotionEvent.AXIS_RTRIGGER
-            val axisB = if (isLeft) MotionEvent.AXIS_BRAKE else MotionEvent.AXIS_GAS
-            val axisC = if (isLeft) -1 else rightTriggerExtraAxis(event.deviceId)
-
-            if (deviceHasAxis(event.deviceId, axisA) || deviceHasAxis(event.deviceId, axisB) ||
-                deviceHasAxis(event.deviceId, axisC))
+            if (triggerAxisLive(event.deviceId, physicalCode == KeyEvent.KEYCODE_BUTTON_L2))
             {
                 return true
             }
@@ -3654,6 +3853,15 @@ open class MainActivityRuntime : ComponentActivity() {
         val on = !gyroActive.value
         gyroActive.value = on
         hotkeyToast(if (on) "Gyro ON" else "Gyro OFF")
+    }
+
+    /** The PRESSURE_MOD_TOGGLE hotkey (ARMSX2 #304): flips the soft-press modifier and leaves it,
+     *  applied to buttons already held just as the hold binding does. */
+    private fun togglePressureModifier() {
+        val on = !com.armsx2.ui.touch.TouchControls.pressureModifierHeld.value
+        com.armsx2.ui.touch.TouchControls.pressureModifierHeld.value = on
+        com.armsx2.ui.touch.TouchControls.reapplyPressureToHeldButtons()
+        hotkeyToast(if (on) "Pressure modifier ON" else "Pressure modifier OFF")
     }
 
     /** Re-zero the motion neutral. Routed through [gyroRecenterHook] because the sensor
@@ -3764,6 +3972,7 @@ open class MainActivityRuntime : ComponentActivity() {
     // on every other device — see maybeCorrectTouchScale). ALWAYS returns super, so it can never
     // block or consume a tap.
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        com.armsx2.ui.common.PadInput.onTouch(ev)
         if (com.armsx2.ui.home.LibraryScreensaver.onTouch(ev)) return true
         maybeCorrectTouchScale(ev)
         return super.dispatchTouchEvent(ev)
@@ -4008,6 +4217,7 @@ open class MainActivityRuntime : ComponentActivity() {
     }
 
     override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
+        com.armsx2.ui.common.PadInput.onMotion(ev)
         if (com.armsx2.ui.home.LibraryScreensaver.onMotion(ev)) return true
         // Controller-input diagnostic (ARMSX2_JOYCON): logged before ANY gate so it
         // captures the raw axes even mid-(re)bind and for SOURCE_DPAD-only events the
@@ -4090,12 +4300,13 @@ open class MainActivityRuntime : ComponentActivity() {
             // instead — take the max so we handle whichever the device
             // actually emits without double-driving when both are present.
             sendTrigger(ev, MotionEvent.AXIS_LTRIGGER, MotionEvent.AXIS_BRAKE,
-                KeyEvent.KEYCODE_BUTTON_L2, port)
+                KeyEvent.KEYCODE_BUTTON_L2, port, axisC = leftTriggerExtraAxis(ev.deviceId))
             sendTrigger(ev, MotionEvent.AXIS_RTRIGGER, MotionEvent.AXIS_GAS,
                 KeyEvent.KEYCODE_BUTTON_R2, port, axisC = rightTriggerExtraAxis(ev.deviceId))
             // Physical STICK DIRECTIONS bound to a PS2 control via the "(send)"
             // rows — e.g. R-Stick Down bound to send Square. The analog "(send)"
-            // targets contribute to the merge layer like every other writer.
+            // targets contribute to the merge layer like every other writer. A bound
+            // direction no longer drives its own stick direction too (dispatchStick).
             dispatchStickDirBindings(ev, port)
             // Single write per analog code per event, merged across ALL writers.
             flushAnalogAxes(port)
@@ -4113,6 +4324,11 @@ open class MainActivityRuntime : ComponentActivity() {
     // merge layer), thresholded for a digital one (change-tracked per code so we
     // only write edges, like dispatchDpadCombined).
     private val stickDirDigitalHeld = Array(8) { HashSet<Int>() } // per unified pad slot (multitap)
+
+    /** Whether this physical stick direction is bound to a pad control in Button mapping. */
+    private fun stickDirBound(left: Boolean, dir: ControllerMappings.StickDir, port: Int): Boolean =
+        ControllerMappings.targetForPhysical(ControllerMappings.stickHotkeyKeyCode(left, dir), port) != null
+
     private fun dispatchStickDirBindings(ev: MotionEvent, port: Int) {
         for (left in booleanArrayOf(true, false)) {
             // Same axis correction the main dispatch applies (swap, then inverts).
@@ -4138,7 +4354,11 @@ open class MainActivityRuntime : ComponentActivity() {
                     val on = mag > STICK_DIGITAL_THRESHOLD
                     val was = held.contains(target)
                     if (on != was) {
-                        NativeApp.setPadButtonForPort(port, target, if (on) 32767 else 0, on)
+                        if (target in com.armsx2.input.MotionButtons.CODES) {
+                            com.armsx2.input.MotionButtons.onKey(port, target, on)
+                        } else {
+                            NativeApp.setPadButtonForPort(port, target, if (on) 32767 else 0, on)
+                        }
                         if (on) held.add(target) else held.remove(target)
                     }
                 }
@@ -4189,6 +4409,23 @@ open class MainActivityRuntime : ComponentActivity() {
         val rz = runCatching { InputDevice.getDevice(deviceId)?.getMotionRange(MotionEvent.AXIS_RZ) }.getOrNull()
         if (rz != null && rz.min >= 0f) MotionEvent.AXIS_RZ else -1
     }
+    // The left-hand twin: the same pads put the left trigger on AXIS_Z. Again only when Z is a 0..1
+    // range, because a real right-stick-X spans -1..1. -1 = no such axis.
+    private val leftTriggerAxisCache = HashMap<Int, Int>()
+    private fun leftTriggerExtraAxis(deviceId: Int): Int = leftTriggerAxisCache.getOrPut(deviceId) {
+        val z = runCatching { InputDevice.getDevice(deviceId)?.getMotionRange(MotionEvent.AXIS_Z) }.getOrNull()
+        if (z != null && z.min >= 0f) MotionEvent.AXIS_Z else -1
+    }
+
+    // Trigger axes that have actually moved past the dead zone, per controller and side. A pad can
+    // list analog trigger axes and still deliver its triggers only as L2/R2 key events (an AYANEO
+    // Pocket DS, ARMSX3 #206): trusting the axes because they were listed dropped the keys and read
+    // an axis that never moves, so L2/R2 were dead in every game. Until a side's axis moves, that
+    // side's keys drive the trigger and sendTrigger writes nothing. Main thread only, like the caches
+    // above; device ids are new on every reconnect, so a re-paired pad starts over.
+    private val liveTriggerAxes = HashSet<Long>()
+    private fun liveTriggerKey(deviceId: Int, left: Boolean): Long = (deviceId.toLong() shl 1) or (if (left) 1L else 0L)
+    private fun triggerAxisLive(deviceId: Int, left: Boolean): Boolean = liveTriggerKey(deviceId, left) in liveTriggerAxes
 
     private var lastStickProbeMs = 0L
     private fun debugStickProbe(ev: MotionEvent) {
@@ -4311,6 +4548,11 @@ open class MainActivityRuntime : ComponentActivity() {
         val nav = com.armsx2.navigation.UiNavigator
         val onHome = nav.route.value == com.armsx2.navigation.AppRoute.Home
         when {
+            // An install another app asked for (issue #188) sits over every screen, so its
+            // question is what B answers, not the screen behind it.
+            com.armsx2.packages.ExternalInstall.showing.value != null -> com.armsx2.packages.ExternalInstall.cancel()
+            // The avatar picker covers the settings screen it was opened from, so B closes it first.
+            com.armsx2.ui.settings.RpcnAvatarPicker.open.value -> com.armsx2.ui.settings.RpcnAvatarPicker.open.value = false
             nav.drawerOpen.value -> nav.drawerOpen.value = false
             WindowImpl.inGameScreen.value != null -> WindowImpl.dismissInGameScreen()
             WindowImpl.showLibrary.value && !onHome -> nav.back()
@@ -4372,9 +4614,10 @@ open class MainActivityRuntime : ComponentActivity() {
                 com.armsx2.ui.emulation.EmulationMenuInputController.move(dx, dy)
             }
             // Library cover grid — only when it actually owns input (same gate as
-            // the key path: not behind the drawer / an in-game screen).
+            // the key path: not behind the drawer / an in-game screen / a modal).
             WindowImpl.inGameScreen.value == null &&
                 !com.armsx2.navigation.UiNavigator.drawerOpen.value &&
+                com.armsx2.ui.settings.SettingsControllerNav.activeLayer.value == null &&
                 com.armsx2.ui.home.HomeInputController.active() -> {
                 com.armsx2.ui.home.HomeInputController.move(dx, dy)
             }
@@ -4606,7 +4849,10 @@ open class MainActivityRuntime : ComponentActivity() {
         // Same axis pairs the gameplay path uses (sendTrigger), including the per-device third
         // axis some pads put the right trigger on, so a trigger that works in game can be bound.
         // Threshold is a deliberate half-pull: resting drift on a worn trigger must not self-bind.
-        val capLt = maxOf(ev.getAxisValue(MotionEvent.AXIS_LTRIGGER), ev.getAxisValue(MotionEvent.AXIS_BRAKE))
+        var capLt = maxOf(ev.getAxisValue(MotionEvent.AXIS_LTRIGGER), ev.getAxisValue(MotionEvent.AXIS_BRAKE))
+        leftTriggerExtraAxis(ev.deviceId).takeIf { it >= 0 }?.let { extra ->
+            capLt = maxOf(capLt, ev.getAxisValue(extra))
+        }
         var capRt = maxOf(ev.getAxisValue(MotionEvent.AXIS_RTRIGGER), ev.getAxisValue(MotionEvent.AXIS_GAS))
         rightTriggerExtraAxis(ev.deviceId).takeIf { it != 0 }?.let { extra ->
             capRt = maxOf(capRt, ev.getAxisValue(extra))
@@ -4762,6 +5008,22 @@ open class MainActivityRuntime : ComponentActivity() {
     private val analogAccum = HashMap<Int, Float>()
     private val analogPrevSent = Array(8) { HashMap<Int, Float>() } // per unified pad slot (multitap)
     val analogKeyHeld = Array(8) { HashMap<Int, Float>() } // written by sendKeyAction; per unified pad slot
+    private val analogMotionLast = Array(8) { HashMap<Int, Float>() } // last flush's motion-only contributions
+
+    /** Write ONE stick direction as the merge of the last motion event's contribution and any key
+     *  holding it, and record it as sent, so flushAnalogAxes' "changed?" test keeps matching what
+     *  the core holds. Used when a key changes between motion events (see sendKeyAction). */
+    private fun writeMergedAnalog(port: Int, code: Int) {
+        val v = maxOf(analogMotionLast[port][code] ?: 0f, analogKeyHeld[port][code] ?: 0f)
+        val prev = analogPrevSent[port]
+        if (v > 0f) {
+            NativeApp.setPadButtonForPort(port, code, (v * 32767).toInt(), true)
+            prev[code] = v
+        } else {
+            NativeApp.setPadButtonForPort(port, code, 0, false)
+            prev.remove(code)
+        }
+    }
 
     // ---- Gyro <-> physical-stick ADDITIVE combine (P1 / port 0) -----------
     // The aim/steer gyro drives a PS2 analog stick; so does the physical stick.
@@ -4789,6 +5051,10 @@ open class MainActivityRuntime : ComponentActivity() {
      *  (so stale codes release exactly once). */
     private fun flushAnalogAxes(port: Int) {
         val prev = analogPrevSent[port]
+        // What this event's motion contributed, before the key-held deflections are folded in,
+        // for writeMergedAnalog to merge a key change against without waiting for motion.
+        analogMotionLast[port].clear()
+        analogMotionLast[port].putAll(analogAccum)
         for ((code, held) in analogKeyHeld[port]) accumAnalog(code, held)
         // Release pass: codes we sent before but that have no contribution now.
         for (code in prev.keys) {
@@ -4825,14 +5091,17 @@ open class MainActivityRuntime : ComponentActivity() {
         val ay = abs(gy)
         if (ax >= ay) { if (ay < ax * STICK_CROSS_GATE) gy = 0f }
         else { if (ax < ay * STICK_CROSS_GATE) gx = 0f }
-        val mag = kotlin.math.hypot(gx, gy)
+        // Magnitude from the RAW vector: the snap only chooses the direction. Measured after it, a
+        // near-straight push lost the dropped axis's share and fell short of full tilt.
+        val mag = kotlin.math.hypot(vx, vy)
         if (mag <= 0f) return
         val shaped = shapeStickMag(mag.coerceAtMost(1f), left)
         // Dividing by the magnitude caps a full diagonal at the unit circle: 0.707 per axis, which
         // is what a circular-gated DualShock 3 really sends. Games that deadzone each axis on its
         // own then ignore diagonals almost entirely. Dividing by the LARGER axis instead expands
         // to the square, so a full diagonal reaches 1.0 on both. Same result on the cardinals.
-        val denom = if (ControllerMappings.stickSquareGate(left)) kotlin.math.max(abs(gx), abs(gy)) else mag
+        val denom = if (ControllerMappings.stickSquareGate(left)) kotlin.math.max(abs(gx), abs(gy))
+            else kotlin.math.hypot(gx, gy)
         val scale = if (denom > 0f) shaped / denom else 0f
         val ox = gx * scale
         val oy = gy * scale
@@ -4844,10 +5113,12 @@ open class MainActivityRuntime : ComponentActivity() {
      *  from the sensor callback on the main looper. [gx],[gy] are the signed,
      *  smoothed gyro vector in [-1,1]; (0,0) on settle/stop releases it. The gyro
      *  sums with whichever physical stick shares its axis (aim -> right, or the
-     *  user-chosen left for RE4-style games; steer -> left) so coarse stick aim
-     *  and fine gyro adjustment work together instead of clobbering each other. */
+     *  user-chosen left for RE4-style games; steer -> its own choice, left by
+     *  default) so coarse stick aim and fine gyro adjustment work together
+     *  instead of clobbering each other. */
     fun onGyroAnalog(mode: Int, gx: Float, gy: Float) {
-        gyroCombineLeft = mode == 2 ||
+        gyroCombineLeft =
+            (mode == 2 && ControllerMappings.gyroSteerStick() == ControllerMappings.GYRO_STICK_LEFT) ||
             (mode == 1 && ControllerMappings.gyroAimStick() == ControllerMappings.GYRO_STICK_LEFT)
         gyroVecX = gx; gyroVecY = gy
         gyroCombineActive = gx != 0f || gy != 0f
@@ -4887,6 +5158,14 @@ open class MainActivityRuntime : ComponentActivity() {
         if (ControllerMappings.stickSwapXY(leftStick)) { val t = vx; vx = vy; vy = t }
         if (ControllerMappings.stickInvertX(leftStick)) vx = -vx
         if (ControllerMappings.stickInvertY(leftStick)) vy = -vy
+        // A direction bound in Button mapping (a "(send)" row) drives only that binding, in
+        // dispatchStickDirBindings. Driving the stick's own direction as well sent both at once:
+        // swapping the right stick's left and right that way put R-Left and R-Right on the same
+        // axis together, and they cancelled out (ARMSX2 #604).
+        if (vx < 0f && stickDirBound(leftStick, ControllerMappings.StickDir.LEFT, port)) vx = 0f
+        if (vx > 0f && stickDirBound(leftStick, ControllerMappings.StickDir.RIGHT, port)) vx = 0f
+        if (vy < 0f && stickDirBound(leftStick, ControllerMappings.StickDir.UP, port)) vy = 0f
+        if (vy > 0f && stickDirBound(leftStick, ControllerMappings.StickDir.DOWN, port)) vy = 0f
         when (mode) {
             ControllerMappings.StickMode.ANALOG -> {
                 // Radial shaping into the merge layer (flushAnalogAxes writes once
@@ -5002,6 +5281,7 @@ open class MainActivityRuntime : ComponentActivity() {
             ControllerMappings.SysHotkey.CYCLE_SLOT -> cycleSaveSlot()
                 // TEXTURE_DUMP hotkey removed: PCSX2 texture dumping.
             ControllerMappings.SysHotkey.GYRO_TOGGLE -> toggleGyro()
+            ControllerMappings.SysHotkey.PRESSURE_MOD_TOGGLE -> togglePressureModifier()
             // GYRO_HOLD needs key up/down edges, which this edge-triggered path (stick
             // directions / combos) doesn't provide — behave as a toggle here rather than
             // latching gyro on with no release.
@@ -5209,17 +5489,28 @@ open class MainActivityRuntime : ComponentActivity() {
         // keycode binding path, so clearing/remapping them in the Pad tab was ignored.
         // Resolve the physical trigger keycode to its mapped PS2 target — null = cleared,
         // so the trigger is disabled; otherwise drive the resolved (possibly remapped) code.
-        val target = ControllerMappings.targetForPhysical(code, port) ?: return
         val raw = maxOf(
             maxOf(event.getAxisValue(axisA), event.getAxisValue(axisB)),
             if (axisC >= 0) event.getAxisValue(axisC) else 0f,
         ).coerceIn(0f, 1f)
+        // Until this side's axis has moved on this controller, its L2/R2 keys are in charge
+        // (liveTriggerAxes), and writing "released" here on every stick event would cancel a held
+        // key press, the same shape as the no-axis case above.
+        val left = code == KeyEvent.KEYCODE_BUTTON_L2
+        if (!triggerAxisLive(event.deviceId, left)) {
+            if (raw <= TRIGGER_DEAD) return
+            liveTriggerAxes.add(liveTriggerKey(event.deviceId, left))
+        }
+        val target = ControllerMappings.targetForPhysical(code, port) ?: return
         val out = if (raw <= TRIGGER_DEAD) 0f else (raw - TRIGGER_DEAD) / (1f - TRIGGER_DEAD)
         if (target in 110..123) {
             // Trigger bound to a PS2 STICK direction ("(send)" rows): contribute the
             // proportional pressure to the merge layer so it can't be released by
             // the target stick's own (resting) ANALOG writer in the same event.
             accumAnalog(target, out)
+        } else if (target in com.armsx2.input.MotionButtons.CODES) {
+            // A trigger mapped to a motion action: held past the dead zone, released below it.
+            com.armsx2.input.MotionButtons.onKey(port, target, out > 0f)
         } else {
             // coerceAtLeast(1) because range 0 is the input layer's "full press"
             // convention: the lightest real squeeze floors to 0 here, which would
@@ -5238,7 +5529,7 @@ open class MainActivityRuntime : ComponentActivity() {
     private fun triggerTravel(ev: MotionEvent, left: Boolean): Float {
         val a = if (left) MotionEvent.AXIS_LTRIGGER else MotionEvent.AXIS_RTRIGGER
         val b = if (left) MotionEvent.AXIS_BRAKE else MotionEvent.AXIS_GAS
-        val c = if (left) -1 else rightTriggerExtraAxis(ev.deviceId)
+        val c = if (left) leftTriggerExtraAxis(ev.deviceId) else rightTriggerExtraAxis(ev.deviceId)
         if (!deviceHasAxis(ev.deviceId, a) && !deviceHasAxis(ev.deviceId, b) &&
             !deviceHasAxis(ev.deviceId, c))
             return -1f
@@ -5301,6 +5592,9 @@ open class MainActivityRuntime : ComponentActivity() {
         // effect would call start() and play the track on the OS home screen. setForeground(false)
         // also pauses whatever is currently playing.
         com.armsx2.PauseMusic.setForeground(false)
+        // The avatar picker's track too, before LibraryMusic.pause() below: it hands that one its
+        // share back when the picker is already closing, and the pause then holds it
+        com.armsx2.AvatarMusic.setForeground(false)
         // Leaving the app (home / recents / slide-out) while a game is running:
         // open the pause OVERLAY instead of a silent pause. A bare pause left
         // users staring at a frozen game with no obvious way back — they had to
@@ -5323,6 +5617,56 @@ open class MainActivityRuntime : ComponentActivity() {
         com.armsx2.LibraryMusic.pause()
         // Pause-menu track was already paused by setForeground(false) at the top of onPause.
         super.onPause()
+    }
+
+    // Stopped, not paused: a split-screen or picture-in-picture app is paused but still in sight.
+    // Out of sight a locked device can sit for hours with the app on top, which Android never
+    // freezes, so everything that polls slows down until onStart (#196).
+    // While the app is in sight, a game whose RPCN session is signed in gets that session kept
+    // reachable in the background (OnlineSession). Watched from here because Android lets a
+    // foreground service start only from the foreground; the game stopping releases it. The same
+    // watch puts up the banner for an RPCN invite to that game (RpcnInviteNotice), and the one for
+    // a game that stopped because a thread of it died (GameErrorNotice).
+    private var onlineSessionWatch: Job? = null
+
+    override fun onStart() {
+        super.onStart()
+        runCatching { NativeApp.setAppBackgrounded(false) }
+        com.armsx2.DiscordPresence.setForeground(true)
+        com.armsx2.input.MicDevices.watch(applicationContext)
+        com.armsx2.input.UsbPassthrough.watch(applicationContext)
+        onlineSessionWatch?.cancel()
+        onlineSessionWatch = lifecycleScope.launch {
+            while (true) {
+                // A reason left from a game already stopped is that game's, and goes with it
+                val gameError = withContext(Dispatchers.IO) { com.armsx3.Rpcs3Bridge.takeGameError() }
+                if (eState.value != EmuState.STOPPED) {
+                    if (gameError.isNotBlank()) com.armsx2.ui.emulation.GameErrorNotice.show(gameError)
+
+                    // Off the main thread: peek_instance waits out a client being torn down
+                    val invites = withContext(Dispatchers.IO) {
+                        if (com.armsx3.Rpcs3Bridge.rpcnSignedIn()) com.armsx3.Rpcs3Bridge.rpcnGetInvites() else null
+                    }
+
+                    if (invites != null) {
+                        com.armsx2.online.OnlineSession.keepAlive(applicationContext)
+                        com.armsx2.ui.friends.RpcnInviteNotice.update(com.armsx2.ui.settings.parseRpcnInvites(invites))
+                    }
+                } else {
+                    com.armsx2.ui.friends.RpcnInviteNotice.reset()
+                    com.armsx2.ui.emulation.GameErrorNotice.clear()
+                }
+                delay(2_000)
+            }
+        }
+    }
+
+    override fun onStop() {
+        onlineSessionWatch?.cancel()
+        onlineSessionWatch = null
+        runCatching { NativeApp.setAppBackgrounded(true) }
+        com.armsx2.DiscordPresence.setForeground(false)
+        super.onStop()
     }
 
     override fun onResume() {
@@ -5356,6 +5700,8 @@ open class MainActivityRuntime : ComponentActivity() {
         if (WindowImpl.overlayVisible.value || WindowImpl.inGameScreen.value != null) {
             com.armsx2.PauseMusic.start(this)
         }
+        // And the avatar picker's, if it is still up (the two above stay quiet under it)
+        com.armsx2.AvatarMusic.setForeground(true)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -5386,6 +5732,9 @@ open class MainActivityRuntime : ComponentActivity() {
     }
 
     private fun handleExternalLaunchIntent(intent: Intent?) {
+        // An install another app asked for (issue #188), which carries no game. Taken first so
+        // nothing below can read it as a launch.
+        if (com.armsx2.packages.ExternalInstall.accept(intent)) return
         val launched = extractLaunchUri(intent) ?: return
         persistReadGrant(intent, launched)
         // A .ps3 shortcut handed over as a file stands for the installed game its title id names.

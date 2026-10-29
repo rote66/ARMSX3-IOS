@@ -11,6 +11,17 @@
     <uses-permission android:name="archos.permission.FULLSCREEN.FULL" />
     <!-- Cover artwork can be loaded from the configured remote artwork source. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Remote play: finding hosts on the same Wi-Fi (DNS-SD). Some drivers drop the multicast
+         replies unless an app holds a multicast lock. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- Remote play on Android 17, which keeps an app that targets it off the local network
+         without this: finding and joining hosts on the same Wi-Fi, and the router port for online
+         hosting. A runtime permission in the Nearby devices group, asked for only when remote play
+         needs it (RemotePlayLocalNetwork.kt). -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+    <!-- Remote play: a low-latency Wi-Fi lock while a stream runs, so the radio does not doze
+         between packets (Android requires this permission for any Wi-Fi lock). -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28"
@@ -36,25 +47,46 @@
          isn't gated for devices without a gyroscope. -->
     <uses-feature android:name="android.hardware.sensor.gyroscope" android:required="false" />
 
+    <!-- Real toy portals passed through to games (UsbPassthrough). Optional: most devices never see one. -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+
     <!--
         The Discord Social SDK .aar is now a real dependency, so its manifest merges into ours and
         brings its <queries> for CustomTabsService with it — no need to restate that here.
 
         What we DO have to undo is its voice permissions. The SDK declares RECORD_AUDIO, three
-        foreground-service permissions and Bluetooth for features we do not ship, and merged
-        unchallenged they would put "Microphone" on the Play listing and require a data-safety
-        declaration for a capability that does not exist in this app.
+        foreground-service permissions and Bluetooth for its voice chat, which we do not ship.
+        FOREGROUND_SERVICE and RECORD_AUDIO are ours as well now (the online keep-alive and the
+        microphone below), so only the SDK's two typed services and MODIFY_AUDIO_SETTINGS go.
 
         tools:node="remove" is the supported way to drop a merged permission, and it is checked:
-        build-play-aab.sh fails the build if RECORD_AUDIO or REQUEST_INSTALL_PACKAGES survive into
-        the bundle, so a regression here cannot ship quietly.
+        build-play-aab.sh fails the build if a removed one survives into the bundle, so a
+        regression here cannot ship quietly.
     -->
-    <uses-permission android:name="android.permission.RECORD_AUDIO" tools:node="remove" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" tools:node="remove" />
+    <!--
+        The microphone, for games that are sung or spoken into (Audio settings, Microphone;
+        MicDevices). Both flavors: on Play it shows "Microphone" on the listing, and the data safety
+        form says audio is used on the device only, never collected or shared.
+    -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- RECORD_AUDIO implies a microphone, and Play hides an app from every device without the
+         hardware its permissions imply unless it is declared optional: 1.4's first upload lost four
+         devices that 1.3.2 reached. Games just hear nothing on a device with no microphone. -->
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" tools:node="remove" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" tools:node="remove" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" tools:node="remove" />
     <!-- The SDK's voice foreground service goes with them; we never start a call. -->
+
+    <!--
+        The foreground service that keeps a running game's RPCN session reachable while the app is
+        in the background (com.armsx2.online.OnlineSession). Android 15 otherwise cuts the app's
+        network a few seconds after it leaves the screen, and the server closes the player's lobby.
+        Both flavors: the play listing needs a Play Console declaration of the special use type
+        (App content, Foreground service permissions) before a bundle with this can be published.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
     <application
         android:name=".Pasx2Application"
@@ -122,6 +154,15 @@
             </intent-filter>
         </activity>
 
+        <!-- Remote play viewer: a friend's game streamed here, played as player 2. -->
+        <activity
+            android:name="com.armsx2.remoteplay.RemotePlayViewerActivity"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|navigation"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:hardwareAccelerated="true"
+            android:screenOrientation="sensorLandscape" />
+
         <activity-alias
             android:name=".MainActivity"
             android:exported="true"
@@ -145,6 +186,56 @@
         </receiver>
 
         <!--
+            Issue #188: another app (a game library manager) asks ARMSX3 to install a package or a
+            licence, and gets the result back. See com.armsx2.packages.ExternalInstall.
+
+            Started for a result, so it runs in the caller's task; it sends the user to Main to
+            confirm and waits there. taskAffinity="" keeps it out of ARMSX3's own task when it is
+            started as a new task (adb, a launcher): there it would sit on top of Main, and starting
+            Main from it would make a second Main. configChanges, so a rotation cannot recreate it
+            mid-request and lose the caller.
+
+            The action is the same in both builds on purpose; the package tells them apart. Three
+            filters because a filter with a MIME type only matches intents that have one: no data,
+            data without a type, and anything with a type (content:// data always has one, from
+            its provider).
+        -->
+        <activity
+            android:name="com.armsx2.packages.ExternalInstallActivity"
+            android:exported="true"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|navigation">
+            <intent-filter>
+                <action android:name="com.armsx3.action.INSTALL" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="com.armsx3.action.INSTALL" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="com.armsx3.action.INSTALL" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+        </activity>
+
+        <!--
+            Issue #188: which titles and licences are installed, for other apps to read. Answers
+            only once the user turns on Settings > App > Share installed games with other apps,
+            which is the gate a permission could not be: any app can declare a normal permission.
+        -->
+        <provider
+            android:name="com.armsx2.packages.InstalledTitlesProvider"
+            android:authorities="${applicationId}.installed"
+            android:exported="true"
+            tools:ignore="ExportedContentProvider" />
+
+        <!--
             Discord Social SDK's OAuth landing activity. Declared here rather than inherited from
             the vendor .aar on purpose: that .aar's manifest also declares RECORD_AUDIO, three
             foreground-service permissions and Bluetooth for its voice features, and the merger
@@ -152,9 +243,13 @@
             need a data-safety declaration for a feature we do not ship. Declaring only this one
             activity means we inherit no permissions at all.
 
-            The scheme must match the redirect URI registered in the Discord developer portal
-            (discord-<application id>) or the browser hands the code back to nothing and the sign-in
-            silently never completes. Same id as kApplicationId in cpp/discord_bridge.cpp. ARMSX3 app id: 1534624714989764829.
+            The scheme must match a redirect URI registered in the Discord developer portal or the
+            browser hands the code back to nothing and the sign-in silently never completes. It comes
+            from the flavor (discordAuthScheme in app/build.gradle.kts): the github build uses the
+            default discord-<application id>, the play build its own discord-<application id>-play, so
+            the two installed side by side do not both claim the result. Any scheme has to start with
+            "discord-": the SDK's AuthenticationActivity ignores callbacks on any other scheme. Same id as kApplicationId in
+            cpp/discord_bridge.cpp. ARMSX3 app id: 1534624714989764829.
 
             Its ForegroundService is deliberately NOT declared — it exists for voice.
         -->
@@ -168,13 +263,24 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="discord-1534624714989764829" />
+                <data android:scheme="${discordAuthScheme}" />
             </intent-filter>
         </activity>
 
         <!-- Voice-only; we never start a call, and a declared foreground service we never use is
              just Play-review surface. -->
         <service android:name="com.discord.socialsdk.ForegroundService" tools:node="remove" />
+
+        <!-- The online keep-alive (see FOREGROUND_SERVICE above) -->
+        <service
+            android:name="com.armsx2.online.OnlineSessionService"
+            android:exported="false"
+            android:stopWithTask="true"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps an online game's connection to its matchmaking server while the player switches apps" />
+        </service>
 
         <!--
             The Discord helper, in its own process.

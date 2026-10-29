@@ -27,12 +27,10 @@ endforeach()
 # Reuse Android's cross-platform launcher media instead of maintaining a second
 # copy with subtly different audio/video assets.
 set(ARMSX3_ANDROID_APP_RAW ${CMAKE_SOURCE_DIR}/android/armsx3-app/app/src/main/res/raw)
-set(ARMSX3_ANDROID_UI_RAW ${CMAKE_SOURCE_DIR}/android/armsx3-ui/app/src/main/res/raw)
 set(ARMSX3_APP_MEDIA
     ${ARMSX3_ANDROID_APP_RAW}/library_music.m4a
     ${ARMSX3_ANDROID_APP_RAW}/pause_music.mp3
-    ${ARMSX3_ANDROID_APP_RAW}/boot_intro.mp4
-    ${ARMSX3_ANDROID_UI_RAW}/library_fallback.gif)
+    ${ARMSX3_ANDROID_APP_RAW}/boot_intro.mp4)
 foreach(media_file IN LISTS ARMSX3_APP_MEDIA)
     set_source_files_properties("${media_file}" PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
 endforeach()
@@ -122,7 +120,7 @@ set_target_properties(ARMSX3 PROPERTIES
     MACOSX_BUNDLE_BUNDLE_NAME ARMSX3
     MACOSX_BUNDLE_GUI_IDENTIFIER com.armsx3.ios
     MACOSX_BUNDLE_SHORT_VERSION_STRING 0.9.9
-    MACOSX_BUNDLE_BUNDLE_VERSION 116
+    MACOSX_BUNDLE_BUNDLE_VERSION 117
     XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER com.armsx3.ios
     XCODE_ATTRIBUTE_CLANG_ENABLE_OBJC_ARC YES
     XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET 15.0

@@ -46,12 +46,37 @@ vec4 apply_zclip_xform(
 		// Compress Z and store towards highest end of the range
 		d = min(1., 0.99 + (0.01 * (pos.z - near_plane) / (far_plane - near_plane)));
 	}
+	else if (d < 0.f && d > -0.000002)
+	{
+		// Rounding put a layer drawn right on the near or far plane a hair outside [0, 1], where
+		// it would be clipped. Back onto the edge, as the fp64 path above snaps it; the margin is
+		// the value that path started from (one float step at 1.0 is already 0.00000012).
+		d = 0.f;
+	}
+	else if (d > 1.f && d < 1.000002)
+	{
+		d = 1.f;
+	}
 	else // This catch-call also handles w=0 since d=inf
 	{
 		return pos;
 	}
 
 	return vec4(pos.x, pos.y, d * pos.w, pos.w);
+}
+#endif
+
+#ifdef _EMULATE_DEPTH_RANGE
+// The host viewport only holds [0, 1] while float depth targets store window Z far above 1.
+// Map the clip range linearly onto the viewport instead; the fragment stage recovers the window Z.
+vec4 apply_depth_range_xform(const in vec4 pos, const in vec2 range)
+{
+	if (range.y <= range.x)
+	{
+		return pos;
+	}
+
+	return vec4(pos.xy, (pos.z - range.x * pos.w) / (range.y - range.x), pos.w);
 }
 #endif
 
@@ -77,9 +102,12 @@ vec4 _fetch_constant(const in uint base_offset)
 	return _fetch_constant(int(base_offset));
 }
 #elif defined(VULKAN)
-#define _fetch_constant(x) vc[x + xform_constants_offset]
+#define _fetch_constant(x) vc[(x) + xform_constants_offset]
 #else
 #define _fetch_constant(x) vc[x]
 #endif
+
+// Indexed access needs bounds checking
+#define _fetch_indexed_constant(x) (((x) < 468) ? _fetch_constant(x) : vec4(0.))
 
 )"

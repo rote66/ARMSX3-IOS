@@ -713,10 +713,60 @@ static s32 savedata_check_args(u32 operation, u32 version, vm::cptr<char> dirNam
 	return CELL_OK;
 }
 
+// ARMSX3: puts a finished save in place when its working folder cannot be renamed there.
+//
+// Android's shared storage refuses some folder renames outright, with errno 1 (EPERM). A tester's
+// data folder under /storage/emulated/0 (Naruto: Ultimate Ninja Storm, Android 15, 2026-10-24)
+// let the old save be renamed to its hidden .backup_ name, then refused to rename the hidden
+// .working_ folder to the save's own name. That happened on every save, so none ever finished:
+// the save thread stopped on it and the game waited for it forever, and the newest save stayed
+// hidden in .working_, which reads as saves lost. Making folders and writing files there works,
+// so the save is copied into place file by file instead (save folders hold files only), and the
+// working folder goes once all of it is across. Through fs::file rather than fs::copy_file, which
+// does not handle a folder reached through the storage device (saf_device).
+bool savedata_commit_by_copy(const std::string& from, const std::string& to)
+{
+	const std::string src = from.ends_with('/') ? from : from + '/';
+	const std::string dst = to.ends_with('/') ? to : to + '/';
+
+	if (!fs::create_dir(dst) && fs::g_tls_error != fs::error::exist)
+	{
+		return false;
+	}
+
+	for (const auto& entry : fs::dir(src))
+	{
+		if (entry.name == "." || entry.name == "..")
+		{
+			continue;
+		}
+
+		if (entry.is_directory)
+		{
+			return false;
+		}
+
+		const fs::file file(src + entry.name);
+
+		if (!file || !fs::write_file(dst + entry.name, fs::rewrite, file.to_vector<u8>()))
+		{
+			return false;
+		}
+
+		fs::utime(dst + entry.name, entry.atime, entry.mtime);
+	}
+
+	fs::sync(dst);
+	fs::remove_all(src);
+	return true;
+}
+
 static NEVER_INLINE error_code savedata_op(ppu_thread& ppu, u32 operation, u32 version, vm::cptr<char> dirName,
 	u32 errDialog, PSetList setList, PSetBuf setBuf, PFuncList funcList, PFuncFixed funcFixed, PFuncStat funcStat,
 	PFuncFile funcFile, u32 container, u32 unk_op_flags /*TODO*/, vm::ptr<void> userdata, u32 userId, PFuncDone funcDone)
 {
+	const u64 op_start_time = get_guest_system_time();
+
 	if (setList)
 	{
 		if (const auto& [ok, list] = setList.try_read(); ok)
@@ -1596,6 +1646,12 @@ static NEVER_INLINE error_code savedata_op(ppu_thread& ppu, u32 operation, u32 v
 		});
 		// clang-format on
 
+		// Up to SDK 2.6, or with fileListMax 0, fileNum and sizeKB only cover the files that fit in fileList
+		if ((g_ps3_process_info.sdk_ver <= 0x26FFFF || !setBuf->fileListMax) && files_sorted.size() > setBuf->fileListMax)
+		{
+			files_sorted.erase(files_sorted.begin() + setBuf->fileListMax, files_sorted.end());
+		}
+
 		for (auto&& entry : files_sorted)
 		{
 			{
@@ -1863,6 +1919,8 @@ static NEVER_INLINE error_code savedata_op(ppu_thread& ppu, u32 operation, u32 v
 	error_code savedata_result = CELL_OK;
 
 	u64 delay_save_until = 0;
+	u64 file_ops = 0;
+	u64 secure_file_ops = 0;
 
 	while (funcFile)
 	{
@@ -1883,7 +1941,17 @@ static NEVER_INLINE error_code savedata_op(ppu_thread& ppu, u32 operation, u32 v
 
 				// Some games (Jak II [NPUA80707]) rely on this delay
 				lv2_obj::sleep(ppu);
-				delay_save_until = get_guest_system_time() + (has_modified ? 500'000 : 100'000);
+				if (operation <= SAVEDATA_OP_AUTO_LOAD)
+				{
+					// Lower bound of the time measured on a PS3 from the AutoSave/AutoLoad call to its return:
+					// 630 ms, 550 ms more when data is modified, 50 ms per file read or written, 280 ms more per secure file
+					delay_save_until = op_start_time + 630'000 + (has_modified ? 550'000 : 0) + file_ops * 50'000 + secure_file_ops * 280'000;
+				}
+				else
+				{
+					delay_save_until = get_guest_system_time() + (has_modified ? 500'000 : 100'000);
+				}
+
 				break;
 			}
 
@@ -1901,6 +1969,12 @@ static NEVER_INLINE error_code savedata_op(ppu_thread& ppu, u32 operation, u32 v
 		}
 
 		// TODO: Show progress if it's not an auto load/save
+
+		if (fileSet->fileOperation != CELL_SAVEDATA_FILEOP_DELETE)
+		{
+			file_ops++;
+			secure_file_ops += fileSet->fileType == CELL_SAVEDATA_FILETYPE_SECUREFILE;
+		}
 
 		std::string file_path;
 
@@ -2189,7 +2263,14 @@ static NEVER_INLINE error_code savedata_op(ppu_thread& ppu, u32 operation, u32 v
 
 		// Remove old backup
 		fs::remove_all(old_path);
-		fs::sync();
+		fs::sync(new_path);
+
+#ifndef _WIN32
+		if (fs::g_tls_error != fs::error::ok)
+		{
+			cellSaveData.warning("savedata_op(): Failed to sync filesystem of '%s' (%s)", new_path, fs::g_tls_error);
+		}
+#endif
 
 		// Backup old savedata
 		if (!vfs::host::rename(dir_path, old_path, &g_mp_sys_dev_hdd0, false))
@@ -2200,8 +2281,16 @@ static NEVER_INLINE error_code savedata_op(ppu_thread& ppu, u32 operation, u32 v
 		// Commit new savedata
 		if (!vfs::host::rename(new_path, dir_path, &g_mp_sys_dev_hdd0, false))
 		{
-			// TODO: handle the case when only commit failed at the next save load
-			fmt::throw_exception("Failed to move directory %s (%s)", new_path, fs::g_tls_error);
+			// ARMSX3: storage that refuses the rename gets the save copied into place instead
+			const fs::error rename_error = fs::g_tls_error;
+
+			if (!savedata_commit_by_copy(new_path, dir_path))
+			{
+				// TODO: handle the case when only commit failed at the next save load
+				fmt::throw_exception("Failed to move directory %s (%s)", new_path, rename_error);
+			}
+
+			cellSaveData.warning("savedata_op(): Could not rename %s into place (%s), copied it instead", new_path, rename_error);
 		}
 
 		// Remove backup again (TODO: may be changed to persistent backup implementation)

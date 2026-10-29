@@ -1162,7 +1162,15 @@ static usz apply_modification(std::vector<u32>& applied, patch_engine::patch_inf
 				continue;
 			}
 
-			const u32 alloc_size = utils::align(static_cast<u32>(p.value.long_value + 1) * 4, 0x10000);
+			// Include the return hook, and leave room for 64 KiB allocation alignment.
+			if (p.value.long_value >= (u32{umax} & -0x10000) / 4)
+			{
+				fmt::throw_exception("Invalid calloc instruction count %u at 0x%x (patch '%s', hash '%s')",
+					p.value.long_value, out_branch, patch.description, patch.hash);
+			}
+
+			const u32 code_size = static_cast<u32>(p.value.long_value + 1) * 4;
+			const u32 alloc_size = utils::align(code_size, 0x10000);
 
 			// Check if should maybe reuse previous code cave allocation (0 size)
 			if (alloc_size - 4 != 0)
@@ -1198,7 +1206,7 @@ static usz apply_modification(std::vector<u32>& applied, patch_engine::patch_inf
 
 			if (!addr)
 			{
-				patch_log.error("Failed to allocate 0x%x bytes for code (entry=0x%x)", alloc_size, addr, out_branch);
+				patch_log.error("Failed to allocate 0x%x bytes for code (entry=0x%x)", alloc_size, out_branch);
 				continue;
 			}
 
@@ -1235,6 +1243,11 @@ static usz apply_modification(std::vector<u32>& applied, patch_engine::patch_inf
 			// Record the insertion point as a faux block.
 			g_fxo->need<ppu_patch_block_registry_t>();
 			g_fxo->get<ppu_patch_block_registry_t>().block_addresses.insert(resval);
+
+			// Keep the initialized helper extent separate from its allocation padding
+			auto& ranges = g_fxo->get<ppu_patch_block_registry_t>().code_ranges;
+			std::erase_if(ranges, [addr](const auto& range) { return range.addr == addr; });
+			ranges.push_back({addr, code_size, fmt::format("%s (hash '%s')", patch.description, patch.hash)});
 
 			relocate_instructions_at = addr;
 			break;
@@ -1275,9 +1288,10 @@ static usz apply_modification(std::vector<u32>& applied, patch_engine::patch_inf
 			if (func_name.starts_with("0x"sv))
 			{
 				// Raw hexadecimal-formatted FNID (real function name cannot contain a digit at the start, derived from C/CPP which were used in PS3 development)
-				const auto result = std::from_chars(func_name.data() + 2, func_name.data() + func_name.size() - 2, id, 16);
-
-				if (result.ec != std::errc() || str.data() + sep_pos != result.ptr)
+				const std::string_view hex = func_name.substr(2);
+				const auto result = std::from_chars(hex.data(), hex.data() + hex.size(), id, 16);
+				
+				if (result.ec != std::errc() || result.ptr != hex.data() + hex.size())
 				{
 					continue;
 				}
@@ -1444,7 +1458,7 @@ static usz apply_modification(std::vector<u32>& applied, patch_engine::patch_inf
 
 			if (dest_path.empty())
 			{
-				patch_log.error("Failed to patch file path at '%s': destination is not mounted", original_vfs_path, dest_vfs_path);
+				patch_log.error("Failed to patch file path at '%s': destination is not mounted", original_vfs_path);
 				continue;
 			}
 
@@ -1471,14 +1485,20 @@ static usz apply_modification(std::vector<u32>& applied, patch_engine::patch_inf
 // Gran Turismo 6 v01.22 reads every frame back for its MLAA pass, so it only renders correctly
 // with Write and Read Color Buffers on, which cost a lot of frame time. illusion's "Disable MLAA"
 // removes the pass, after which the buffers only cost time. Tied to the patch being applied, not
-// to the version: other v01.22 executables are in circulation (RPCS3's database knows another for
-// BCUS98296), and without the patch those still need the buffers, which then stay as configured.
+// to the version: other v01.22 executables are in circulation, and without the patch those still
+// need the buffers, which then stay as configured.
 static void armsx3_apply_patch_settings(const std::string& hash, const std::string& description)
 {
 	static constexpr std::string_view gt6_mlaa_hashes[] =
 	{
 		"PPU-42367707f4caac2668f10cb46498f64bde9db440", // BCUS99247 v01.22
 		"PPU-4f1e9acd7d98961b4b742fb324a2faba6212ea67", // BCUS98296 v01.22
+		"PPU-6ac472e1f334f54ec4753cde9e8e1515bfab4d17", // BCUS98296 v01.22, the one RPCS3's database lists
+		"PPU-638ef307e2b35d593f599efec0dc0c37059a984b", // BCES01893 v01.22
+		"PPU-80f0d67b29d3d17ac885a309a3fc4cd8dcf50658", // NPEA00502 v01.22
+		"PPU-4213aba5ed17f7e3cd3f299fa44d9d9acef0ba18", // NPUA81049 v01.22
+		"PPU-6a7de7fdfd7e7cbd1031bf28a7104b29c308136c", // NPHA80269 v01.22
+		"PPU-43e618448eed82aa96856338d072f1e4978c36a8", // NPJA00113 v01.22
 	};
 
 	if (description != "Disable MLAA")
@@ -1673,6 +1693,12 @@ void patch_engine::unload(const std::string& name)
 			// Deallocate used memory
 			if (u32 addr = std::exchange(entry.alloc_addr, 0))
 			{
+				if (g_fxo->is_init<ppu_patch_block_registry_t>())
+				{
+					std::erase_if(g_fxo->get<ppu_patch_block_registry_t>().code_ranges,
+						[addr](const auto& range) { return range.addr == addr; });
+				}
+
 				vm::dealloc(addr);
 
 				auto alloc_map = vm::get(vm::any, addr);

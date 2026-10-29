@@ -27,6 +27,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -59,6 +61,11 @@ import com.armsx2.ui.common.GlassPanel
 import com.armsx2.ui.common.RoundAction
 import com.armsx2.ui.common.SettingSwitchRow
 import com.armsx2.ui.settings.controllerFocusable
+import com.armsx2.ui.settings.RpcnFriendsList
+import com.armsx3.Rpcs3Bridge
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
 
 /**
  * Who else is in ARMSX2 right now, via Discord.
@@ -74,8 +81,52 @@ fun FriendsScreen(onBack: () -> Unit) {
             ArmsTopBar(
                 title = str("friends.title"),
                 leading = { RoundAction("←", str("action.back"), onClick = onBack) },
+                // Who you are on each: the RPCN account (with the avatar games show) and Discord
+                actions = {
+                    RpcnSelfChip(Modifier.padding(horizontal = 6.dp), caption = "RPCN")
+                    if (DiscordPresence.available()) SelfChip(Modifier.padding(horizontal = 6.dp), caption = "Discord")
+                },
             )
+            RpcnFriendsPanel(Modifier.padding(horizontal = 8.dp).padding(bottom = 10.dp))
             FriendsPanel(Modifier.padding(horizontal = 8.dp))
+        }
+    }
+}
+
+/**
+ * RPCN friends and the requests waiting on them, for whoever plays online through RPCN.
+ *
+ * The rest of this tab is Discord's, and a friend request on RPCN had no screen at all: the RPCN
+ * settings listed accepted friends only. A game's invite list offers RPCN friends who are online,
+ * so a request nobody could see was a friend nobody could invite. Shown only once an RPCN account
+ * is set up, so the tab stays Discord's for everyone else.
+ *
+ * In the in-game menu ([inGame]) it lists game invites, which only the running game can take, and
+ * leaves out Remove, which there would only be in the way.
+ */
+@Composable
+fun RpcnFriendsPanel(modifier: Modifier = Modifier, inGame: Boolean = false) {
+    var configured by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        configured = withContext(Dispatchers.IO) {
+            runCatching { JSONObject(Rpcs3Bridge.rpcnStatus()).optBoolean("configured") }.getOrDefault(false)
+        }
+    }
+    if (!configured) return
+
+    GlassPanel(modifier.fillMaxWidth()) {
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(
+                str("friends.rpcn.title"),
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+            )
+            RpcnFriendsList(
+                controllerIdPrefix = "friends.rpcn",
+                canAdd = false,
+                canRemove = !inGame,
+                showInvites = inGame,
+            )
         }
     }
 }
@@ -92,6 +143,7 @@ fun FriendsPanel(modifier: Modifier = Modifier) {
     val friends by DiscordPresence.friends
     val error by DiscordPresence.error
     val notify by DiscordPresence.notifyState
+    val showGame by DiscordPresence.showGameState
 
     Column(
         modifier.fillMaxWidth(),
@@ -188,12 +240,20 @@ fun FriendsPanel(modifier: Modifier = Modifier) {
 
         if (status == DiscordPresence.CONNECTED) {
             GlassPanel(Modifier.fillMaxWidth()) {
-                SettingSwitchRow(
-                    title = str("friends.notify"),
-                    description = str("friends.notify.desc"),
-                    checked = notify,
-                    onCheckedChange = { DiscordPresence.notifyInGame = it },
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    SettingSwitchRow(
+                        title = str("friends.notify"),
+                        description = str("friends.notify.desc"),
+                        checked = notify,
+                        onCheckedChange = { DiscordPresence.notifyInGame = it },
+                    )
+                    SettingSwitchRow(
+                        title = str("friends.showGame"),
+                        description = str("friends.showGame.desc"),
+                        checked = showGame,
+                        onCheckedChange = { DiscordPresence.showGameInStatus = it },
+                    )
+                }
             }
 
             GlassPanel(Modifier.fillMaxWidth()) {
@@ -400,7 +460,7 @@ fun FriendOnlineBanner() {
  * should say who you are rather than nothing. Renders nothing when not connected.
  */
 @Composable
-fun SelfChip(modifier: Modifier = Modifier) {
+fun SelfChip(modifier: Modifier = Modifier, caption: String? = null) {
     val me by DiscordPresence.self
     val status by DiscordPresence.status
     if (status != DiscordPresence.CONNECTED || me == null) return
@@ -415,12 +475,49 @@ fun SelfChip(modifier: Modifier = Modifier) {
             )
             Spacer(Modifier.width(7.dp))
         }
+        ChipName(me?.name.orEmpty(), caption)
+    }
+}
+
+/**
+ * The RPCN account, compact like [SelfChip]: the avatar games show for the player (chosen in the RPCN
+ * tab) and the RPCN name. Renders nothing until an RPCN account is set up.
+ */
+@Composable
+fun RpcnSelfChip(modifier: Modifier = Modifier, caption: String? = null) {
+    var npid by remember { mutableStateOf("") }
+    LaunchedEffect(Unit) {
+        npid = withContext(Dispatchers.IO) {
+            runCatching { JSONObject(Rpcs3Bridge.rpcnGetConfig()).optString("npid") }.getOrDefault("")
+        }
+    }
+    if (npid.isBlank()) return
+
+    Row(modifier, verticalAlignment = Alignment.CenterVertically) {
+        com.armsx2.ui.settings.RpcnAvatarImage(Modifier.size(24.dp).clip(CircleShape))
+        Spacer(Modifier.width(7.dp))
+        ChipName(npid, caption)
+    }
+}
+
+/** A chip's name, with the service it belongs to under it when both chips are shown. */
+@Composable
+private fun ChipName(name: String, caption: String?) {
+    Column {
         Text(
-            me?.name.orEmpty(),
+            name,
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
+        caption?.let {
+            Text(
+                it,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.8f),
+                maxLines = 1,
+            )
+        }
     }
 }

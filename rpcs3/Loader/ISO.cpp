@@ -1,12 +1,14 @@
 #include "stdafx.h"
 
 #include "ISO.h"
+#include "CHD.h"
 #include "Emu/VFS.h"
 #include "Emu/system_utils.hpp"
 #include "Crypto/utils.h"
 
 #include <codecvt>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <stack>
@@ -129,7 +131,15 @@ bool is_iso_file(const std::string& path, u64* size, bool* is_raw_device)
 
 	iso_file file(new_path);
 
-	return is_iso_file(file, size);
+	if (is_iso_file(file, size))
+	{
+		return true;
+	}
+
+	// A CHD (chdman createdvd) holds the same disc image compressed, so nothing sits at the offset
+	// the check above reads. It is recognised from its header alone: opening one decodes its whole
+	// hunk map, and this runs for every library scan and boot.
+	return !raw_device && chd::probe(new_path, size);
 }
 
 // Convert 4 bytes in big-endian format to an unsigned integer
@@ -422,7 +432,8 @@ bool iso_file_decryption::init(const std::string& path, iso_archive* archive)
 	// Store the ISO region information (needed by both the "Redump" type (only on "decrypt()" method) and "3k3y" type)
 	//
 
-	iso_file iso_file(path);
+	// A CHD's sectors are compressed on disk, so they are read through the image its archive opened.
+	iso_file iso_file = archive && archive->m_chd ? ::iso_file(chd::make_file(archive->m_chd), path) : ::iso_file(path);
 
 	if (!is_iso_file(iso_file))
 	{
@@ -634,6 +645,11 @@ bool iso_file_decryption::decrypt(u64 offset, void* buffer, u64 size, const std:
 
 iso_file_encrypted::iso_file_encrypted(const std::string& path, bs_t<fs::open_mode> mode, const iso_fs_node& node, std::shared_ptr<iso_file_decryption> dec)
 	: iso_file(path, mode, node), m_dec(dec)
+{
+}
+
+iso_file_encrypted::iso_file_encrypted(fs::file image, const iso_fs_node& node, std::shared_ptr<iso_file_decryption> dec)
+	: iso_file(std::move(image), node), m_dec(std::move(dec))
 {
 }
 
@@ -897,19 +913,19 @@ static std::optional<iso_fs_metadata> iso_read_directory_entry(fs::file& entry, 
 	const u32 start_sector = retrieve_endian_int<u32>(header.start_sector);
 	const u32 file_size = retrieve_endian_int<u32>(header.file_size);
 
-	std::tm file_date = {};
+	// ARMSX3: ISO 9660 records local time at a signed offset from GMT in 15-minute steps (-48 West to +52 East);
+	// PS3 discs record 0, so their dates are UTC. Upstream read them as the host's local time and added
+	// (offset - 50) * 15 min in an s16, which overflowed (-45000 became +20536), so every file reported a date
+	// hours off. Batman: Arkham Origins checks its HDD cache against the real date in single-player and the
+	// reported one in multiplayer, and re-copied the cache at every switch between them.
+	std::time_t date_time = 0;
 
-	file_date.tm_year = header.year;
-	file_date.tm_mon = header.month - 1;
-	file_date.tm_mday = header.day;
-	file_date.tm_hour = header.hour;
-	file_date.tm_min = header.minute;
-	file_date.tm_sec = header.second;
-
-	const s16 timezone_value = header.timezone_value;
-	const s16 timezone_offset = (timezone_value - 50) * 15 * 60;
-
-	const std::time_t date_time = std::mktime(&file_date) + timezone_offset;
+	if (const std::chrono::year_month_day date{std::chrono::year{1900 + header.year}, std::chrono::month{header.month}, std::chrono::day{header.day}}; date.ok())
+	{
+		date_time = std::chrono::sys_seconds{std::chrono::sys_days{date}}.time_since_epoch().count()
+			+ header.hour * 3600 + header.minute * 60 + header.second
+			- static_cast<s8>(header.timezone_value) * 15 * 60;
+	}
 
 	// 2nd flag bit indicates whether a given fs node is a directory
 	const bool is_directory = header.flags & 0b00000010;
@@ -1059,7 +1075,7 @@ iso_archive::iso_archive(const std::string& path)
 	m_path = path;
 
 	// "m_path" is updated with the raw device path in case "path" points to a BD drive
-	fs::get_optical_raw_device(path, &m_path);
+	const bool raw_device = fs::get_optical_raw_device(path, &m_path);
 
 	if (!is_iso_file(m_path))
 	{
@@ -1068,7 +1084,29 @@ iso_archive::iso_archive(const std::string& path)
 		return;
 	}
 
-	fs::file iso_file(std::make_unique<iso_file>(m_path));
+	// A CHD is opened here, once, and every file on the disc reads through it.
+	if (!raw_device && chd::is_chd_file(m_path))
+	{
+		m_chd = chd::open(m_path);
+
+		if (!m_chd)
+		{
+			iso_log.error("iso_archive: Failed to open CHD image: '%s'", path);
+			return;
+		}
+
+		// is_iso_file() knew the CHD by its header: check the image inside, as it checks an ISO.
+		iso_file image(chd::make_file(m_chd), m_path);
+
+		if (!is_iso_file(image))
+		{
+			iso_log.error("iso_archive: CHD image does not hold a disc: '%s'", path);
+			m_chd.reset();
+			return;
+		}
+	}
+
+	fs::file iso_file = m_chd ? chd::make_file(m_chd) : fs::file(std::make_unique<::iso_file>(m_path));
 
 	u8 descriptor_type = -2;
 	bool use_ucs2_decoding = false;
@@ -1112,6 +1150,40 @@ iso_archive::iso_archive(const std::string& path)
 		// TODO: throw something?
 		return;
 	}
+
+	// A CHD is usually made from a decrypted ISO, and a key file kept from the encrypted original,
+	// next to it or in the keys folder, would then "decrypt" plain data into garbage.
+	const auto enc_type = m_dec->get_enc_type();
+
+	if (m_chd && (enc_type == iso_encryption_type::REDUMP || enc_type == iso_encryption_type::ENC_3K3Y) && reads_decrypted())
+	{
+		iso_log.warning("iso_archive: '%s' is already decrypted, so its disc key is not used", path);
+		m_dec = std::make_shared<iso_file_decryption>();
+	}
+}
+
+bool iso_archive::reads_decrypted()
+{
+	// The files retrieve_key() tests keys on, which an encrypted disc always has encrypted, and
+	// what they start with in the clear.
+	static constexpr std::pair<std::string_view, std::string_view> s_plain_starts[]
+	{
+		{"PS3_GAME/LICDIR/LIC.DAT", "PS3LICDA"},
+		{"PS3_GAME/USRDIR/EBOOT.BIN", "SCE"},
+	};
+
+	for (const auto& [file_path, magic] : s_plain_starts)
+	{
+		if (const iso_fs_node* node = retrieve(std::string(file_path)))
+		{
+			iso_file file(chd::make_file(m_chd), *node);
+			std::array<char, 8> head{};
+
+			return file.read(head.data(), magic.size()) == magic.size() && std::memcmp(head.data(), magic.data(), magic.size()) == 0;
+		}
+	}
+
+	return false;
 }
 
 iso_fs_node* iso_archive::retrieve(const std::string& passed_path)
@@ -1149,7 +1221,8 @@ iso_fs_node* iso_archive::retrieve(const std::string& passed_path)
 
 		bool found = false;
 
-		if (path_component == ".")
+		// An empty component names the current node, as "." does (e.g. "dir//name" resolves as "dir/name")
+		if (path_component.empty() || path_component == ".")
 		{
 			found = true;
 		}
@@ -1215,6 +1288,23 @@ bool iso_archive::is_file(const std::string& path)
 
 std::unique_ptr<fs::file_base> iso_archive::get_iso_file(const std::string& path, bs_t<fs::open_mode> mode, const iso_fs_node& node)
 {
+	if (m_chd)
+	{
+		// Every file on a CHD reads through the image the archive opened, which is read-only.
+		if (mode & (fs::write + fs::append + fs::create + fs::trunc))
+		{
+			fs::g_tls_error = fs::error::readonly;
+			return nullptr;
+		}
+
+		if (m_dec->get_enc_type() == iso_encryption_type::NONE)
+		{
+			return std::make_unique<iso_file>(chd::make_file(m_chd), node);
+		}
+
+		return std::make_unique<iso_file_encrypted>(chd::make_file(m_chd), node, m_dec);
+	}
+
 	if (m_dec->get_enc_type() == iso_encryption_type::NONE)
 	{
 		return std::make_unique<iso_file>(path, mode, node);
@@ -1276,6 +1366,18 @@ iso_file::iso_file(const std::string& path, bs_t<fs::open_mode> mode, const iso_
 	m_file.seek(m_meta.extents[0].start * ISO_SECTOR_SIZE);
 
 	m_raw_device = fs::is_optical_raw_device(path);
+}
+
+iso_file::iso_file(fs::file image, const std::string& name)
+	: m_file(std::move(image))
+{
+	m_meta.name = name;
+	m_meta.extents.push_back({0, m_file.size()});
+}
+
+iso_file::iso_file(fs::file image, const iso_fs_node& node)
+	: m_file(std::move(image)), m_meta(node.metadata)
+{
 }
 
 fs::stat_t iso_file::get_stat()
