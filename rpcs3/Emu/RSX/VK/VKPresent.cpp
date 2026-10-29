@@ -208,7 +208,9 @@ bool VKGSRender::reinitialize_swapchain()
 	m_framegen_blit_cb_count = 0;
 
 	// Read with the same setting init() reads to pick the present mode. See m_swapchain_framegen.
+#ifdef __ANDROID__
 	m_swapchain_framegen = g_cfg.video.frame_generation != frame_generation_mode::off;
+#endif
 
 	// Rebuild swapchain. Old swapchain destruction is handled by the init_swapchain call
 	if (!m_swapchain->init(m_swapchain_dims.width, m_swapchain_dims.height))
@@ -1343,10 +1345,12 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 	// first swapchain exists, and can be switched in-game, so it ran in MAILBOX: the real frame
 	// presented right after each generated one replaced it, and measured on the Odin 3 only 51 of
 	// 60 refreshes showed a new frame. Rebuild on a change, as for VSync.
+#ifdef __ANDROID__
 	if (m_swapchain_framegen != (g_cfg.video.frame_generation != frame_generation_mode::off))
 	{
 		swapchain_unavailable = true;
 	}
+#endif
 
 	if (swapchain_unavailable || should_reinitialize_swapchain)
 	{

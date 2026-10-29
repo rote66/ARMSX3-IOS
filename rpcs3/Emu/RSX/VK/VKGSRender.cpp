@@ -495,7 +495,9 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 	m_swapchain_dims.height = m_frame->client_height();
 
 	// Read with the same setting init() reads to pick the present mode. See m_swapchain_framegen.
+#ifdef __ANDROID__
 	m_swapchain_framegen = g_cfg.video.frame_generation != frame_generation_mode::off;
+#endif
 
 	if (!m_swapchain->init(m_swapchain_dims.width, m_swapchain_dims.height))
 	{
